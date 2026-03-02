@@ -4,6 +4,7 @@
 # Model weights (large files, download separately)
 SmolLM-135M-Instruct/
 SmolLM2-1.7B/
+models/
 
 # macOS
 .DS_Store
