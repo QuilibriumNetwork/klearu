@@ -24,8 +24,15 @@ impl Mlp {
         let mut gate = vec![0.0f32; self.intermediate_size];
         let mut up = vec![0.0f32; self.intermediate_size];
 
-        self.gate_proj.forward(input, &mut gate);
-        self.up_proj.forward(input, &mut up);
+        if self.intermediate_size >= 512 {
+            rayon::join(
+                || self.gate_proj.forward(input, &mut gate),
+                || self.up_proj.forward(input, &mut up),
+            );
+        } else {
+            self.gate_proj.forward(input, &mut gate);
+            self.up_proj.forward(input, &mut up);
+        }
 
         // SiLU(gate) * up
         for (g, u) in gate.iter_mut().zip(up.iter()) {

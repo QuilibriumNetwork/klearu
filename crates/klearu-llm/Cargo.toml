@@ -23,6 +23,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 
 rand = { workspace = true }
+rayon = { workspace = true }
 safetensors = "0.4"
 tokenizers = "0.20"
 memmap2 = "0.9"

@@ -612,6 +612,7 @@ dependencies = [
  "memmap2",
  "rand",
  "rand_distr",
+ "rayon",
  "safetensors",
  "serde",
  "serde_json",

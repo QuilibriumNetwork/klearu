@@ -2,6 +2,7 @@ use super::kv_cache::KvCache;
 use super::linear::Linear;
 use super::rope::RotaryEmbedding;
 use klearu_accel::simd::dense_dot_dense_simd;
+use rayon::prelude::*;
 
 /// Multi-head attention with Grouped Query Attention (GQA) and KV cache.
 pub struct Attention {
@@ -85,32 +86,45 @@ impl Attention {
 
         let seq_len = kv_cache.current_len();
         let inv_sqrt_dk = 1.0 / (self.head_dim as f32).sqrt();
+        let kv = &*kv_cache;
 
-        // Compute attention for each Q head
+        // Compute attention for each Q head.
+        // Each head writes to a disjoint head_dim-sized chunk of attn_concat.
         let mut attn_concat = vec![0.0f32; q_dim];
+        let head_dim = self.head_dim;
+        let gqa_group_size = self.gqa_group_size;
+        let num_heads = self.num_heads;
 
-        for h in 0..self.num_heads {
-            let kv_h = h / self.gqa_group_size;
-            let q_head = &q[h * self.head_dim..(h + 1) * self.head_dim];
+        let compute_head = |h: usize, head_out: &mut [f32]| {
+            let kv_h = h / gqa_group_size;
+            let q_head = &q[h * head_dim..(h + 1) * head_dim];
 
-            // Compute attention scores over all cached positions
             let mut scores: Vec<f32> = (0..seq_len)
                 .map(|j| {
-                    let k_j = kv_cache.k_at(kv_h, j);
+                    let k_j = kv.k_at(kv_h, j);
                     dense_dot_dense_simd(q_head, k_j) * inv_sqrt_dk
                 })
                 .collect();
 
-            // Softmax
             softmax_inplace(&mut scores);
 
-            // Weighted sum of V
-            let head_out = &mut attn_concat[h * self.head_dim..(h + 1) * self.head_dim];
             for (j, &score) in scores.iter().enumerate() {
-                let v_j = kv_cache.v_at(kv_h, j);
+                let v_j = kv.v_at(kv_h, j);
                 for (d, &vv) in head_out.iter_mut().zip(v_j.iter()) {
                     *d += score * vv;
                 }
+            }
+        };
+
+        if num_heads >= 8 {
+            attn_concat
+                .par_chunks_mut(head_dim)
+                .enumerate()
+                .for_each(|(h, head_out)| compute_head(h, head_out));
+        } else {
+            for h in 0..num_heads {
+                let head_out = &mut attn_concat[h * head_dim..(h + 1) * head_dim];
+                compute_head(h, head_out);
             }
         }
 

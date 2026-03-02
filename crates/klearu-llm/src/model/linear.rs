@@ -1,10 +1,16 @@
 use klearu_accel::memory::ContiguousWeightStore;
 use klearu_accel::simd::dense_dot_dense_simd;
+use rayon::prelude::*;
+
+/// Minimum output rows before Rayon parallelism kicks in.
+/// Below this threshold the thread-pool overhead exceeds the compute savings.
+const PAR_ROW_THRESHOLD: usize = 512;
+const PAR_MIN_CHUNK: usize = 64;
 
 /// Bias-free linear layer backed by ContiguousWeightStore.
 ///
 /// Weight layout: `[out_features × in_features]` (row-major, each row is one output neuron).
-/// Uses SIMD-accelerated dot products for forward pass.
+/// Uses SIMD-accelerated dot products and Rayon parallelism for forward pass.
 pub struct Linear {
     pub weights: ContiguousWeightStore,
     in_features: usize,
@@ -33,9 +39,23 @@ impl Linear {
         debug_assert_eq!(input.len(), self.in_features);
         debug_assert!(output.len() >= self.out_features);
 
-        for (i, out) in output.iter_mut().enumerate().take(self.out_features) {
-            let w = self.weights.get_weights(i);
-            *out = dense_dot_dense_simd(&w[..self.in_features], input);
+        let in_features = self.in_features;
+        let weights = &self.weights;
+        let dst = &mut output[..self.out_features];
+
+        if dst.len() >= PAR_ROW_THRESHOLD {
+            dst.par_iter_mut()
+                .with_min_len(PAR_MIN_CHUNK)
+                .enumerate()
+                .for_each(|(i, out)| {
+                    let w = weights.get_weights(i);
+                    *out = dense_dot_dense_simd(&w[..in_features], input);
+                });
+        } else {
+            for (i, out) in dst.iter_mut().enumerate() {
+                let w = weights.get_weights(i);
+                *out = dense_dot_dense_simd(&w[..in_features], input);
+            }
         }
     }
 
@@ -43,9 +63,23 @@ impl Linear {
     pub fn forward_sparse(&self, input: &[f32], indices: &[usize], output: &mut [f32]) {
         debug_assert_eq!(input.len(), self.in_features);
 
-        for (out_idx, &neuron_idx) in indices.iter().enumerate() {
-            let w = self.weights.get_weights(neuron_idx);
-            output[out_idx] = dense_dot_dense_simd(&w[..self.in_features], input);
+        let in_features = self.in_features;
+        let weights = &self.weights;
+        let dst = &mut output[..indices.len()];
+
+        if dst.len() >= PAR_ROW_THRESHOLD {
+            dst.par_iter_mut()
+                .with_min_len(PAR_MIN_CHUNK)
+                .zip(indices.par_iter())
+                .for_each(|(out, &neuron_idx)| {
+                    let w = weights.get_weights(neuron_idx);
+                    *out = dense_dot_dense_simd(&w[..in_features], input);
+                });
+        } else {
+            for (out, &neuron_idx) in dst.iter_mut().zip(indices.iter()) {
+                let w = weights.get_weights(neuron_idx);
+                *out = dense_dot_dense_simd(&w[..in_features], input);
+            }
         }
     }
 }

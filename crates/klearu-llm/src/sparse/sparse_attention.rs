@@ -2,6 +2,7 @@ use crate::model::attention::Attention;
 use crate::model::kv_cache::KvCache;
 use crate::model::rope::RotaryEmbedding;
 use klearu_accel::simd::dense_dot_dense_simd;
+use rayon::prelude::*;
 
 /// Sparse attention: only compute selected heads, zero out the rest.
 pub fn forward_sparse(
@@ -40,33 +41,47 @@ pub fn forward_sparse(
     kv_cache.append(&k, &v);
     let seq_len = kv_cache.current_len();
     let inv_sqrt_dk = 1.0 / (head_dim as f32).sqrt();
+    let kv = &*kv_cache;
 
-    // Only compute attention for active heads
     let mut attn_concat = vec![0.0f32; q_dim];
 
-    for &h in active_heads {
-        if h >= num_heads {
-            continue;
-        }
+    let compute_head = |h: usize| -> Vec<f32> {
         let kv_h = h / gqa_group_size;
         let q_head = &q[h * head_dim..(h + 1) * head_dim];
 
         let mut scores: Vec<f32> = (0..seq_len)
             .map(|j| {
-                let k_j = kv_cache.k_at(kv_h, j);
+                let k_j = kv.k_at(kv_h, j);
                 dense_dot_dense_simd(q_head, k_j) * inv_sqrt_dk
             })
             .collect();
 
-        // Softmax
         softmax_inplace(&mut scores);
 
-        let head_out = &mut attn_concat[h * head_dim..(h + 1) * head_dim];
+        let mut head_out = vec![0.0f32; head_dim];
         for (j, &score) in scores.iter().enumerate() {
-            let v_j = kv_cache.v_at(kv_h, j);
+            let v_j = kv.v_at(kv_h, j);
             for (d, &vv) in head_out.iter_mut().zip(v_j.iter()) {
                 *d += score * vv;
             }
+        }
+        head_out
+    };
+
+    let valid_heads: Vec<usize> = active_heads.iter().copied().filter(|&h| h < num_heads).collect();
+
+    if valid_heads.len() >= 8 {
+        let head_results: Vec<(usize, Vec<f32>)> = valid_heads
+            .par_iter()
+            .map(|&h| (h, compute_head(h)))
+            .collect();
+        for (h, head_out) in head_results {
+            attn_concat[h * head_dim..(h + 1) * head_dim].copy_from_slice(&head_out);
+        }
+    } else {
+        for &h in &valid_heads {
+            let head_out = compute_head(h);
+            attn_concat[h * head_dim..(h + 1) * head_dim].copy_from_slice(&head_out);
         }
     }
 

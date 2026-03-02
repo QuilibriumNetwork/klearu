@@ -1,5 +1,6 @@
 use klearu_accel::memory::ContiguousWeightStore;
 use klearu_accel::simd::dense_dot_dense_simd;
+use rayon::prelude::*;
 
 /// Token embedding table backed by ContiguousWeightStore.
 ///
@@ -29,9 +30,23 @@ impl Embedding {
     /// Use embedding weights as LM head (tied embeddings).
     /// Computes `logits[i] = dot(hidden, embedding[i])` for each vocab token.
     pub fn lm_head_forward(&self, hidden: &[f32], logits: &mut [f32]) {
-        for (i, logit) in logits.iter_mut().enumerate().take(self.vocab_size) {
-            let row = self.weights.get_weights(i);
-            *logit = dense_dot_dense_simd(&row[..self.hidden_size], hidden);
+        let hidden_size = self.hidden_size;
+        let weights = &self.weights;
+        let dst = &mut logits[..self.vocab_size];
+
+        if dst.len() >= 512 {
+            dst.par_iter_mut()
+                .with_min_len(64)
+                .enumerate()
+                .for_each(|(i, logit)| {
+                    let row = weights.get_weights(i);
+                    *logit = dense_dot_dense_simd(&row[..hidden_size], hidden);
+                });
+        } else {
+            for (i, logit) in dst.iter_mut().enumerate() {
+                let row = weights.get_weights(i);
+                *logit = dense_dot_dense_simd(&row[..hidden_size], hidden);
+            }
         }
     }
 }

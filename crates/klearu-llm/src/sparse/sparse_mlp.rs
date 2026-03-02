@@ -1,17 +1,23 @@
 use crate::model::mlp::Mlp;
+use rayon::prelude::*;
 
 /// Sparse MLP: only compute selected neurons in the intermediate layer.
 pub fn forward_sparse(mlp: &Mlp, input: &[f32], active_neurons: &[usize]) -> Vec<f32> {
     let k = active_neurons.len();
 
-    // Sparse gate and up projections (only selected neurons)
+    // Sparse gate and up projections (parallel when large enough)
     let mut gate_sparse = vec![0.0f32; k];
     let mut up_sparse = vec![0.0f32; k];
 
-    mlp.gate_proj
-        .forward_sparse(input, active_neurons, &mut gate_sparse);
-    mlp.up_proj
-        .forward_sparse(input, active_neurons, &mut up_sparse);
+    if k >= 512 {
+        rayon::join(
+            || mlp.gate_proj.forward_sparse(input, active_neurons, &mut gate_sparse),
+            || mlp.up_proj.forward_sparse(input, active_neurons, &mut up_sparse),
+        );
+    } else {
+        mlp.gate_proj.forward_sparse(input, active_neurons, &mut gate_sparse);
+        mlp.up_proj.forward_sparse(input, active_neurons, &mut up_sparse);
+    }
 
     // SiLU(gate) * up for active neurons only
     for (g, u) in gate_sparse.iter_mut().zip(up_sparse.iter()) {
@@ -20,17 +26,33 @@ pub fn forward_sparse(mlp: &Mlp, input: &[f32], active_neurons: &[usize]) -> Vec
 
     // Down projection: need to compute using sparse input
     // down_proj has shape [hidden_size × intermediate_size]
-    // We need: output[j] = sum_i (down_proj[j][active_neurons[i]] * gate_sparse[i])
+    // output[j] = sum_i (down_proj[j][active_neurons[i]] * gate_sparse[i])
     let hidden_size = mlp.down_proj.out_features();
+    let weights = &mlp.down_proj.weights;
     let mut output = vec![0.0f32; hidden_size];
 
-    for (j, out) in output.iter_mut().enumerate() {
-        let w = mlp.down_proj.weights.get_weights(j);
-        let mut sum = 0.0f32;
-        for (idx, &neuron) in active_neurons.iter().enumerate() {
-            sum += w[neuron] * gate_sparse[idx];
+    if hidden_size >= 512 {
+        output
+            .par_iter_mut()
+            .with_min_len(64)
+            .enumerate()
+            .for_each(|(j, out)| {
+                let w = weights.get_weights(j);
+                let mut sum = 0.0f32;
+                for (idx, &neuron) in active_neurons.iter().enumerate() {
+                    sum += w[neuron] * gate_sparse[idx];
+                }
+                *out = sum;
+            });
+    } else {
+        for (j, out) in output.iter_mut().enumerate() {
+            let w = weights.get_weights(j);
+            let mut sum = 0.0f32;
+            for (idx, &neuron) in active_neurons.iter().enumerate() {
+                sum += w[neuron] * gate_sparse[idx];
+            }
+            *out = sum;
         }
-        *out = sum;
     }
 
     output
