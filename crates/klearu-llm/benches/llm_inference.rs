@@ -249,18 +249,18 @@ fn bench_decode_at_context_length(c: &mut Criterion) {
     for &ctx_len in context_lengths {
         let mut model = build_synthetic(small_config());
 
-        // Pre-fill the KV cache with `ctx_len` tokens
-        model.reset_kv_caches();
-        for pos in 0..ctx_len {
-            let tok = (pos % 512) as u32;
-            let _ = model.forward_decode(tok, pos);
-        }
-
         group.bench_with_input(
             BenchmarkId::new("small_synthetic_ctx", ctx_len),
             &ctx_len,
             |b, &ctx| {
                 b.iter(|| {
+                    // Each decode appends to the KV cache, so we must reset and
+                    // prefill before every iteration to avoid overflow.
+                    model.reset_kv_caches();
+                    for pos in 0..ctx {
+                        let tok = (pos % 512) as u32;
+                        let _ = model.forward_decode(tok, pos);
+                    }
                     black_box(model.forward_decode(black_box(1u32), ctx));
                 })
             },
