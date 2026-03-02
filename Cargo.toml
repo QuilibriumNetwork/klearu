@@ -10,7 +10,10 @@ members = [
     "crates/klearu",
     "crates/klearu-dpf",
     "crates/klearu-mpc",
-    "crates/klearu-private",
+    # klearu-private requires the monorepo sibling (../monorepo/crates/ferret).
+    # Add it back once that sibling is cloned:
+    #   git clone https://github.com/quilibriumnetwork/monorepo ../monorepo
+    # "crates/klearu-private",
 ]
 
 [workspace.package]

@@ -42,3 +42,8 @@ required-features = ["sparse"]
 
 [dev-dependencies]
 rand_distr = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "llm_inference"
+harness = false
