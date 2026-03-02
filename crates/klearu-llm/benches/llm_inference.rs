@@ -12,7 +12,14 @@
 ///     cargo bench --bench llm_inference -p klearu-llm
 ///
 /// Without that variable the benchmarks fall back to the synthetic model.
-use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+///
+/// To print a summary table from the last run:
+///
+///   cargo run --bin bench_table -p klearu-llm
+///
+/// (Run from the workspace root so `target/criterion` exists, or pass the path
+/// to the criterion output directory as the first argument.)
+use criterion::{BenchmarkId, Criterion, SamplingMode, black_box, criterion_group, criterion_main};
 use klearu_llm::config::LlmConfig;
 use klearu_llm::model::Model;
 
@@ -87,6 +94,7 @@ fn maybe_load_real_model() -> Option<Model> {
 
 fn bench_decode_single(c: &mut Criterion) {
     let mut group = c.benchmark_group("decode_single_token");
+    group.sampling_mode(SamplingMode::Flat);
 
     // Small synthetic
     {
@@ -129,6 +137,7 @@ fn bench_decode_single(c: &mut Criterion) {
 
 fn bench_prefill(c: &mut Criterion) {
     let mut group = c.benchmark_group("prefill_throughput");
+    group.sampling_mode(SamplingMode::Flat);
 
     let prompt_lengths: &[usize] = &[8, 32, 128, 256];
 
@@ -177,6 +186,7 @@ fn bench_prefill(c: &mut Criterion) {
 
 fn bench_decode_sequential(c: &mut Criterion) {
     let mut group = c.benchmark_group("decode_sequential");
+    group.sampling_mode(SamplingMode::Flat);
 
     let decode_steps: &[usize] = &[16, 64, 128];
 
@@ -243,6 +253,7 @@ fn bench_decode_sequential(c: &mut Criterion) {
 
 fn bench_decode_at_context_length(c: &mut Criterion) {
     let mut group = c.benchmark_group("decode_at_context_length");
+    group.sampling_mode(SamplingMode::Flat);
 
     let context_lengths: &[usize] = &[0, 32, 128, 256];
 
@@ -276,8 +287,7 @@ fn bench_decode_at_context_length(c: &mut Criterion) {
 
 criterion_group! {
     name = benches;
-    config = Criterion::default()
-        .measurement_time(std::time::Duration::from_secs(10));
+    config = Criterion::default();
     targets =
         bench_decode_single,
         bench_prefill,

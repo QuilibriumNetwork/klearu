@@ -36,6 +36,10 @@ name = "diagnose"
 path = "src/bin/diagnose.rs"
 
 [[bin]]
+name = "bench_table"
+path = "src/bin/bench_table.rs"
+
+[[bin]]
 name = "calibrate"
 path = "src/bin/calibrate.rs"
 required-features = ["sparse"]
