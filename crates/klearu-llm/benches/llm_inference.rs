@@ -82,21 +82,10 @@ fn build_synthetic(config: LlmConfig) -> Model {
 
 /// Try to load a real model from `KLEARU_MODEL_DIR`.  Returns `None` when the
 /// variable is unset or the directory cannot be loaded.
-/// When a model is loaded, prints its path and config to stderr.
 fn maybe_load_real_model() -> Option<Model> {
     let dir = std::env::var("KLEARU_MODEL_DIR").ok()?;
     let path = std::path::Path::new(&dir);
-    let model = klearu_llm::weight::load_model(path).ok()?;
-    let c = &model.config;
-    eprintln!(
-        "Model loaded: {} (layers={}, hidden={}, vocab={}, max_seq_len={})",
-        path.display(),
-        c.num_layers,
-        c.hidden_size,
-        c.vocab_size,
-        c.max_seq_len,
-    );
-    Some(model)
+    klearu_llm::weight::load_model(path).ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -298,7 +287,8 @@ fn bench_decode_at_context_length(c: &mut Criterion) {
 
 criterion_group! {
     name = benches;
-    config = Criterion::default();
+    config = Criterion::default()
+        .measurement_time(std::time::Duration::from_secs(300));
     targets =
         bench_decode_single,
         bench_prefill,
