@@ -7,6 +7,7 @@ use klearu_core::data::Example;
 use klearu_core::hash::{HashFamily, MinHash, SimHash, SparseRandomProjection, WtaHash};
 use klearu_core::lsh::{create_lsh_index, LshIndexTrait};
 use klearu_core::network::Network;
+use klearu_core::optim::HogwildNetwork;
 use klearu_core::tensor::SparseVector;
 
 // ---------------------------------------------------------------------------
@@ -310,6 +311,28 @@ fn bench_train_step(c: &mut Criterion) {
             black_box(network.train_step(black_box(&[&example]), 0.01));
         })
     });
+
+    // Multi-threaded training (uses all cores via Rayon when num_threads > 1)
+    let num_workers = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(4)
+        .max(1);
+    let mut config_parallel = make_bench_config();
+    config_parallel.network.num_threads = num_workers;
+    config_parallel.hogwild = true;
+    let network_parallel = Network::new(config_parallel);
+    let hogwild = HogwildNetwork::new(network_parallel);
+    let batch: Vec<Example> = (0..64)
+        .map(|i| Example::new(random_dense(400 + i, 128), vec![(i % 10) as u32]))
+        .collect();
+    group.bench_function(
+        format!("train_parallel_128_64_10_{}threads", num_workers),
+        |b| {
+            b.iter(|| {
+                black_box(hogwild.train_parallel(black_box(&batch), num_workers, 0.01, 1));
+            })
+        },
+    );
 
     group.finish();
 }
