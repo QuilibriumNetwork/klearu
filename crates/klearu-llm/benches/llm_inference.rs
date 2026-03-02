@@ -274,11 +274,14 @@ fn bench_decode_at_context_length(c: &mut Criterion) {
 // Criterion harness
 // ---------------------------------------------------------------------------
 
-criterion_group!(
-    benches,
-    bench_decode_single,
-    bench_prefill,
-    bench_decode_sequential,
-    bench_decode_at_context_length,
-);
+criterion_group! {
+    name = benches;
+    config = Criterion::default()
+        .measurement_time(std::time::Duration::from_secs(10));
+    targets =
+        bench_decode_single,
+        bench_prefill,
+        bench_decode_sequential,
+        bench_decode_at_context_length,
+}
 criterion_main!(benches);
