@@ -21,12 +21,19 @@ pub fn detect_eos_token(model_dir: &Path) -> Option<u32> {
         return Some(id as u32);
     }
 
-    // Try config.json instead
+    // Try config.json instead (supports nested Qwen3.5 format)
     let config_path = model_dir.join("config.json");
     if let Ok(content) = std::fs::read_to_string(config_path) {
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+            // Top-level eos_token_id
             if let Some(id) = json.get("eos_token_id").and_then(|v| v.as_u64()) {
                 return Some(id as u32);
+            }
+            // Nested under text_config (Qwen3.5)
+            if let Some(tc) = json.get("text_config") {
+                if let Some(id) = tc.get("eos_token_id").and_then(|v| v.as_u64()) {
+                    return Some(id as u32);
+                }
             }
         }
     }

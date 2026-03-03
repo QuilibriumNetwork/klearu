@@ -3,6 +3,7 @@ use std::path::Path;
 use crate::config::LlmConfig;
 use crate::error::{LlmError, Result};
 use crate::model::Model;
+use crate::model::block::AttentionLayer;
 
 use super::name_map::{parse_weight_name, WeightTarget};
 use super::safetensors::SafeTensorsFile;
@@ -16,10 +17,11 @@ pub fn load_model(model_dir: &Path) -> Result<Model> {
     let config = LlmConfig::from_file(&config_path)?;
 
     tracing::info!(
-        "Loading model: {} layers, hidden_size={}, vocab_size={}",
+        "Loading model: {} layers, hidden_size={}, vocab_size={}{}",
         config.num_layers,
         config.hidden_size,
-        config.vocab_size
+        config.vocab_size,
+        if config.is_qwen35() { " (Qwen3.5)" } else { "" }
     );
 
     let mut model = Model::new(config);
@@ -89,18 +91,40 @@ fn load_weight_into_model(
         WeightTarget::LayerMlpNorm(i) => {
             load_1d_into_vec(&mut model.layers[*i].mlp_norm.weight, data, shape)?;
         }
+
+        // Standard attention projections
         WeightTarget::LayerQProj(i) => {
-            load_2d_into_store(&mut model.layers[*i].attention.q_proj.weights, data, shape)?;
+            let attn = get_standard_attn_mut(&mut model.layers[*i].attention, *i)?;
+            load_2d_into_store(&mut attn.q_proj.weights, data, shape)?;
         }
         WeightTarget::LayerKProj(i) => {
-            load_2d_into_store(&mut model.layers[*i].attention.k_proj.weights, data, shape)?;
+            let attn = get_standard_attn_mut(&mut model.layers[*i].attention, *i)?;
+            load_2d_into_store(&mut attn.k_proj.weights, data, shape)?;
         }
         WeightTarget::LayerVProj(i) => {
-            load_2d_into_store(&mut model.layers[*i].attention.v_proj.weights, data, shape)?;
+            let attn = get_standard_attn_mut(&mut model.layers[*i].attention, *i)?;
+            load_2d_into_store(&mut attn.v_proj.weights, data, shape)?;
         }
         WeightTarget::LayerOProj(i) => {
-            load_2d_into_store(&mut model.layers[*i].attention.o_proj.weights, data, shape)?;
+            let attn = get_standard_attn_mut(&mut model.layers[*i].attention, *i)?;
+            load_2d_into_store(&mut attn.o_proj.weights, data, shape)?;
         }
+
+        // Q/K RMSNorm (Qwen3.5 gated full attention)
+        WeightTarget::LayerQNorm(i) => {
+            let attn = get_standard_attn_mut(&mut model.layers[*i].attention, *i)?;
+            if let Some(ref mut w) = attn.q_norm_weight {
+                load_1d_into_vec(w, data, shape)?;
+            }
+        }
+        WeightTarget::LayerKNorm(i) => {
+            let attn = get_standard_attn_mut(&mut model.layers[*i].attention, *i)?;
+            if let Some(ref mut w) = attn.k_norm_weight {
+                load_1d_into_vec(w, data, shape)?;
+            }
+        }
+
+        // MLP projections
         WeightTarget::LayerGateProj(i) => {
             load_2d_into_store(&mut model.layers[*i].mlp.gate_proj.weights, data, shape)?;
         }
@@ -110,8 +134,79 @@ fn load_weight_into_model(
         WeightTarget::LayerDownProj(i) => {
             load_2d_into_store(&mut model.layers[*i].mlp.down_proj.weights, data, shape)?;
         }
+
+        // GatedDeltaNet weights
+        WeightTarget::LayerDeltaNetQKV(i) => {
+            let dn = get_deltanet_mut(&mut model.layers[*i].attention, *i)?;
+            load_2d_into_store(&mut dn.in_proj_qkv.weights, data, shape)?;
+        }
+        WeightTarget::LayerDeltaNetZ(i) => {
+            let dn = get_deltanet_mut(&mut model.layers[*i].attention, *i)?;
+            load_2d_into_store(&mut dn.in_proj_z.weights, data, shape)?;
+        }
+        WeightTarget::LayerDeltaNetA(i) => {
+            let dn = get_deltanet_mut(&mut model.layers[*i].attention, *i)?;
+            load_2d_into_store(&mut dn.in_proj_a.weights, data, shape)?;
+        }
+        WeightTarget::LayerDeltaNetB(i) => {
+            let dn = get_deltanet_mut(&mut model.layers[*i].attention, *i)?;
+            load_2d_into_store(&mut dn.in_proj_b.weights, data, shape)?;
+        }
+        WeightTarget::LayerDeltaNetConv(i) => {
+            let dn = get_deltanet_mut(&mut model.layers[*i].attention, *i)?;
+            // Conv weight comes as [conv_dim, 1, kernel_size] -> flatten to [conv_dim × kernel_size]
+            let flat_data = data;
+            let expected_len = dn.conv_dim * dn.kernel_size;
+            if flat_data.len() != expected_len {
+                return Err(LlmError::ShapeMismatch {
+                    expected: format!("[{} total elements]", expected_len),
+                    got: format!("[{} total elements] (shape {:?})", flat_data.len(), shape),
+                });
+            }
+            dn.conv_weight.copy_from_slice(flat_data);
+        }
+        WeightTarget::LayerDeltaNetDtBias(i) => {
+            let dn = get_deltanet_mut(&mut model.layers[*i].attention, *i)?;
+            load_1d_into_vec(&mut dn.dt_bias, data, shape)?;
+        }
+        WeightTarget::LayerDeltaNetALog(i) => {
+            let dn = get_deltanet_mut(&mut model.layers[*i].attention, *i)?;
+            load_1d_into_vec(&mut dn.a_log, data, shape)?;
+        }
+        WeightTarget::LayerDeltaNetNorm(i) => {
+            let dn = get_deltanet_mut(&mut model.layers[*i].attention, *i)?;
+            load_1d_into_vec(&mut dn.norm_weight, data, shape)?;
+        }
+        WeightTarget::LayerDeltaNetOutProj(i) => {
+            let dn = get_deltanet_mut(&mut model.layers[*i].attention, *i)?;
+            load_2d_into_store(&mut dn.out_proj.weights, data, shape)?;
+        }
     }
     Ok(())
+}
+
+fn get_standard_attn_mut(
+    layer: &mut AttentionLayer,
+    layer_idx: usize,
+) -> Result<&mut crate::model::attention::Attention> {
+    match layer {
+        AttentionLayer::Standard(ref mut attn) => Ok(attn),
+        AttentionLayer::GatedDeltaNet(_) => Err(LlmError::WeightLoad(format!(
+            "Expected Standard attention at layer {layer_idx}, got GatedDeltaNet"
+        ))),
+    }
+}
+
+fn get_deltanet_mut(
+    layer: &mut AttentionLayer,
+    layer_idx: usize,
+) -> Result<&mut crate::model::gated_deltanet::GatedDeltaNet> {
+    match layer {
+        AttentionLayer::GatedDeltaNet(ref mut dn) => Ok(dn),
+        AttentionLayer::Standard(_) => Err(LlmError::WeightLoad(format!(
+            "Expected GatedDeltaNet at layer {layer_idx}, got Standard attention"
+        ))),
+    }
 }
 
 fn load_2d_into_store(

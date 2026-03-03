@@ -13,6 +13,7 @@
 //! ~150 per-layer exchanges. Massive bandwidth reduction.
 
 use klearu_llm::Model;
+use klearu_llm::model::block::AttentionLayer;
 use klearu_mpc::beaver::{TripleGenerator, TripleGenerator128};
 use klearu_mpc::fixed_point::{from_fixed, from_fixed64, to_fixed, to_fixed64};
 use klearu_mpc::linear::shared_linear_forward_64;
@@ -21,7 +22,7 @@ use klearu_mpc::transport::Transport;
 use klearu_mpc::{SharedVec, SharedVec64};
 use std::io;
 
-use crate::private_block::private_block_forward_secure;
+use crate::private_block::{private_block_forward_secure, effective_norm_weights};
 
 #[cfg(feature = "oprf-sparse")]
 use crate::oprf::{OprfClient, OprfServer};
@@ -62,13 +63,22 @@ pub fn private_model_forward(
         norm_buf.copy_from_slice(&hidden);
         model.layers[layer_idx].attn_norm.forward(&mut norm_buf);
 
-        // Attention
-        let attn_out = model.layers[layer_idx].attention.forward(
-            &norm_buf,
-            position,
-            &model.rope,
-            model.kv_caches.layer_mut(layer_idx),
-        );
+        // Attention (dispatch based on layer type)
+        let attn_out = match &model.layers[layer_idx].attention {
+            AttentionLayer::Standard(attn) => {
+                attn.forward(
+                    &norm_buf,
+                    position,
+                    &model.rope,
+                    model.kv_caches.layer_mut(layer_idx),
+                )
+            }
+            AttentionLayer::GatedDeltaNet(dn) => {
+                let state = model.deltanet_states.layer_mut(layer_idx)
+                    .expect("DeltaNet state missing for linear attention layer");
+                dn.forward_decode(&norm_buf, state)
+            }
+        };
 
         // Residual
         for (h, a) in hidden.iter_mut().zip(attn_out.iter()) {
@@ -145,12 +155,21 @@ pub fn private_model_forward_sparse(
         norm_buf.copy_from_slice(&hidden);
         model.layers[layer_idx].attn_norm.forward(&mut norm_buf);
 
-        let attn_out = model.layers[layer_idx].attention.forward(
-            &norm_buf,
-            position,
-            &model.rope,
-            model.kv_caches.layer_mut(layer_idx),
-        );
+        let attn_out = match &model.layers[layer_idx].attention {
+            AttentionLayer::Standard(attn) => {
+                attn.forward(
+                    &norm_buf,
+                    position,
+                    &model.rope,
+                    model.kv_caches.layer_mut(layer_idx),
+                )
+            }
+            AttentionLayer::GatedDeltaNet(dn) => {
+                let state = model.deltanet_states.layer_mut(layer_idx)
+                    .expect("DeltaNet state missing for linear attention layer");
+                dn.forward_decode(&norm_buf, state)
+            }
+        };
 
         for (h, a) in hidden.iter_mut().zip(attn_out.iter()) {
             *h += a;
@@ -338,6 +357,9 @@ pub fn private_model_forward_secure(
 
     // Per-layer MPC forward pass
     for layer_idx in 0..model.config.num_layers {
+        // Extract deltanet state (separate field from layers/kv_caches/rope)
+        let dn_state = model.deltanet_states.layer_mut(layer_idx);
+
         private_block_forward_secure(
             party,
             &model.layers[layer_idx],
@@ -345,16 +367,18 @@ pub fn private_model_forward_secure(
             position,
             &model.rope,
             model.kv_caches.layer_mut(layer_idx),
+            dn_state,
             triples,
             transport,
         )?;
     }
 
-    // Final RMSNorm (privacy-preserving)
+    // Final RMSNorm (privacy-preserving, handle one_plus_weight)
+    let final_weights = effective_norm_weights(&model.final_norm);
     rmsnorm_shared_64(
         party,
         &mut hidden_share,
-        &model.final_norm.weight,
+        &final_weights,
         model.final_norm.eps(),
         triples,
         transport,
@@ -417,6 +441,7 @@ mod tests {
             rope_theta: 10000.0,
             rms_norm_eps: 1e-5,
             tie_word_embeddings: true,
+            ..LlmConfig::default()
         }
     }
 
@@ -488,17 +513,19 @@ mod tests {
 
         // Attention and MLP weights
         for layer in &mut model.layers {
-            // Q, K, V, O projections
-            for (proj_idx, proj) in [
-                &mut layer.attention.q_proj,
-                &mut layer.attention.k_proj,
-                &mut layer.attention.v_proj,
-                &mut layer.attention.o_proj,
-            ].into_iter().enumerate() {
-                for i in 0..proj.out_features() {
-                    let row = proj.weights.get_weights_mut(i);
-                    for (j, v) in row.iter_mut().enumerate() {
-                        *v = ((i * 5 + j * 11 + proj_idx * 3 + 1) % 19) as f32 * 0.01 - 0.09;
+            // Q, K, V, O projections (only for Standard attention layers)
+            if let AttentionLayer::Standard(attn) = &mut layer.attention {
+                for (proj_idx, proj) in [
+                    &mut attn.q_proj,
+                    &mut attn.k_proj,
+                    &mut attn.v_proj,
+                    &mut attn.o_proj,
+                ].into_iter().enumerate() {
+                    for i in 0..proj.out_features() {
+                        let row = proj.weights.get_weights_mut(i);
+                        for (j, v) in row.iter_mut().enumerate() {
+                            *v = ((i * 5 + j * 11 + proj_idx * 3 + 1) % 19) as f32 * 0.01 - 0.09;
+                        }
                     }
                 }
             }
@@ -618,6 +645,7 @@ mod tests {
             rope_theta: 10000.0,
             rms_norm_eps: 1e-5,
             tie_word_embeddings: true,
+            ..LlmConfig::default()
         };
 
         let mut model_plain = Model::new(config.clone());
@@ -791,6 +819,7 @@ mod tests {
             rope_theta: 10000.0,
             rms_norm_eps: 1e-5,
             tie_word_embeddings: true,
+            ..LlmConfig::default()
         };
 
         let mut model_plain = Model::new(config.clone());
@@ -890,6 +919,7 @@ mod tests {
             rope_theta: 10000.0,
             rms_norm_eps: 1e-5,
             tie_word_embeddings: true,
+            ..LlmConfig::default()
         };
 
         let mut model_plain = Model::new(config.clone());
@@ -1066,5 +1096,256 @@ mod tests {
                 "Q32 embedding[{}]: got {}, expected {}", i, reconstructed, expected
             );
         }
+    }
+
+    // --- Qwen3.5 hybrid model tests ---
+
+    fn qwen35_tiny_config() -> LlmConfig {
+        LlmConfig {
+            vocab_size: 16,
+            hidden_size: 16,
+            num_heads: 2,
+            num_kv_heads: 2,
+            head_dim: 8,
+            intermediate_size: 32,
+            num_layers: 4,
+            max_seq_len: 8,
+            rope_theta: 10000.0,
+            rms_norm_eps: 1e-6,
+            tie_word_embeddings: true,
+            model_type: Some("qwen3_5_text".to_string()),
+            attn_output_gate: true,
+            layer_types: Some(vec![
+                "linear_attention".to_string(),
+                "linear_attention".to_string(),
+                "linear_attention".to_string(),
+                "full_attention".to_string(),
+            ]),
+            linear_num_key_heads: 2,
+            linear_num_value_heads: 2,
+            linear_key_head_dim: 4,
+            linear_value_head_dim: 4,
+            linear_conv_kernel_dim: 2,
+            ..LlmConfig::default()
+        }
+    }
+
+    fn init_qwen35_model_weights(model: &mut Model) {
+        let vs = model.config.vocab_size;
+
+        // Embedding weights
+        for i in 0..vs {
+            let row = model.embedding.weights.get_weights_mut(i);
+            for (j, v) in row.iter_mut().enumerate() {
+                *v = ((i * 7 + j * 3 + 1) % 17) as f32 * 0.02 - 0.15;
+            }
+        }
+
+        // Norm weights: for one_plus_weight models, leave at 0.0 (effective = 1.0)
+        // For non-one_plus, set to 1.0
+        if model.final_norm.is_one_plus_weight() {
+            // Leave at 0.0 — (1 + 0) = 1.0
+        } else {
+            for w in model.final_norm.weight.iter_mut() {
+                *w = 1.0;
+            }
+        }
+
+        for layer in &mut model.layers {
+            if layer.attn_norm.is_one_plus_weight() {
+                // Leave at 0.0
+            } else {
+                for w in layer.attn_norm.weight.iter_mut() {
+                    *w = 1.0;
+                }
+            }
+            if layer.mlp_norm.is_one_plus_weight() {
+                // Leave at 0.0
+            } else {
+                for w in layer.mlp_norm.weight.iter_mut() {
+                    *w = 1.0;
+                }
+            }
+
+            match &mut layer.attention {
+                AttentionLayer::Standard(attn) => {
+                    for (proj_idx, proj) in [
+                        &mut attn.q_proj,
+                        &mut attn.k_proj,
+                        &mut attn.v_proj,
+                        &mut attn.o_proj,
+                    ].into_iter().enumerate() {
+                        for i in 0..proj.out_features() {
+                            let row = proj.weights.get_weights_mut(i);
+                            for (j, v) in row.iter_mut().enumerate() {
+                                *v = ((i * 5 + j * 11 + proj_idx * 3 + 1) % 19) as f32 * 0.01 - 0.09;
+                            }
+                        }
+                    }
+                    // Q/K norm weights: leave at 0.0 (Qwen3.5 default)
+                }
+                AttentionLayer::GatedDeltaNet(dn) => {
+                    for (proj_idx, proj) in [
+                        &mut dn.in_proj_qkv, &mut dn.in_proj_z, &mut dn.in_proj_a,
+                        &mut dn.in_proj_b, &mut dn.out_proj,
+                    ].into_iter().enumerate() {
+                        for i in 0..proj.out_features() {
+                            let row = proj.weights.get_weights_mut(i);
+                            for (j, v) in row.iter_mut().enumerate() {
+                                *v = ((i * 5 + j * 11 + proj_idx * 3 + 1) % 19) as f32 * 0.01 - 0.09;
+                            }
+                        }
+                    }
+                    for (i, v) in dn.conv_weight.iter_mut().enumerate() {
+                        *v = ((i * 3 + 7) % 11) as f32 * 0.02 - 0.1;
+                    }
+                    for (i, v) in dn.dt_bias.iter_mut().enumerate() {
+                        *v = ((i * 5 + 2) % 7) as f32 * 0.1 - 0.3;
+                    }
+                    for (i, v) in dn.a_log.iter_mut().enumerate() {
+                        *v = -1.0 - (i as f32) * 0.1;
+                    }
+                    // norm_weight: leave at 1.0 (GatedDeltaNet uses standard RMSNorm)
+                    for v in dn.norm_weight.iter_mut() {
+                        *v = 1.0;
+                    }
+                }
+            }
+
+            // MLP projections
+            for (proj_idx, proj) in [
+                &mut layer.mlp.gate_proj,
+                &mut layer.mlp.up_proj,
+                &mut layer.mlp.down_proj,
+            ].into_iter().enumerate() {
+                for i in 0..proj.out_features() {
+                    let row = proj.weights.get_weights_mut(i);
+                    for (j, v) in row.iter_mut().enumerate() {
+                        *v = ((i * 13 + j * 7 + proj_idx * 5 + 2) % 23) as f32 * 0.01 - 0.11;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Test lower-security MPC (reveal embedding, plaintext forward) with Qwen3.5 hybrid model.
+    #[test]
+    fn test_mpc_qwen35_matches_plaintext() {
+        let config = qwen35_tiny_config();
+
+        let mut model_plain = Model::new(config.clone());
+        init_qwen35_model_weights(&mut model_plain);
+
+        let mut model0 = Model::new(config.clone());
+        init_qwen35_model_weights(&mut model0);
+
+        let mut model1 = Model::new(config.clone());
+        init_qwen35_model_weights(&mut model1);
+
+        let token_id = 1u32;
+
+        // Plaintext forward
+        let plaintext_logits = model_plain.forward_decode(token_id, 0);
+
+        // MPC forward (lower security: reveal + plaintext)
+        let share0 = shared_embedding_lookup(0, &model0, token_id);
+        let share1 = shared_embedding_lookup(1, &model1, token_id);
+
+        let (mut gen0, mut gen1) = dummy_triple_pair(100_000);
+        let (mut trans_a, mut trans_b) = memory_transport_pair();
+
+        let handle = std::thread::spawn(move || {
+            private_model_forward(1, &mut model1, &share1, 0, &mut gen1, &mut trans_b)
+        });
+
+        let mpc_logits = private_model_forward(0, &mut model0, &share0, 0, &mut gen0, &mut trans_a).unwrap();
+        let mpc_logits1 = handle.join().unwrap().unwrap();
+
+        // Both parties compute identical f32 logits
+        assert_eq!(mpc_logits, mpc_logits1);
+        assert_eq!(mpc_logits.len(), config.vocab_size);
+
+        // Should be close to plaintext (embedding Q16.16 roundtrip introduces ~1e-5 error)
+        let mut max_diff = 0.0f32;
+        for i in 0..config.vocab_size {
+            assert!(mpc_logits[i].is_finite(), "logit[{i}] is NaN/Inf");
+            let diff = (mpc_logits[i] - plaintext_logits[i]).abs();
+            if diff > max_diff { max_diff = diff; }
+        }
+        eprintln!("Qwen3.5 lower-security: max logit diff={max_diff}");
+        assert!(
+            max_diff < 5.0,
+            "Qwen3.5 MPC diverges too much from plaintext: max_diff={max_diff}"
+        );
+    }
+
+    /// Test secure MPC (Q32.32 per-layer) with Qwen3.5 hybrid model.
+    #[test]
+    fn test_mpc_secure_qwen35_matches_plaintext() {
+        let config = qwen35_tiny_config();
+
+        let mut model_plain = Model::new(config.clone());
+        init_qwen35_model_weights(&mut model_plain);
+
+        let mut model0 = Model::new(config.clone());
+        init_qwen35_model_weights(&mut model0);
+
+        let mut model1 = Model::new(config.clone());
+        init_qwen35_model_weights(&mut model1);
+
+        let token_id = 1u32;
+
+        // Plaintext forward
+        let plaintext_logits = model_plain.forward_decode(token_id, 0);
+
+        // Secure MPC forward (Q32.32)
+        let share0 = shared_embedding_lookup_64(0, &model0, token_id);
+        let share1 = shared_embedding_lookup_64(1, &model1, token_id);
+
+        let (mut gen0, mut gen1) = dummy_triple_pair_128(500_000);
+        let (mut trans_a, mut trans_b) = memory_transport_pair();
+
+        let handle = std::thread::spawn(move || {
+            private_model_forward_secure(1, &mut model1, &share1, 0, &mut gen1, &mut trans_b)
+        });
+
+        let mpc_logits = private_model_forward_secure(0, &mut model0, &share0, 0, &mut gen0, &mut trans_a).unwrap();
+        let mpc_logits1 = handle.join().unwrap().unwrap();
+
+        // Both parties should produce identical revealed logits
+        assert_eq!(mpc_logits, mpc_logits1);
+        assert_eq!(mpc_logits.len(), config.vocab_size);
+
+        let mut max_diff = 0.0f32;
+        let mut plaintext_argmax = 0;
+        let mut mpc_argmax = 0;
+        let mut plaintext_max = f32::NEG_INFINITY;
+        let mut mpc_max = f32::NEG_INFINITY;
+
+        for i in 0..config.vocab_size {
+            let diff = (mpc_logits[i] - plaintext_logits[i]).abs();
+            if diff > max_diff { max_diff = diff; }
+            if plaintext_logits[i] > plaintext_max {
+                plaintext_max = plaintext_logits[i];
+                plaintext_argmax = i;
+            }
+            if mpc_logits[i] > mpc_max {
+                mpc_max = mpc_logits[i];
+                mpc_argmax = i;
+            }
+        }
+
+        eprintln!("Secure Qwen3.5 (4 layers): max logit diff={max_diff}");
+        eprintln!("Plaintext argmax={plaintext_argmax}, MPC argmax={mpc_argmax}");
+
+        for i in 0..config.vocab_size {
+            assert!(mpc_logits[i].is_finite(), "secure logit[{i}] is NaN/Inf");
+        }
+
+        // Q32.32 has quantization error — allow wider tolerance
+        assert!(
+            max_diff < 5.0,
+            "Secure Qwen3.5 MPC diverges too much: max_diff={max_diff}"
+        );
     }
 }

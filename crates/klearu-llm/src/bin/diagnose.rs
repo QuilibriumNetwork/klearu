@@ -10,6 +10,7 @@ use std::path::PathBuf;
 
 use klearu_llm::generate::pipeline::detect_eos_token;
 use klearu_llm::generate::sampler::{SamplerConfig, sample};
+use klearu_llm::model::block::AttentionLayer;
 use klearu_llm::tokenizer::Tokenizer;
 
 fn main() {
@@ -63,6 +64,18 @@ fn main() {
     eprintln!("  rms_norm_eps:     {}", config.rms_norm_eps);
     eprintln!("  tie_word_embeddings: {}", config.tie_word_embeddings);
     eprintln!("  GQA group_size:   {}", config.gqa_group_size());
+    if config.is_qwen35() {
+        eprintln!("  model_type:       Qwen3.5");
+        eprintln!("  attn_output_gate: {}", config.attn_output_gate);
+        eprintln!("  linear_heads:     {}", config.linear_num_key_heads);
+        eprintln!("  linear_key_dim:   {}", config.linear_key_head_dim);
+        eprintln!("  linear_value_dim: {}", config.linear_value_head_dim);
+        eprintln!("  partial_rotary:   {}", config.partial_rotary_factor());
+        let linear_count = (0..config.num_layers)
+            .filter(|&i| config.layer_type(i) == klearu_llm::config::LayerType::LinearAttention)
+            .count();
+        eprintln!("  linear_attn layers: {}/{}", linear_count, config.num_layers);
+    }
 
     // 2. Detect EOS token
     let eos = detect_eos_token(&model_dir);
@@ -103,12 +116,31 @@ fn main() {
         layer_nonzero += layer.mlp_norm.weight.iter().filter(|&&v| v != 0.0).count();
         layer_total += layer.mlp_norm.weight.len();
 
-        // Attention projections
-        for proj in [&layer.attention.q_proj, &layer.attention.k_proj,
-                     &layer.attention.v_proj, &layer.attention.o_proj] {
-            let w = proj.weights.as_raw_slice();
-            layer_nonzero += w.iter().filter(|&&v| v != 0.0).count();
-            layer_total += w.len();
+        // Attention projections (handle both layer types)
+        match &layer.attention {
+            AttentionLayer::Standard(attn) => {
+                for proj in [&attn.q_proj, &attn.k_proj, &attn.v_proj, &attn.o_proj] {
+                    let w = proj.weights.as_raw_slice();
+                    layer_nonzero += w.iter().filter(|&&v| v != 0.0).count();
+                    layer_total += w.len();
+                }
+            }
+            AttentionLayer::GatedDeltaNet(dn) => {
+                for proj in [&dn.in_proj_qkv, &dn.in_proj_z, &dn.in_proj_a,
+                             &dn.in_proj_b, &dn.out_proj] {
+                    let w = proj.weights.as_raw_slice();
+                    layer_nonzero += w.iter().filter(|&&v| v != 0.0).count();
+                    layer_total += w.len();
+                }
+                layer_nonzero += dn.conv_weight.iter().filter(|&&v| v != 0.0).count();
+                layer_total += dn.conv_weight.len();
+                layer_nonzero += dn.dt_bias.iter().filter(|&&v| v != 0.0).count();
+                layer_total += dn.dt_bias.len();
+                layer_nonzero += dn.a_log.iter().filter(|&&v| v != 0.0).count();
+                layer_total += dn.a_log.len();
+                layer_nonzero += dn.norm_weight.iter().filter(|&&v| v != 0.0).count();
+                layer_total += dn.norm_weight.len();
+            }
         }
 
         // MLP projections
@@ -118,9 +150,14 @@ fn main() {
             layer_total += w.len();
         }
 
+        let layer_kind = match &layer.attention {
+            AttentionLayer::Standard(_) => "full",
+            AttentionLayer::GatedDeltaNet(_) => "linear",
+        };
+
         if layer_idx < 3 || layer_idx == config.num_layers - 1 {
-            eprintln!("  layer {}: {}/{} non-zero ({:.1}%)",
-                layer_idx, layer_nonzero, layer_total,
+            eprintln!("  layer {} ({}): {}/{} non-zero ({:.1}%)",
+                layer_idx, layer_kind, layer_nonzero, layer_total,
                 100.0 * layer_nonzero as f64 / layer_total as f64);
         } else if layer_idx == 3 {
             eprintln!("  ... (skipping middle layers) ...");
@@ -168,7 +205,8 @@ fn main() {
 
     let last_token = *tokens.last().unwrap_or(&0);
     let position = if tokens.is_empty() { 0 } else { tokens.len() - 1 };
-    let logits = model.forward_decode(last_token, position);
+    eprintln!("\n--- Per-Layer Norms (last token) ---");
+    let logits = model.forward_decode_debug(last_token, position);
 
     eprintln!("  Logits: {} values", logits.len());
 

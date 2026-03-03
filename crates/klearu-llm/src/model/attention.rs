@@ -3,7 +3,8 @@ use super::linear::Linear;
 use super::rope::RotaryEmbedding;
 use klearu_accel::simd::dense_dot_dense_simd;
 
-/// Multi-head attention with Grouped Query Attention (GQA) and KV cache.
+/// Multi-head attention with Grouped Query Attention (GQA), KV cache,
+/// and optional Qwen3.5 features (output gate, Q/K RMSNorm, partial RoPE).
 pub struct Attention {
     pub q_proj: Linear,
     pub k_proj: Linear,
@@ -13,6 +14,16 @@ pub struct Attention {
     num_kv_heads: usize,
     head_dim: usize,
     gqa_group_size: usize,
+
+    // Qwen3.5 gated full attention features
+    /// If true, q_proj output is doubled: first half = query, second half = sigmoid gate.
+    pub output_gate: bool,
+    /// Per-head_dim RMSNorm for Q (Qwen3.5). Uses (1 + weight) scaling.
+    pub q_norm_weight: Option<Vec<f32>>,
+    /// Per-head_dim RMSNorm for K (Qwen3.5). Uses (1 + weight) scaling.
+    pub k_norm_weight: Option<Vec<f32>>,
+    /// Epsilon for Q/K RMSNorm.
+    pub qk_norm_eps: f32,
 }
 
 impl Attention {
@@ -44,6 +55,39 @@ impl Attention {
             num_kv_heads,
             head_dim,
             gqa_group_size: num_heads / num_kv_heads,
+            output_gate: false,
+            q_norm_weight: None,
+            k_norm_weight: None,
+            qk_norm_eps: 1e-6,
+        }
+    }
+
+    /// Create an attention layer for Qwen3.5 gated full attention.
+    /// q_proj is doubled (2 * num_heads * head_dim) for the output gate.
+    pub fn new_gated(
+        hidden_size: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        rms_norm_eps: f32,
+    ) -> Self {
+        let q_dim = num_heads * head_dim;
+        let kv_dim = num_kv_heads * head_dim;
+
+        Self {
+            // q_proj output is doubled: query + gate
+            q_proj: Linear::new(hidden_size, q_dim * 2),
+            k_proj: Linear::new(hidden_size, kv_dim),
+            v_proj: Linear::new(hidden_size, kv_dim),
+            o_proj: Linear::new(q_dim, hidden_size),
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            gqa_group_size: num_heads / num_kv_heads,
+            output_gate: true,
+            q_norm_weight: Some(vec![0.0; head_dim]),
+            k_norm_weight: Some(vec![0.0; head_dim]),
+            qk_norm_eps: rms_norm_eps,
         }
     }
 
@@ -59,14 +103,49 @@ impl Attention {
         let q_dim = self.num_heads * self.head_dim;
         let kv_dim = self.num_kv_heads * self.head_dim;
 
-        // Project Q, K, V
-        let mut q = vec![0.0f32; q_dim];
+        // Project K, V (same for both standard and gated)
         let mut k = vec![0.0f32; kv_dim];
         let mut v = vec![0.0f32; kv_dim];
-
-        self.q_proj.forward(input, &mut q);
         self.k_proj.forward(input, &mut k);
         self.v_proj.forward(input, &mut v);
+
+        // Project Q (and gate if output_gate)
+        let (mut q, gate) = if self.output_gate {
+            // q_proj output is [num_heads × (head_dim * 2)], interleaved per-head:
+            // [head0_query(head_dim) | head0_gate(head_dim) | head1_query | head1_gate | ...]
+            // We must de-interleave into separate q[num_heads × head_dim] and gate[num_heads × head_dim].
+            let mut q_gate = vec![0.0f32; q_dim * 2];
+            self.q_proj.forward(input, &mut q_gate);
+            let mut q = vec![0.0f32; q_dim];
+            let mut gate = vec![0.0f32; q_dim];
+            for h in 0..self.num_heads {
+                let src_offset = h * self.head_dim * 2;
+                let dst_offset = h * self.head_dim;
+                q[dst_offset..dst_offset + self.head_dim]
+                    .copy_from_slice(&q_gate[src_offset..src_offset + self.head_dim]);
+                gate[dst_offset..dst_offset + self.head_dim]
+                    .copy_from_slice(&q_gate[src_offset + self.head_dim..src_offset + self.head_dim * 2]);
+            }
+            (q, Some(gate))
+        } else {
+            let mut q = vec![0.0f32; q_dim];
+            self.q_proj.forward(input, &mut q);
+            (q, None)
+        };
+
+        // Apply per-head Q/K RMSNorm if present (Qwen3.5, uses 1+weight scaling)
+        if let Some(ref qw) = self.q_norm_weight {
+            for h in 0..self.num_heads {
+                let offset = h * self.head_dim;
+                rms_norm_one_plus(&mut q[offset..offset + self.head_dim], qw, self.qk_norm_eps);
+            }
+        }
+        if let Some(ref kw) = self.k_norm_weight {
+            for h in 0..self.num_kv_heads {
+                let offset = h * self.head_dim;
+                rms_norm_one_plus(&mut k[offset..offset + self.head_dim], kw, self.qk_norm_eps);
+            }
+        }
 
         // Apply RoPE to each Q head
         for h in 0..self.num_heads {
@@ -114,6 +193,13 @@ impl Attention {
             }
         }
 
+        // Apply output gate: output *= sigmoid(gate)
+        if let Some(ref gate) = gate {
+            for (o, &g) in attn_concat.iter_mut().zip(gate.iter()) {
+                *o *= sigmoid(g);
+            }
+        }
+
         // Output projection
         let hidden_size = self.o_proj.out_features();
         let mut output = vec![0.0f32; hidden_size];
@@ -121,6 +207,28 @@ impl Attention {
 
         output
     }
+}
+
+/// In-place RMSNorm with (1 + weight) scaling.
+fn rms_norm_one_plus(x: &mut [f32], weight: &[f32], eps: f32) {
+    let n = x.len();
+    debug_assert_eq!(n, weight.len());
+
+    let mut sum_sq = 0.0f32;
+    for &v in x.iter() {
+        sum_sq += v * v;
+    }
+    let rms = (sum_sq / n as f32 + eps).sqrt();
+    let inv_rms = 1.0 / rms;
+
+    for (xi, &wi) in x.iter_mut().zip(weight.iter()) {
+        *xi = *xi * inv_rms * (1.0 + wi);
+    }
+}
+
+#[inline]
+fn sigmoid(x: f32) -> f32 {
+    1.0 / (1.0 + (-x).exp())
 }
 
 /// In-place softmax over a slice.
@@ -143,6 +251,7 @@ fn softmax_inplace(x: &mut [f32]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::kv_cache::KvCache;
 
     #[test]
     fn test_softmax() {
@@ -216,5 +325,42 @@ mod tests {
         for (a, b) in out0_alone.iter().zip(out0_with_next.iter()) {
             assert!((a - b).abs() < 1e-6, "Causal violation: {a} != {b}");
         }
+    }
+
+    #[test]
+    fn test_sigmoid() {
+        assert!((sigmoid(0.0) - 0.5).abs() < 1e-6);
+        assert!(sigmoid(100.0) > 0.999);
+        assert!(sigmoid(-100.0) < 0.001);
+    }
+
+    #[test]
+    fn test_rms_norm_one_plus() {
+        let weight = vec![0.0; 4]; // (1+0) = 1, same as unit
+        let mut x = vec![1.0, 2.0, 3.0, 4.0];
+        let expected_rms = (7.5f32 + 1e-6).sqrt();
+        let expected: Vec<f32> = [1.0, 2.0, 3.0, 4.0].iter().map(|&v| v / expected_rms).collect();
+        rms_norm_one_plus(&mut x, &weight, 1e-6);
+        for (a, b) in x.iter().zip(expected.iter()) {
+            assert!((a - b).abs() < 1e-5, "{a} != {b}");
+        }
+    }
+
+    #[test]
+    fn test_gated_attention_output_finite() {
+        let hidden_size = 16;
+        let num_heads = 4;
+        let num_kv_heads = 2;
+        let head_dim = 4;
+
+        let attn = Attention::new_gated(hidden_size, num_heads, num_kv_heads, head_dim, 1e-6);
+        let rope = RotaryEmbedding::new(head_dim, 32, 10000.0);
+        let mut kv_cache = KvCache::new(num_kv_heads, 32, head_dim);
+
+        let input = vec![0.1; hidden_size];
+        let output = attn.forward(&input, 0, &rope, &mut kv_cache);
+
+        assert_eq!(output.len(), hidden_size);
+        assert!(output.iter().all(|x| x.is_finite()));
     }
 }

@@ -380,6 +380,7 @@ mod tests {
             rope_theta: 10000.0,
             rms_norm_eps: 1e-5,
             tie_word_embeddings: true,
+            ..LlmConfig::default()
         }
     }
 
