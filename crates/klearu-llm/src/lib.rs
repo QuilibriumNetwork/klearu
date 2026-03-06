@@ -9,6 +9,9 @@ pub mod weight;
 #[cfg(feature = "sparse")]
 pub mod sparse;
 
+#[cfg(feature = "vision")]
+pub mod vlm;
+
 pub use config::LlmConfig;
 pub use error::{LlmError, Result};
 pub use model::Model;

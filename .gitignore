@@ -4,6 +4,12 @@
 # Model weights (large files, download separately)
 SmolLM-135M-Instruct/
 SmolLM2-1.7B/
+davit_tiny/
+vit_tiny/
+eva02_tiny/
+dinov2_small/
+siglip_base/
+Qwen3.5-0.8B/
 
 # macOS
 .DS_Store

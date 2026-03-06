@@ -1,4 +1,5 @@
 pub mod activation;
+pub mod attention_mpc;
 pub mod beaver;
 pub mod fixed_point;
 pub mod linear;

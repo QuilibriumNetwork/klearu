@@ -48,6 +48,12 @@ impl PredictorStore {
         self.num_layers
     }
 
+    /// Returns true if any layer has a calibrated head or neuron predictor.
+    pub fn is_calibrated(&self) -> bool {
+        self.head_predictors.iter().any(|p| p.is_some())
+            || self.neuron_predictors.iter().any(|p| p.is_some())
+    }
+
     /// Save all predictors to a directory.
     /// Each predictor is saved as `layer_{i}_head.json` / `layer_{i}_neuron.json`.
     pub fn save(&self, dir: &Path) -> std::io::Result<()> {

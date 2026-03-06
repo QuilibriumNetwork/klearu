@@ -8,7 +8,7 @@ AGPL-3.0 with additional terms. See [LICENSE](LICENSE) for details. Commercial u
 
 ## Workspace Overview
 
-Klearu is organized as a Cargo workspace with 10 crates:
+Klearu is organized as a Cargo workspace with 11 crates:
 
 | Crate | Description |
 |---|---|
@@ -17,7 +17,8 @@ Klearu is organized as a Cargo workspace with 10 crates:
 | **klearu-mongoose** | Learnable hash functions, adaptive rebuild scheduling with drift detection |
 | **klearu-bolt** | LSH hyperparameter autotuning, sparse inference optimizations |
 | **klearu-dejavu** | Deja Vu transformer sparsity prediction (attention heads + MLP neurons) |
-| **klearu-llm** | LLaMA-compatible LLM inference with optional sparsity |
+| **klearu-vision** | Vision transformers: DaViT, ViT, Swin, ConvNeXt, Hiera, EVA-02, Qwen Vision, SigLIP, DINOv2 |
+| **klearu-llm** | LLaMA-compatible LLM inference with optional sparsity and VLM support |
 | **klearu** | Facade crate with feature-gated re-exports |
 | **klearu-dpf** | Distributed Point Functions (AES-based BGI construction) and DCF |
 | **klearu-mpc** | 2PC building blocks: Q16.16/Q32.32 fixed-point, Beaver triples, additive sharing |
@@ -47,6 +48,15 @@ cargo build --release -p klearu-llm
 
 # LLM with sparse inference (no monorepo needed)
 cargo build --release -p klearu-llm --features sparse
+
+# Vision models (no monorepo needed)
+cargo build --release -p klearu-vision
+
+# Vision with sparse inference
+cargo build --release -p klearu-vision --features sparse
+
+# Vision CLI (image classification)
+cargo build --release -p klearu-vision --features cli
 
 # Private inference (requires monorepo sibling)
 cargo build --release -p klearu-private
@@ -166,6 +176,99 @@ A LLaMA-compatible inference engine supporting GQA, RoPE, RMSNorm, and SwiGLU. W
 |---|---|---|
 | `head_sparsity` | 0.5 | Fraction of attention heads to keep |
 | `neuron_sparsity` | 0.5 | Fraction of FFN neurons to keep |
+
+### klearu-vision — Vision Transformers
+
+A pure-Rust vision encoder library supporting multiple architectures. All models load from [timm](https://huggingface.co/timm) safetensors format with automatic preprocessing config detection.
+
+**Supported architectures:**
+
+| Architecture | Loader | Notes |
+|---|---|---|
+| DaViT | `load_davit_model()` | 4-stage dual-attention (spatial window + channel) |
+| ViT | `load_vit_model()` | Standard Vision Transformer (CLS/mean pool) |
+| Swin | — | Shifted-window attention with relative position bias |
+| ConvNeXt | — | Pure-convolution "modernized ResNet" |
+| Hiera | — | Hierarchical ViT with masked-unit attention |
+| EVA-02 | `load_eva02_model()` | ViT with SwiGLU MLP and RoPE |
+| DINOv2 | `load_dinov2_model()` | Self-supervised ViT feature extractor |
+| SigLIP | `load_siglip_model()` | Sigmoid-loss contrastive vision encoder |
+| Qwen Vision | `load_qwen_vision_from_dir()` | Conv2d patch embed → ViT blocks → PatchMerger |
+
+**Features:**
+- Preprocessing: resize (bicubic/bilinear), center crop, ImageNet normalization — auto-detected from timm `pretrained_cfg`
+- INT8 quantization: `QuantizedLinear` (W8A32) with per-channel symmetric quantization
+- 2D RoPE for position-aware attention (EVA-02)
+- Test-time augmentation: horizontal flip, five-crop, ten-crop
+- Sparse inference (feature: `sparse`): per-block Deja Vu sparsity prediction for all architectures
+
+#### Running DaViT Inference
+
+```bash
+# Download a DaViT model from timm
+huggingface-cli download timm/davit_tiny.msft_in1k --local-dir davit_tiny
+
+# Run inference on an image (requires `cli` feature)
+cargo run --release -p klearu-vision --features cli --bin davit-infer -- \
+    ./davit_tiny path/to/image.jpg
+
+# With horizontal-flip TTA
+cargo run --release -p klearu-vision --features cli --bin davit-infer -- \
+    ./davit_tiny path/to/image.jpg --tta
+```
+
+#### Programmatic Usage
+
+```rust
+use klearu_vision::weight::load_vit_model;
+use klearu_vision::preprocess::PreprocessConfig;
+
+// Load a ViT model from a timm model directory
+let model = load_vit_model("./vit_tiny")?;
+
+// Preprocess: [C, H, W] f32 tensor, ImageNet-normalized
+let image: Vec<f32> = /* your preprocessing */;
+let logits = model.forward(&image);
+```
+
+#### Vision-Language Model (VLM) Bridge
+
+The `klearu-llm` crate includes a `VlmBridge` that connects the Qwen Vision encoder to LLM inference, replacing `<image>` placeholder tokens with vision encoder outputs:
+
+```rust
+use klearu_llm::vlm::{VlmBridge, VlmImage};
+
+let bridge = VlmBridge::new(vision_encoder, image_token_id,
+    vision_start_token_id, vision_end_token_id);
+
+// Encode image and inject into text embeddings
+let image = VlmImage { data: chw_tensor, height: 448, width: 448 };
+let merged = bridge.inject_vision_tokens(
+    &token_ids, &text_embeddings, &[image], hidden_size,
+);
+```
+
+#### Downloading Vision Models
+
+```bash
+# DaViT tiny (~44 MB)
+huggingface-cli download timm/davit_tiny.msft_in1k --local-dir davit_tiny
+
+# ViT tiny (~22 MB)
+huggingface-cli download timm/vit_tiny_patch16_224.augreg_in21k_ft_in1k --local-dir vit_tiny
+
+# EVA-02 tiny (~22 MB)
+huggingface-cli download timm/eva02_tiny_patch14_336.mim_in22k_ft_in1k --local-dir eva02_tiny
+
+# DINOv2 small (~84 MB)
+huggingface-cli download timm/vit_small_patch14_dinov2.lvd142m --local-dir dinov2_small
+
+# SigLIP base (~354 MB)
+huggingface-cli download timm/vit_base_patch16_siglip_224.webli --local-dir siglip_base
+
+# Qwen3.5-0.8B VLM (~1.8 GB, includes both vision encoder and LLM)
+huggingface-cli download Qwen/Qwen3.5-0.8B --local-dir Qwen3.5-0.8B
+```
 
 ### klearu-dpf — Distributed Point Functions
 
@@ -287,4 +390,4 @@ The facade crate (`klearu`) provides feature-gated access to all functionality:
 | `llm` | LLM inference engine |
 | `full` | All of the above |
 
-The `sparse` feature on `klearu-llm` enables Deja Vu sparse inference and the `calibrate` binary.
+The `sparse` feature on `klearu-llm` enables Deja Vu sparse inference and the `calibrate` binary. The `sparse` feature on `klearu-vision` enables per-block sparsity prediction for all vision architectures. The `cli` feature on `klearu-vision` enables the `davit-infer` binary for image classification.

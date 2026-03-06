@@ -9,11 +9,13 @@ repository.workspace = true
 [features]
 default = []
 sparse = ["dep:klearu-dejavu"]
+vision = ["dep:klearu-vision"]
 
 [dependencies]
 klearu-core = { workspace = true }
 klearu-accel = { workspace = true }
 klearu-dejavu = { workspace = true, optional = true }
+klearu-vision = { workspace = true, optional = true }
 
 half = { workspace = true }
 bytemuck = { workspace = true }

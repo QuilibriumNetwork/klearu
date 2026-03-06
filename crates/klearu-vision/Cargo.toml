@@ -1,0 +1,37 @@
+[package]
+name = "klearu-vision"
+description = "DaViT vision transformer with SLIDE-based sparsity"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+autobins = false
+
+[features]
+default = []
+sparse = ["dep:klearu-dejavu"]
+cli = ["dep:image"]
+
+[dependencies]
+klearu-core = { workspace = true }
+klearu-accel = { workspace = true }
+klearu-dejavu = { workspace = true, optional = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+safetensors = "0.4"
+memmap2 = "0.9"
+half = { workspace = true }
+image = { version = "0.25", optional = true }
+
+[[bin]]
+name = "davit-infer"
+path = "src/bin/davit_infer.rs"
+required-features = ["cli"]
+
+[dev-dependencies]
+rand = { workspace = true }
+rand_distr = { workspace = true }

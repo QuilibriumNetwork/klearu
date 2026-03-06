@@ -3,8 +3,26 @@ pub mod ferret_triples;
 pub mod oprf;
 pub mod private_attention;
 pub mod private_block;
+pub mod private_conv2d;
 pub mod private_mlp;
 pub mod private_model;
 pub mod private_pipeline;
 pub mod tcp_transport;
 pub mod weight_share;
+
+#[cfg(feature = "vision")]
+pub mod private_vision_helpers;
+#[cfg(feature = "vision")]
+pub mod private_davit;
+#[cfg(feature = "vision")]
+pub mod private_vit;
+#[cfg(feature = "vision")]
+pub mod private_qwen_vision;
+#[cfg(feature = "vision")]
+pub mod private_swin;
+#[cfg(feature = "vision")]
+pub mod private_convnext;
+#[cfg(feature = "vision")]
+pub mod private_hiera;
+#[cfg(feature = "vision")]
+pub mod private_eva02;

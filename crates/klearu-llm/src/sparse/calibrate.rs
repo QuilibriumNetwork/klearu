@@ -2,6 +2,7 @@ use klearu_dejavu::predictor::SparsityPredictor;
 
 use crate::config::LlmConfig;
 use crate::model::Model;
+use crate::model::block::AttentionLayer;
 use crate::sparse::predictor_store::PredictorStore;
 
 /// Head importance scores collected during calibration.
@@ -39,17 +40,29 @@ impl CalibrationData {
 
             let mut norm_buf = vec![0.0f32; hidden_size];
 
+            let mut attn_out = vec![0.0f32; hidden_size];
+
             for layer_idx in 0..config.num_layers {
                 norm_buf.copy_from_slice(&hidden);
                 model.layers[layer_idx].attn_norm.forward(&mut norm_buf);
 
-                // Full attention (we'd ideally capture per-head outputs here)
-                let attn_out = model.layers[layer_idx].attention.forward(
-                    &norm_buf,
-                    pos,
-                    &model.rope,
-                    model.kv_caches.layer_mut(layer_idx),
-                );
+                // Full attention (dispatch based on layer type)
+                match &model.layers[layer_idx].attention {
+                    AttentionLayer::Standard(attn) => {
+                        attn.forward_into(
+                            &norm_buf,
+                            pos,
+                            &model.rope,
+                            model.kv_caches.layer_mut(layer_idx),
+                            &mut attn_out,
+                        );
+                    }
+                    AttentionLayer::GatedDeltaNet(dn) => {
+                        let state = model.deltanet_states.layer_mut(layer_idx)
+                            .expect("DeltaNet state missing for linear attention layer");
+                        dn.forward_decode_into(&norm_buf, state, &mut attn_out);
+                    }
+                };
 
                 // Approximate head importance: L2 norm of the full attention output
                 // divided equally across heads (simplified).
@@ -59,7 +72,7 @@ impl CalibrationData {
                     self.head_importance[layer_idx][h] += per_head;
                 }
 
-                for (h, a) in hidden.iter_mut().zip(attn_out.iter()) {
+                for (h, &a) in hidden.iter_mut().zip(attn_out.iter()) {
                     *h += a;
                 }
 

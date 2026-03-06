@@ -8,28 +8,53 @@ use crate::tokenizer::Tokenizer;
 
 use super::sampler::{SamplerConfig, sample};
 
-/// Detect EOS token ID from a model directory's `tokenizer_config.json`.
+/// Detect EOS token ID from a model directory's config files.
 ///
-/// Tries `eos_token_id` (integer), `eos_token` (string or object), and common defaults.
+/// Priority:
+/// 1. `tokenizer_config.json` → `eos_token_id` (integer)
+/// 2. `tokenizer_config.json` → resolve `eos_token` string via `added_tokens_decoder`
+/// 3. `config.json` → top-level `eos_token_id`
+/// 4. `config.json` → `text_config.eos_token_id`
+/// 5. Fallback to 2 (common LLaMA default)
 pub fn detect_eos_token(model_dir: &Path) -> Option<u32> {
-    let config_path = model_dir.join("tokenizer_config.json");
-    let content = std::fs::read_to_string(config_path).ok()?;
-    let json: serde_json::Value = serde_json::from_str(&content).ok()?;
-
-    // Try "eos_token_id" first (integer)
-    if let Some(id) = json.get("eos_token_id").and_then(|v| v.as_u64()) {
-        return Some(id as u32);
-    }
-
-    // Try config.json instead (supports nested Qwen3.5 format)
-    let config_path = model_dir.join("config.json");
-    if let Ok(content) = std::fs::read_to_string(config_path) {
+    let tok_config_path = model_dir.join("tokenizer_config.json");
+    if let Ok(content) = std::fs::read_to_string(&tok_config_path) {
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
-            // Top-level eos_token_id
+            // Try "eos_token_id" integer first
             if let Some(id) = json.get("eos_token_id").and_then(|v| v.as_u64()) {
                 return Some(id as u32);
             }
-            // Nested under text_config (Qwen3.5)
+
+            // Try resolving "eos_token" string via "added_tokens_decoder"
+            let eos_token_str = json.get("eos_token").and_then(|v| {
+                // Can be a plain string or an object with "content" field
+                v.as_str().map(|s| s.to_string())
+                    .or_else(|| v.get("content").and_then(|c| c.as_str()).map(|s| s.to_string()))
+            });
+
+            if let Some(eos_str) = eos_token_str {
+                if let Some(decoder) = json.get("added_tokens_decoder").and_then(|v| v.as_object()) {
+                    for (id_str, info) in decoder {
+                        if let Some(content) = info.get("content").and_then(|c| c.as_str()) {
+                            if content == eos_str {
+                                if let Ok(id) = id_str.parse::<u32>() {
+                                    return Some(id);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Try config.json (supports nested Qwen3.5 format)
+    let config_path = model_dir.join("config.json");
+    if let Ok(content) = std::fs::read_to_string(config_path) {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+            if let Some(id) = json.get("eos_token_id").and_then(|v| v.as_u64()) {
+                return Some(id as u32);
+            }
             if let Some(tc) = json.get("text_config") {
                 if let Some(id) = tc.get("eos_token_id").and_then(|v| v.as_u64()) {
                     return Some(id as u32);
