@@ -12,7 +12,8 @@
 //! values outside [-3, 3].
 
 use klearu_llm::model::mlp::Mlp;
-use klearu_mpc::beaver::TripleGenerator;
+use klearu_mpc::beaver::{TripleGenerator, TripleGenerator128};
+use klearu_mpc::activation::swiglu_noreveal_64;
 use klearu_mpc::fixed_point::{from_fixed, from_fixed64, SCALE_64};
 use klearu_mpc::linear::{shared_linear_forward, shared_linear_forward_64_pq, shared_linear_forward_sparse};
 use klearu_mpc::transport::Transport;
@@ -32,7 +33,7 @@ fn silu(x: f32) -> f32 {
 ///
 /// No Beaver triples needed.
 fn swiglu_reveal(
-    party: u8,
+    _party: u8,
     gate_share: &SharedVec,
     up_share: &SharedVec,
     transport: &mut impl Transport,
@@ -179,10 +180,10 @@ pub fn private_dense_mlp_forward_secure(
     let out_features = mlp.gate_proj.out_features();
 
     let gate_share = shared_linear_forward_64_pq(
-        &mlp.gate_proj.weights_q32, in_features, out_features, x_share,
+        &mlp.gate_proj.q32_weights(), in_features, out_features, x_share,
     );
     let up_share = shared_linear_forward_64_pq(
-        &mlp.up_proj.weights_q32, in_features, out_features, x_share,
+        &mlp.up_proj.q32_weights(), in_features, out_features, x_share,
     );
 
     let activated = swiglu_reveal_64(party, &gate_share, &up_share, transport)?;
@@ -190,7 +191,52 @@ pub fn private_dense_mlp_forward_secure(
     let down_in = mlp.down_proj.in_features();
     let down_out = mlp.down_proj.out_features();
     Ok(shared_linear_forward_64_pq(
-        &mlp.down_proj.weights_q32, down_in, down_out, &activated,
+        &mlp.down_proj.q32_weights(), down_in, down_out, &activated,
+    ))
+}
+
+/// No-reveal dense MLP forward pass (Q32.32).
+///
+/// Uses polynomial SiLU (no gate reveal). 3 triples/neuron, 3 round-trips.
+///
+/// Protocol:
+/// 1. gate_share = shared_linear_forward_64_pq(gate_proj, x_share) — local
+/// 2. up_share = shared_linear_forward_64_pq(up_proj, x_share) — local
+/// 3. activated = swiglu_noreveal_64(gate_share, up_share, triples, transport) — 3 RTs
+/// 4. output = shared_linear_forward_64_pq(down_proj, activated) — local
+///
+/// Leakage: none (only Beaver d/e values exchanged).
+pub fn private_dense_mlp_forward_noreveal(
+    party: u8,
+    mlp: &Mlp,
+    x_share: &SharedVec64,
+    triples: &mut impl TripleGenerator128,
+    transport: &mut impl Transport,
+) -> io::Result<SharedVec64> {
+    let in_features = mlp.gate_proj.in_features();
+    let out_features = mlp.gate_proj.out_features();
+
+    // 1. gate_proj (local)
+    let gate_share = shared_linear_forward_64_pq(
+        &mlp.gate_proj.q32_weights(), in_features, out_features, x_share,
+    );
+
+    // 2. up_proj (local)
+    let up_share = shared_linear_forward_64_pq(
+        &mlp.up_proj.q32_weights(), in_features, out_features, x_share,
+    );
+
+    // 3. SwiGLU via polynomial (no reveals): 3 triples/element, 3 round-trips
+    let n = out_features;
+    let needed = 3 * n; // swiglu_noreveal_64 needs 3n triples
+    let swiglu_triples = triples.generate(needed);
+    let activated = swiglu_noreveal_64(party, &gate_share, &up_share, &swiglu_triples, transport)?;
+
+    // 4. down_proj (local)
+    let down_in = mlp.down_proj.in_features();
+    let down_out = mlp.down_proj.out_features();
+    Ok(shared_linear_forward_64_pq(
+        &mlp.down_proj.q32_weights(), down_in, down_out, &activated,
     ))
 }
 

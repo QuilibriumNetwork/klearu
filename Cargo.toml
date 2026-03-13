@@ -12,6 +12,8 @@ members = [
     "crates/klearu-mpc",
     "crates/klearu-private",
     "crates/klearu-vision",
+    "crates/klearu-wasm",
+    "crates/klearu-server",
 ]
 
 [workspace.package]
@@ -29,9 +31,11 @@ klearu-bolt = { path = "crates/klearu-bolt" }
 klearu-dejavu = { path = "crates/klearu-dejavu" }
 klearu-llm = { path = "crates/klearu-llm" }
 klearu-dpf = { path = "crates/klearu-dpf" }
-klearu-mpc = { path = "crates/klearu-mpc" }
-klearu-private = { path = "crates/klearu-private" }
+klearu-mpc = { path = "crates/klearu-mpc", default-features = false, features = ["test-transport"] }
+klearu-private = { path = "crates/klearu-private", default-features = false }
 klearu-vision = { path = "crates/klearu-vision" }
+klearu-wasm = { path = "crates/klearu-wasm" }
+klearu-server = { path = "crates/klearu-server" }
 
 # Core dependencies
 ndarray = { version = "0.16", features = ["rayon"] }
@@ -53,6 +57,19 @@ crossbeam = "0.8"
 criterion = { version = "0.5", features = ["html_reports"] }
 aes = "0.8"
 curve25519-dalek = { version = "4", features = ["serde"] }
+
+# Server dependencies
+axum = { version = "0.8", features = ["ws"] }
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.6", features = ["fs", "cors"] }
+tracing-subscriber = "0.3"
+clap = { version = "4", features = ["derive"] }
+
+# WASM dependencies
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+getrandom = "0.2"
 
 [profile.release]
 lto = "thin"

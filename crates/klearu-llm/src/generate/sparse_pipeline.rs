@@ -98,7 +98,7 @@ impl SparsePipeline {
         for step in 0..config.max_new_tokens {
             let next_token = sample(&mut logits, &config.sampler, &all_ids, rng);
 
-            if config.eos_token_id == Some(next_token) {
+            if config.eos_token_ids.contains(&next_token) {
                 break;
             }
 
@@ -140,7 +140,7 @@ impl SparsePipeline {
         for step in 0..config.max_new_tokens {
             let next_token = sample(&mut logits, &config.sampler, &all_ids, rng);
 
-            if config.eos_token_id == Some(next_token) {
+            if config.eos_token_ids.contains(&next_token) {
                 break;
             }
 

@@ -1,0 +1,32 @@
+[package]
+name = "klearu-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Axum-based server for private 2PC chat inference"
+
+[dependencies]
+klearu-llm = { workspace = true }
+klearu-mpc = { workspace = true }
+klearu-private = { workspace = true, default-features = false }
+klearu-dpf = { workspace = true }
+bytemuck = { workspace = true }
+axum = { workspace = true }
+axum-server = { workspace = true }
+tokio = { workspace = true }
+tower-http = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+rand = { workspace = true }
+clap = { workspace = true }
+
+[[bin]]
+name = "server-a"
+path = "src/bin/server_a.rs"
+
+[[bin]]
+name = "server-b"
+path = "src/bin/server_b.rs"

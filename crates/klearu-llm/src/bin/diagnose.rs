@@ -8,7 +8,7 @@
 
 use std::path::PathBuf;
 
-use klearu_llm::generate::pipeline::detect_eos_token;
+use klearu_llm::generate::pipeline::detect_eos_tokens;
 use klearu_llm::generate::sampler::{SamplerConfig, sample};
 use klearu_llm::model::block::AttentionLayer;
 use klearu_llm::tokenizer::Tokenizer;
@@ -77,9 +77,9 @@ fn main() {
         eprintln!("  linear_attn layers: {}/{}", linear_count, config.num_layers);
     }
 
-    // 2. Detect EOS token
-    let eos = detect_eos_token(&model_dir);
-    eprintln!("\n--- EOS Token ---");
+    // 2. Detect EOS tokens
+    let eos = detect_eos_tokens(&model_dir);
+    eprintln!("\n--- EOS Tokens ---");
     eprintln!("  Detected: {:?}", eos);
 
     // 3. Load model
@@ -248,7 +248,7 @@ fn main() {
     for step in 0..20 {
         let next_token = sample(&mut logits, &sampler, &all_ids, &mut rand::thread_rng());
 
-        if eos == Some(next_token) {
+        if eos.contains(&next_token) {
             eprintln!("  [EOS at step {}]", step);
             break;
         }

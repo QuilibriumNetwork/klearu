@@ -7,30 +7,33 @@ repository.workspace = true
 description = "Private SLIDE inference via 2-party computation with Ferret OT"
 
 [features]
-default = []
-oprf-sparse = ["klearu-llm/sparse"]
+default = ["native"]
+native = ["dep:ferret", "dep:curve25519-dalek", "dep:aes", "klearu-llm/native-io"]
+oprf-sparse = ["native", "klearu-llm/sparse"]
 vision = ["dep:klearu-vision"]
 vision-cli = ["vision", "dep:image"]
 
 [dependencies]
 klearu-mpc = { workspace = true }
-klearu-llm = { workspace = true }
+klearu-llm = { path = "../klearu-llm", default-features = false }
 klearu-vision = { workspace = true, optional = true }
-ferret = { path = "../../../monorepo/crates/ferret" }
-curve25519-dalek = { workspace = true }
+ferret = { path = "../../../monorepo/crates/ferret", optional = true }
+curve25519-dalek = { workspace = true, optional = true }
 rand = { workspace = true }
 thiserror = { workspace = true }
-aes = { workspace = true }
+aes = { workspace = true, optional = true }
 serde_json = { workspace = true }
 image = { version = "0.25", optional = true }
 
 [[bin]]
 name = "private-server"
 path = "src/bin/private_server.rs"
+required-features = ["native"]
 
 [[bin]]
 name = "private-client"
 path = "src/bin/private_client.rs"
+required-features = ["native"]
 
 [[bin]]
 name = "davit-mpc-infer"

@@ -103,6 +103,73 @@ impl Model {
         }
     }
 
+    /// Create a model optimized for MPC party 0 (WASM): minimal embedding,
+    /// always-separate lm_head. The embedding table uses only 1 row to save
+    /// memory since party 0 never does token lookups (it receives embedding
+    /// shares). lm_head is always allocated as a separate Linear, even for
+    /// tie_word_embeddings models (its weights must be loaded separately).
+    pub fn new_no_embedding(config: LlmConfig) -> Self {
+        let rope = if config.is_qwen35() {
+            let rotary_dim = config.rotary_dim();
+            RotaryEmbedding::new_partial(
+                config.head_dim,
+                rotary_dim,
+                config.max_seq_len.min(8192),
+                config.rope_theta,
+            )
+        } else {
+            RotaryEmbedding::new(config.head_dim, config.max_seq_len, config.rope_theta)
+        };
+
+        // Minimal embedding (1 row) — party 0 never uses it
+        let embedding = Embedding::new(1, config.hidden_size);
+
+        let mut layers = Vec::with_capacity(config.num_layers);
+        for i in 0..config.num_layers {
+            layers.push(TransformerBlock::new_for_layer(&config, i));
+        }
+
+        let final_norm = if config.is_qwen35() {
+            RmsNorm::new_one_plus(config.hidden_size, config.rms_norm_eps)
+        } else {
+            RmsNorm::new(config.hidden_size, config.rms_norm_eps)
+        };
+
+        // Always create a separate lm_head (even for tie_word_embeddings)
+        let lm_head = Some(linear::Linear::new(config.hidden_size, config.vocab_size));
+
+        let kv_caches = KvCacheStore::new(
+            config.num_layers,
+            config.num_kv_heads,
+            if config.is_qwen35() {
+                config.max_seq_len.min(8192)
+            } else {
+                config.max_seq_len
+            },
+            config.head_dim,
+        );
+
+        let mut deltanet_states = DeltaNetStateStore::with_capacity(config.num_layers);
+        for i in 0..config.num_layers {
+            if config.layer_type(i) == LayerType::LinearAttention {
+                if let AttentionLayer::GatedDeltaNet(ref dn) = layers[i].attention {
+                    deltanet_states.states[i] = Some(dn.create_state());
+                }
+            }
+        }
+
+        Self {
+            config,
+            embedding,
+            layers,
+            final_norm,
+            lm_head,
+            rope,
+            kv_caches,
+            deltanet_states,
+        }
+    }
+
     /// Reset all KV caches and DeltaNet states (e.g., for a new generation).
     pub fn reset_kv_caches(&mut self) {
         self.kv_caches.clear();
@@ -263,6 +330,82 @@ impl Model {
         logits
     }
 
+    /// Decode from a raw embedding vector instead of a token ID.
+    ///
+    /// The provided `embedding` slice must have length == `hidden_size`.
+    /// This skips the embedding lookup and injects the vector directly as
+    /// the initial hidden state, then runs the same transformer layers,
+    /// final norm, and LM head as `forward_decode`.
+    pub fn forward_decode_with_embedding(&mut self, embedding: &[f32], position: usize) -> Vec<f32> {
+        let hidden_size = self.config.hidden_size;
+        let vocab_size = self.config.vocab_size;
+        let intermediate_size = self.config.intermediate_size;
+
+        // Use provided embedding directly instead of token lookup
+        let mut hidden = vec![0.0f32; hidden_size];
+        hidden.copy_from_slice(&embedding[..hidden_size]);
+
+        // Pre-allocate all scratch buffers (reused across layers)
+        let mut norm_buf = vec![0.0f32; hidden_size];
+        let mut attn_out = vec![0.0f32; hidden_size];
+        let mut mlp_out = vec![0.0f32; hidden_size];
+        let mut gate_buf = vec![0.0f32; intermediate_size];
+        let mut up_buf = vec![0.0f32; intermediate_size];
+
+        for layer_idx in 0..self.config.num_layers {
+            // Pre-attention norm
+            norm_buf.copy_from_slice(&hidden);
+            self.layers[layer_idx].attn_norm.forward(&mut norm_buf);
+
+            // Attention (dispatch based on layer type)
+            match &self.layers[layer_idx].attention {
+                AttentionLayer::Standard(attn) => {
+                    attn.forward_into(
+                        &norm_buf,
+                        position,
+                        &self.rope,
+                        self.kv_caches.layer_mut(layer_idx),
+                        &mut attn_out,
+                    );
+                }
+                AttentionLayer::GatedDeltaNet(dn) => {
+                    let state = self.deltanet_states.layer_mut(layer_idx)
+                        .expect("DeltaNet state missing for linear attention layer");
+                    dn.forward_decode_into(&norm_buf, state, &mut attn_out);
+                }
+            };
+
+            // Residual
+            for (h, &a) in hidden.iter_mut().zip(attn_out.iter()) {
+                *h += a;
+            }
+
+            // Pre-MLP norm
+            norm_buf.copy_from_slice(&hidden);
+            self.layers[layer_idx].mlp_norm.forward(&mut norm_buf);
+
+            // MLP
+            self.layers[layer_idx].mlp.forward_into(&norm_buf, &mut mlp_out, &mut gate_buf, &mut up_buf);
+
+            // Residual
+            for (h, &m) in hidden.iter_mut().zip(mlp_out.iter()) {
+                *h += m;
+            }
+        }
+
+        // Final norm
+        self.final_norm.forward(&mut hidden);
+
+        // LM head
+        let mut logits = vec![0.0f32; vocab_size];
+        match &self.lm_head {
+            Some(head) => head.forward(&hidden, &mut logits),
+            None => self.embedding.lm_head_forward(&hidden, &mut logits),
+        }
+
+        logits
+    }
+
     /// Prefill multiple tokens (initial prompt processing).
     /// Returns logits for the last token only.
     pub fn forward_prefill(&mut self, token_ids: &[u32]) -> Vec<f32> {
@@ -271,6 +414,85 @@ impl Model {
             logits = self.forward_decode(token_id, pos);
         }
         logits
+    }
+
+    /// Prefill multiple tokens and return the hidden state (post-final-norm,
+    /// pre-LM-head) at the last token position. This is the contextual
+    /// representation of the input sequence — suitable for use as a semantic
+    /// embedding. KV caches are populated for all positions.
+    pub fn forward_prefill_hidden(&mut self, token_ids: &[u32]) -> Vec<f32> {
+        let (hidden, _) = self.forward_prefill_hidden_and_logits(token_ids);
+        hidden
+    }
+
+    /// Prefill multiple tokens and return both:
+    /// - The post-final-norm hidden state (contextual embedding)
+    /// - Logits over the vocabulary (for sampling the next token)
+    ///
+    /// KV caches are populated for all positions, so autoregressive
+    /// generation can continue from `position = token_ids.len()`.
+    pub fn forward_prefill_hidden_and_logits(&mut self, token_ids: &[u32]) -> (Vec<f32>, Vec<f32>) {
+        let hidden_size = self.config.hidden_size;
+        let vocab_size = self.config.vocab_size;
+        let intermediate_size = self.config.intermediate_size;
+
+        let mut hidden = vec![0.0f32; hidden_size];
+        let mut norm_buf = vec![0.0f32; hidden_size];
+        let mut attn_out = vec![0.0f32; hidden_size];
+        let mut mlp_out = vec![0.0f32; hidden_size];
+        let mut gate_buf = vec![0.0f32; intermediate_size];
+        let mut up_buf = vec![0.0f32; intermediate_size];
+
+        for (pos, &token_id) in token_ids.iter().enumerate() {
+            // Embed the token
+            self.embedding.forward(token_id, &mut hidden);
+
+            for layer_idx in 0..self.config.num_layers {
+                norm_buf.copy_from_slice(&hidden);
+                self.layers[layer_idx].attn_norm.forward(&mut norm_buf);
+
+                match &self.layers[layer_idx].attention {
+                    AttentionLayer::Standard(attn) => {
+                        attn.forward_into(
+                            &norm_buf,
+                            pos,
+                            &self.rope,
+                            self.kv_caches.layer_mut(layer_idx),
+                            &mut attn_out,
+                        );
+                    }
+                    AttentionLayer::GatedDeltaNet(dn) => {
+                        let state = self.deltanet_states.layer_mut(layer_idx)
+                            .expect("DeltaNet state missing for linear attention layer");
+                        dn.forward_decode_into(&norm_buf, state, &mut attn_out);
+                    }
+                };
+
+                for (h, &a) in hidden.iter_mut().zip(attn_out.iter()) {
+                    *h += a;
+                }
+
+                norm_buf.copy_from_slice(&hidden);
+                self.layers[layer_idx].mlp_norm.forward(&mut norm_buf);
+                self.layers[layer_idx].mlp.forward_into(&norm_buf, &mut mlp_out, &mut gate_buf, &mut up_buf);
+
+                for (h, &m) in hidden.iter_mut().zip(mlp_out.iter()) {
+                    *h += m;
+                }
+            }
+        }
+
+        // Final norm
+        self.final_norm.forward(&mut hidden);
+
+        // LM head for logits
+        let mut logits = vec![0.0f32; vocab_size];
+        match &self.lm_head {
+            Some(head) => head.forward(&hidden, &mut logits),
+            None => self.embedding.lm_head_forward(&hidden, &mut logits),
+        }
+
+        (hidden, logits)
     }
 }
 

@@ -209,6 +209,54 @@ pub fn beaver_dot_product_64(
     Ok(result)
 }
 
+/// Batched element-wise Q32.32 Beaver multiply.
+///
+/// Returns `z[i] = x[i] * y[i]` for each element. Uses a single round-trip:
+/// concatenates all d and e shares, sends once, receives once.
+///
+/// Cost: n BeaverTriple128, 1 send + 1 recv of 2n u128 values.
+pub fn beaver_multiply_elementwise_64(
+    party: u8,
+    x_shares: &[u64],
+    y_shares: &[u64],
+    triples: &[BeaverTriple128],
+    transport: &mut impl Transport,
+) -> io::Result<Vec<u64>> {
+    let n = x_shares.len();
+    assert_eq!(n, y_shares.len());
+    assert_eq!(n, triples.len());
+
+    // Compute d = x - a, e = y - b for all elements
+    let mut de_concat = Vec::with_capacity(2 * n);
+    for i in 0..n {
+        de_concat.push((x_shares[i] as i64 as i128 as u128).wrapping_sub(triples[i].a));
+    }
+    for i in 0..n {
+        de_concat.push((y_shares[i] as i64 as i128 as u128).wrapping_sub(triples[i].b));
+    }
+
+    // Single round-trip
+    transport.send_u128_slice(&de_concat)?;
+    let de_others = transport.recv_u128_slice(2 * n)?;
+
+    let mut result = Vec::with_capacity(n);
+    for i in 0..n {
+        let d = de_concat[i].wrapping_add(de_others[i]);
+        let e = de_concat[n + i].wrapping_add(de_others[n + i]);
+
+        let mut z = triples[i].c;
+        z = z.wrapping_add(triples[i].a.wrapping_mul(e));
+        z = z.wrapping_add(d.wrapping_mul(triples[i].b));
+        if party == 0 {
+            z = z.wrapping_add(d.wrapping_mul(e));
+        }
+
+        result.push(((z as i128) >> FRAC_BITS_64) as i64 as u64);
+    }
+
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -370,5 +418,41 @@ mod tests {
 
         let result = from_fixed64(z0.wrapping_add(z1));
         assert!((result - expected).abs() < 1.0, "Q32 dot product should be ~{}, got {}", expected, result);
+    }
+
+    #[test]
+    fn test_beaver_multiply_elementwise_64() {
+        let x_vals = [3.0f32, -2.0, 0.5];
+        let y_vals = [4.0f32, 3.0, 0.5];
+        let expected = [12.0f32, -6.0, 0.25];
+
+        let x_fixed: Vec<u64> = x_vals.iter().map(|&v| to_fixed64(v)).collect();
+        let y_fixed: Vec<u64> = y_vals.iter().map(|&v| to_fixed64(v)).collect();
+
+        let (mut gen0, mut gen1) = dummy_triple_pair_128(600);
+        let t0 = gen0.generate(3);
+        let t1 = gen1.generate(3);
+
+        let (mut trans_a, mut trans_b) = memory_transport_pair();
+
+        let x0 = x_fixed;
+        let y0 = vec![0u64; 3];
+        let x1 = vec![0u64; 3];
+        let y1 = y_fixed;
+
+        let handle = std::thread::spawn(move || {
+            beaver_multiply_elementwise_64(1, &x1, &y1, &t1, &mut trans_b).unwrap()
+        });
+
+        let z0 = beaver_multiply_elementwise_64(0, &x0, &y0, &t0, &mut trans_a).unwrap();
+        let z1 = handle.join().unwrap();
+
+        for i in 0..3 {
+            let result = from_fixed64(z0[i].wrapping_add(z1[i]));
+            assert!(
+                (result - expected[i]).abs() < 1.0,
+                "elementwise[{i}]: expected {}, got {}", expected[i], result
+            );
+        }
     }
 }

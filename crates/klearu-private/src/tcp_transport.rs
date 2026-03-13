@@ -36,6 +36,10 @@ impl Transport for TcpTransport {
         self.reader.read_exact(&mut buf)?;
         Ok(buf)
     }
+
+    fn recv_into(&mut self, buf: &mut [u8]) -> io::Result<()> {
+        self.reader.read_exact(buf)
+    }
 }
 
 /// Create a pair of connected TCP transports on localhost (for testing).

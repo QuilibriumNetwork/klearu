@@ -218,6 +218,141 @@ impl Attention {
         output.iter_mut().for_each(|v| *v = 0.0);
         self.o_proj.forward(&attn_concat, output);
     }
+
+    /// Forward pass using pre-allocated scratch buffers.
+    /// Avoids all heap allocation in the hot decode path.
+    pub fn forward_into_buffered(
+        &self,
+        input: &[f32],
+        position: usize,
+        rope: &RotaryEmbedding,
+        kv_cache: &mut KvCache,
+        output: &mut [f32],
+        scratch: &mut AttentionScratch,
+    ) {
+        let q_dim = self.num_heads * self.head_dim;
+        let kv_dim = self.num_kv_heads * self.head_dim;
+
+        // Project K, V
+        self.k_proj.forward(input, &mut scratch.k[..kv_dim]);
+        self.v_proj.forward(input, &mut scratch.v[..kv_dim]);
+
+        // Project Q (and gate if output_gate)
+        let has_gate = if self.output_gate {
+            self.q_proj.forward(input, &mut scratch.q_gate[..q_dim * 2]);
+            // De-interleave: q_gate is [head0_query | head0_gate | head1_query | head1_gate | ...]
+            for h in 0..self.num_heads {
+                let src_offset = h * self.head_dim * 2;
+                let dst_offset = h * self.head_dim;
+                scratch.q[dst_offset..dst_offset + self.head_dim]
+                    .copy_from_slice(&scratch.q_gate[src_offset..src_offset + self.head_dim]);
+                scratch.gate[dst_offset..dst_offset + self.head_dim]
+                    .copy_from_slice(&scratch.q_gate[src_offset + self.head_dim..src_offset + self.head_dim * 2]);
+            }
+            true
+        } else {
+            self.q_proj.forward(input, &mut scratch.q[..q_dim]);
+            false
+        };
+
+        // Apply per-head Q/K RMSNorm if present
+        if let Some(ref qw) = self.q_norm_weight {
+            for h in 0..self.num_heads {
+                let offset = h * self.head_dim;
+                rms_norm_one_plus(&mut scratch.q[offset..offset + self.head_dim], qw, self.qk_norm_eps);
+            }
+        }
+        if let Some(ref kw) = self.k_norm_weight {
+            for h in 0..self.num_kv_heads {
+                let offset = h * self.head_dim;
+                rms_norm_one_plus(&mut scratch.k[offset..offset + self.head_dim], kw, self.qk_norm_eps);
+            }
+        }
+
+        // Apply RoPE
+        for h in 0..self.num_heads {
+            let offset = h * self.head_dim;
+            rope.apply(&mut scratch.q[offset..offset + self.head_dim], position);
+        }
+        for h in 0..self.num_kv_heads {
+            let offset = h * self.head_dim;
+            rope.apply(&mut scratch.k[offset..offset + self.head_dim], position);
+        }
+
+        // Append to KV cache
+        kv_cache.append(&scratch.k[..kv_dim], &scratch.v[..kv_dim]);
+
+        let seq_len = kv_cache.current_len();
+        let inv_sqrt_dk = 1.0 / (self.head_dim as f32).sqrt();
+
+        // Zero attn_concat for accumulation
+        scratch.attn_concat[..q_dim].fill(0.0);
+
+        for h in 0..self.num_heads {
+            let kv_h = h / self.gqa_group_size;
+            let q_head = &scratch.q[h * self.head_dim..(h + 1) * self.head_dim];
+
+            for j in 0..seq_len {
+                let k_j = kv_cache.k_at(kv_h, j);
+                scratch.scores[j] = dense_dot_dense_simd(q_head, k_j) * inv_sqrt_dk;
+            }
+
+            softmax_inplace(&mut scratch.scores[..seq_len]);
+
+            let head_out = &mut scratch.attn_concat[h * self.head_dim..(h + 1) * self.head_dim];
+            for (j, &score) in scratch.scores[..seq_len].iter().enumerate() {
+                let v_j = kv_cache.v_at(kv_h, j);
+                for (d, &vv) in head_out.iter_mut().zip(v_j.iter()) {
+                    *d += score * vv;
+                }
+            }
+        }
+
+        // Apply output gate
+        if has_gate {
+            for (o, &g) in scratch.attn_concat[..q_dim].iter_mut().zip(scratch.gate.iter()) {
+                *o *= sigmoid(g);
+            }
+        }
+
+        // Output projection
+        output.iter_mut().for_each(|v| *v = 0.0);
+        self.o_proj.forward(&scratch.attn_concat[..q_dim], output);
+    }
+}
+
+/// Pre-allocated scratch buffers for attention forward pass.
+/// Reuse across layers and tokens to avoid per-call heap allocation.
+pub struct AttentionScratch {
+    pub k: Vec<f32>,
+    pub v: Vec<f32>,
+    pub q: Vec<f32>,
+    pub q_gate: Vec<f32>,
+    pub gate: Vec<f32>,
+    pub attn_concat: Vec<f32>,
+    pub scores: Vec<f32>,
+}
+
+impl AttentionScratch {
+    pub fn new(
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        output_gate: bool,
+    ) -> Self {
+        let q_dim = num_heads * head_dim;
+        let kv_dim = num_kv_heads * head_dim;
+        Self {
+            k: vec![0.0; kv_dim],
+            v: vec![0.0; kv_dim],
+            q: vec![0.0; q_dim],
+            q_gate: if output_gate { vec![0.0; q_dim * 2] } else { Vec::new() },
+            gate: if output_gate { vec![0.0; q_dim] } else { Vec::new() },
+            attn_concat: vec![0.0; q_dim],
+            scores: vec![0.0; max_seq_len],
+        }
+    }
 }
 
 /// In-place RMSNorm with (1 + weight) scaling.

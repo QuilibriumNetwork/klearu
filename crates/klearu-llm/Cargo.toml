@@ -7,12 +7,14 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-default = []
+default = ["native-io", "parallel"]
+native-io = ["dep:klearu-core", "dep:safetensors", "dep:tokenizers", "dep:memmap2"]
 sparse = ["dep:klearu-dejavu"]
 vision = ["dep:klearu-vision"]
+parallel = ["dep:rayon"]
 
 [dependencies]
-klearu-core = { workspace = true }
+klearu-core = { workspace = true, optional = true }
 klearu-accel = { workspace = true }
 klearu-dejavu = { workspace = true, optional = true }
 klearu-vision = { workspace = true, optional = true }
@@ -25,22 +27,25 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 
 rand = { workspace = true }
-safetensors = "0.4"
-tokenizers = "0.20"
-memmap2 = "0.9"
+rayon = { workspace = true, optional = true }
+safetensors = { version = "0.4", optional = true }
+tokenizers = { version = "0.20", optional = true }
+memmap2 = { version = "0.9", optional = true }
 
 [[bin]]
 name = "chat"
 path = "src/bin/chat.rs"
+required-features = ["native-io"]
 
 [[bin]]
 name = "diagnose"
 path = "src/bin/diagnose.rs"
+required-features = ["native-io"]
 
 [[bin]]
 name = "calibrate"
 path = "src/bin/calibrate.rs"
-required-features = ["sparse"]
+required-features = ["sparse", "native-io"]
 
 [dev-dependencies]
 rand_distr = { workspace = true }

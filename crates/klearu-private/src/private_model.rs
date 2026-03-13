@@ -14,15 +14,32 @@
 
 use klearu_llm::Model;
 use klearu_llm::model::block::AttentionLayer;
+use klearu_llm::model::gated_deltanet::DeltaNetStateStore;
+use klearu_llm::model::kv_cache::KvCacheStore;
 use klearu_mpc::beaver::{TripleGenerator, TripleGenerator128};
 use klearu_mpc::fixed_point::{from_fixed, from_fixed64, to_fixed, to_fixed64};
-use klearu_mpc::linear::shared_linear_forward_64;
+use klearu_mpc::linear::{shared_linear_forward_64, shared_linear_forward_64_pq};
 use klearu_mpc::normalization::rmsnorm_shared_64;
 use klearu_mpc::transport::Transport;
 use klearu_mpc::{SharedVec, SharedVec64};
 use std::io;
 
 use crate::private_block::{private_block_forward_secure, effective_norm_weights};
+
+/// Create a `DeltaNetStateStore` matching a model's layer architecture.
+///
+/// Layers with GatedDeltaNet attention get initialized states; Standard
+/// attention layers get `None`. The returned store is owned by the caller
+/// and persists across tokens (like `KvCacheStore`).
+pub fn create_deltanet_states(model: &Model) -> DeltaNetStateStore {
+    let mut store = DeltaNetStateStore::with_capacity(model.config.num_layers);
+    for (i, layer) in model.layers.iter().enumerate() {
+        if let AttentionLayer::GatedDeltaNet(dn) = &layer.attention {
+            store.states[i] = Some(dn.create_state());
+        }
+    }
+    store
+}
 
 #[cfg(feature = "oprf-sparse")]
 use crate::oprf::{OprfClient, OprfServer};
@@ -337,19 +354,22 @@ pub fn shared_embedding_lookup(
     }
 }
 
-/// Secure (Q32.32) private inference for a single decode step.
+/// Secure (Q32.32) private inference — returns logit SHARES without reveal.
 ///
-/// Unlike `private_model_forward` which reveals the full embedding and runs
-/// plaintext, this uses per-layer MPC with Q32.32 shares. Only sum(x²)
-/// scalars, Q vectors, attention scores, and gate activations are revealed.
-pub fn private_model_forward_secure(
+/// Runs the full per-layer MPC forward pass with Q32.32 shares, but does NOT
+/// exchange shares at the end. The caller receives this party's logit share
+/// and must combine with the other party's share to reconstruct logits.
+///
+/// This is the building block for client-side logit reconstruction: the server
+/// sends both parties' shares to the client, who adds them locally.
+pub fn private_model_forward_secure_no_reveal(
     party: u8,
     model: &mut Model,
     input_share: &SharedVec64,
     position: usize,
     triples: &mut impl TripleGenerator128,
     transport: &mut impl Transport,
-) -> io::Result<Vec<f32>> {
+) -> io::Result<SharedVec64> {
     let hidden_size = model.config.hidden_size;
     assert_eq!(input_share.len(), hidden_size);
 
@@ -358,7 +378,6 @@ pub fn private_model_forward_secure(
 
     // Per-layer MPC forward pass
     for layer_idx in 0..model.config.num_layers {
-        // Extract deltanet state (separate field from layers/kv_caches/rope)
         let dn_state = model.deltanet_states.layer_mut(layer_idx);
 
         private_block_forward_secure(
@@ -396,6 +415,30 @@ pub fn private_model_forward_secure(
         party, lm_head_weights, hidden_size, vocab_size, &hidden_share, &[], transport,
     )?;
 
+    Ok(logit_shares)
+}
+
+/// Secure (Q32.32) private inference for a single decode step.
+///
+/// Unlike `private_model_forward` which reveals the full embedding and runs
+/// plaintext, this uses per-layer MPC with Q32.32 shares. Only sum(x²)
+/// scalars, Q vectors, attention scores, and gate activations are revealed.
+///
+/// Calls `private_model_forward_secure_no_reveal` and then exchanges shares
+/// to reveal the final logits.
+pub fn private_model_forward_secure(
+    party: u8,
+    model: &mut Model,
+    input_share: &SharedVec64,
+    position: usize,
+    triples: &mut impl TripleGenerator128,
+    transport: &mut impl Transport,
+) -> io::Result<Vec<f32>> {
+    let vocab_size = model.config.vocab_size;
+    let logit_shares = private_model_forward_secure_no_reveal(
+        party, model, input_share, position, triples, transport,
+    )?;
+
     // Final reveal: exchange logit shares → Vec<f32>
     transport.send_u64_slice(&logit_shares.0)?;
     let other = transport.recv_u64_slice(vocab_size)?;
@@ -421,6 +464,104 @@ pub fn shared_embedding_lookup_64(
     } else {
         SharedVec64::zeros(hidden_size)
     }
+}
+
+/// Private inference with external caches — returns logit SHARES.
+///
+/// Uses the secure MPC path (reveals Q/K/gate as f32, plaintext softmax/SiLU)
+/// for accurate nonlinear computation. DPF-PIR hides token IDs from Server B.
+///
+/// Only RMSNorm sum(x²) scalars, Q/K vectors, gate activations, and attention
+/// scores are revealed — NOT the full hidden state.
+///
+/// `kv_caches`: f32 KV cache store (caller owns, persists across tokens).
+/// `deltanet_states`: DeltaNet recurrent state store (caller owns, persists across tokens).
+pub fn private_model_forward_noreveal(
+    party: u8,
+    model: &Model,
+    input_share: &SharedVec64,
+    position: usize,
+    kv_caches: &mut KvCacheStore,
+    deltanet_states: &mut DeltaNetStateStore,
+    triples: &mut impl TripleGenerator128,
+    transport: &mut impl Transport,
+) -> io::Result<SharedVec64> {
+    let hidden_size = model.config.hidden_size;
+    assert_eq!(input_share.len(), hidden_size);
+
+    let mut hidden_share = input_share.clone();
+    let mut normed_buf = SharedVec64::zeros(hidden_size);
+
+    for layer_idx in 0..model.config.num_layers {
+        let dn_state = deltanet_states.layer_mut(layer_idx);
+
+        private_block_forward_secure(
+            party,
+            &model.layers[layer_idx],
+            &mut hidden_share,
+            position,
+            &model.rope,
+            kv_caches.layer_mut(layer_idx),
+            dn_state,
+            &mut normed_buf,
+            triples,
+            transport,
+        )?;
+    }
+
+    // Final RMSNorm
+    let final_weights = effective_norm_weights(&model.final_norm);
+    rmsnorm_shared_64(
+        party,
+        &mut hidden_share,
+        &final_weights,
+        model.final_norm.eps(),
+        triples,
+        transport,
+    )?;
+
+    // LM head projection (local, public weights)
+    let vocab_size = model.config.vocab_size;
+    let lm_head_weights = match &model.lm_head {
+        Some(head) => head.q32_weights().into_owned(),
+        None => {
+            // Tied embeddings: use embedding table as lm_head weights
+            let raw = model.embedding.weights.as_raw_slice();
+            raw.iter().map(|&v| klearu_mpc::to_fixed64(v) as i64).collect()
+        }
+    };
+    let logit_shares = shared_linear_forward_64_pq(
+        &lm_head_weights, hidden_size, vocab_size, &hidden_share,
+    );
+
+    Ok(logit_shares)
+}
+
+/// Private inference with external caches — returns revealed f32 logits.
+///
+/// Calls `private_model_forward_noreveal` then exchanges logit shares.
+pub fn private_model_forward_noreveal_reveal(
+    party: u8,
+    model: &Model,
+    input_share: &SharedVec64,
+    position: usize,
+    kv_caches: &mut KvCacheStore,
+    deltanet_states: &mut DeltaNetStateStore,
+    triples: &mut impl TripleGenerator128,
+    transport: &mut impl Transport,
+) -> io::Result<Vec<f32>> {
+    let vocab_size = model.config.vocab_size;
+    let logit_shares = private_model_forward_noreveal(
+        party, model, input_share, position, kv_caches, deltanet_states, triples, transport,
+    )?;
+
+    // Exchange logit shares → Vec<f32>
+    transport.send_u64_slice(&logit_shares.0)?;
+    let other = transport.recv_u64_slice(vocab_size)?;
+
+    Ok((0..vocab_size)
+        .map(|i| from_fixed64(logit_shares.0[i].wrapping_add(other[i])))
+        .collect())
 }
 
 #[cfg(test)]
@@ -1380,5 +1521,58 @@ mod tests {
             max_diff < 5.0,
             "Secure Qwen3.5 MPC diverges too much: max_diff={max_diff}"
         );
+    }
+
+    // --- No-reveal model tests ---
+
+    #[test]
+    fn test_noreveal_model_forward_runs() {
+        use klearu_llm::model::kv_cache::KvCacheStore;
+
+        let config = tiny_config();
+
+        let mut model0 = Model::new(config.clone());
+        init_model_weights(&mut model0);
+
+        let mut model1 = Model::new(config.clone());
+        init_model_weights(&mut model1);
+
+        let token_id = 1u32;
+        let share0 = shared_embedding_lookup_64(0, &model0, token_id);
+        let share1 = shared_embedding_lookup_64(1, &model1, token_id);
+
+        let (mut gen0, mut gen1) = dummy_triple_pair_128(500_000);
+        let (mut trans_a, mut trans_b) = memory_transport_pair();
+
+        let mut kv0 = KvCacheStore::new(
+            config.num_layers, config.num_kv_heads, config.max_seq_len, config.head_dim,
+        );
+        let mut kv1 = KvCacheStore::new(
+            config.num_layers, config.num_kv_heads, config.max_seq_len, config.head_dim,
+        );
+
+        let mut dn0 = create_deltanet_states(&model0);
+        let mut dn1 = create_deltanet_states(&model1);
+
+        let handle = std::thread::spawn(move || {
+            private_model_forward_noreveal_reveal(
+                1, &model1, &share1, 0, &mut kv1, &mut dn1, &mut gen1, &mut trans_b,
+            )
+        });
+
+        let mpc_logits = private_model_forward_noreveal_reveal(
+            0, &model0, &share0, 0, &mut kv0, &mut dn0, &mut gen0, &mut trans_a,
+        ).unwrap();
+        let mpc_logits1 = handle.join().unwrap().unwrap();
+
+        // Both parties should produce identical revealed logits
+        assert_eq!(mpc_logits, mpc_logits1);
+        assert_eq!(mpc_logits.len(), config.vocab_size);
+
+        for i in 0..config.vocab_size {
+            assert!(mpc_logits[i].is_finite(), "noreveal logit[{i}] is NaN/Inf");
+        }
+
+        eprintln!("No-reveal 1-layer: logits finite, len={}", mpc_logits.len());
     }
 }

@@ -78,6 +78,100 @@ impl KvCache {
     }
 }
 
+/// Per-layer KV cache storing Q32.32 shares (u64).
+///
+/// Layout: `[num_kv_heads][max_seq_len][head_dim]` -- same as KvCache.
+pub struct KvCache64 {
+    k: Vec<u64>,
+    v: Vec<u64>,
+    num_kv_heads: usize,
+    head_dim: usize,
+    max_seq_len: usize,
+    current_len: usize,
+}
+
+impl KvCache64 {
+    pub fn new(num_kv_heads: usize, max_seq_len: usize, head_dim: usize) -> Self {
+        let total = num_kv_heads * max_seq_len * head_dim;
+        Self {
+            k: vec![0u64; total],
+            v: vec![0u64; total],
+            num_kv_heads,
+            head_dim,
+            max_seq_len,
+            current_len: 0,
+        }
+    }
+
+    pub fn current_len(&self) -> usize {
+        self.current_len
+    }
+
+    /// Append K and V vectors for a single position.
+    /// `k_new` layout: `[num_kv_heads × head_dim]`, `v_new` same.
+    pub fn append(&mut self, k_new: &[u64], v_new: &[u64]) {
+        debug_assert_eq!(k_new.len(), self.num_kv_heads * self.head_dim);
+        debug_assert_eq!(v_new.len(), self.num_kv_heads * self.head_dim);
+        assert!(self.current_len < self.max_seq_len, "KvCache64 is full");
+
+        let pos = self.current_len;
+        for h in 0..self.num_kv_heads {
+            let src_offset = h * self.head_dim;
+            let dst_offset = h * self.max_seq_len * self.head_dim + pos * self.head_dim;
+            self.k[dst_offset..dst_offset + self.head_dim]
+                .copy_from_slice(&k_new[src_offset..src_offset + self.head_dim]);
+            self.v[dst_offset..dst_offset + self.head_dim]
+                .copy_from_slice(&v_new[src_offset..src_offset + self.head_dim]);
+        }
+        self.current_len += 1;
+    }
+
+    /// Get K at a specific head and position.
+    pub fn k_at(&self, kv_head: usize, pos: usize) -> &[u64] {
+        let offset = kv_head * self.max_seq_len * self.head_dim + pos * self.head_dim;
+        &self.k[offset..offset + self.head_dim]
+    }
+
+    /// Get V at a specific head and position.
+    pub fn v_at(&self, kv_head: usize, pos: usize) -> &[u64] {
+        let offset = kv_head * self.max_seq_len * self.head_dim + pos * self.head_dim;
+        &self.v[offset..offset + self.head_dim]
+    }
+
+    pub fn clear(&mut self) {
+        self.current_len = 0;
+    }
+}
+
+/// Collection of Q32.32 KV caches, one per layer.
+pub struct KvCacheStore64 {
+    caches: Vec<KvCache64>,
+}
+
+impl KvCacheStore64 {
+    pub fn new(
+        num_layers: usize,
+        num_kv_heads: usize,
+        max_seq_len: usize,
+        head_dim: usize,
+    ) -> Self {
+        let caches = (0..num_layers)
+            .map(|_| KvCache64::new(num_kv_heads, max_seq_len, head_dim))
+            .collect();
+        Self { caches }
+    }
+
+    pub fn layer_mut(&mut self, idx: usize) -> &mut KvCache64 {
+        &mut self.caches[idx]
+    }
+
+    pub fn clear(&mut self) {
+        for cache in &mut self.caches {
+            cache.clear();
+        }
+    }
+}
+
 /// Collection of KV caches, one per layer.
 pub struct KvCacheStore {
     caches: Vec<KvCache>,

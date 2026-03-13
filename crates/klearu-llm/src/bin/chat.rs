@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use rand::SeedableRng;
 
 use klearu_llm::generate::chat_template::{ChatMessage, ChatTemplate};
-use klearu_llm::generate::pipeline::{GenerateConfig, Pipeline, detect_eos_token};
+use klearu_llm::generate::pipeline::{GenerateConfig, Pipeline, detect_eos_tokens};
 use klearu_llm::generate::sampler::SamplerConfig;
 #[cfg(feature = "sparse")]
 use klearu_llm::generate::sparse_pipeline::SparsePipeline;
@@ -151,8 +151,8 @@ fn main() {
     };
 
     // Detect EOS token from model config
-    let eos_token_id = detect_eos_token(&model_dir);
-    eprintln!("EOS token ID: {eos_token_id:?}");
+    let eos_token_ids = detect_eos_tokens(&model_dir);
+    eprintln!("EOS token IDs: {eos_token_ids:?}");
 
     let config = GenerateConfig {
         max_new_tokens: max_tokens,
@@ -162,7 +162,7 @@ fn main() {
             top_p,
             repetition_penalty: rep_penalty,
         },
-        eos_token_id,
+        eos_token_ids,
     };
 
     if use_sparse {

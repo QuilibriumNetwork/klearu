@@ -13,13 +13,16 @@
 
 use klearu_llm::model::attention::Attention;
 use klearu_llm::model::gated_deltanet::{DeltaNetState, GatedDeltaNet};
-use klearu_llm::model::kv_cache::KvCache;
+use klearu_llm::model::kv_cache::{KvCache, KvCache64};
 use klearu_llm::model::rope::RotaryEmbedding;
-use klearu_mpc::fixed_point::{from_fixed, from_fixed64};
+use klearu_mpc::beaver::TripleGenerator128;
+use klearu_mpc::fixed_point::{from_fixed, from_fixed64, FRAC_BITS_64};
 use klearu_mpc::linear::{
     shared_linear_forward, shared_linear_forward_64_pq,
     shared_linear_forward_f32_input, shared_linear_forward_f32_input_64,
 };
+use klearu_mpc::multiply::beaver_dot_product_64;
+use klearu_mpc::activation::softmax_shared_64;
 use klearu_mpc::transport::Transport;
 use klearu_mpc::{SharedVec, SharedVec64};
 use std::io;
@@ -299,10 +302,10 @@ pub fn private_attention_forward_secure(
 
     // K/V projections using pre-quantized weights (same for both paths)
     let k_share = shared_linear_forward_64_pq(
-        &attention.k_proj.weights_q32, hidden_size, kv_out, x_share,
+        &attention.k_proj.q32_weights(), hidden_size, kv_out, x_share,
     );
     let v_share = shared_linear_forward_64_pq(
-        &attention.v_proj.weights_q32, hidden_size, kv_out, x_share,
+        &attention.v_proj.q32_weights(), hidden_size, kv_out, x_share,
     );
 
     let v_cache_f32: Vec<f32> = v_share.0.iter().map(|&v| from_fixed64(v)).collect();
@@ -313,7 +316,7 @@ pub fn private_attention_forward_secure(
         // 1. Q projection (doubled), de-interleave per head
         let q_out_doubled = q_out * 2;
         let q_gate_share = shared_linear_forward_64_pq(
-            &attention.q_proj.weights_q32, hidden_size, q_out_doubled, x_share,
+            &attention.q_proj.q32_weights(), hidden_size, q_out_doubled, x_share,
         );
 
         let mut q_vals = vec![0u64; q_out];
@@ -395,7 +398,7 @@ pub fn private_attention_forward_secure(
 
         // 1. Q projection using pre-quantized weights
         let q_share = shared_linear_forward_64_pq(
-            &attention.q_proj.weights_q32, hidden_size, q_out, x_share,
+            &attention.q_proj.q32_weights(), hidden_size, q_out, x_share,
         );
 
         // 2. RoPE on shares
@@ -459,6 +462,157 @@ pub fn private_attention_forward_secure(
             attention.o_proj.weights.as_raw_slice(), q_out, hidden_size, &output_f32,
         ))
     }
+}
+
+/// Apply RoPE to Q32.32 shares in-place (no communication needed).
+///
+/// RoPE is a linear transformation: `x_rot = x*cos + rotate(x)*sin`.
+/// Since cos/sin are public and × share is local, this is a pure local op.
+fn rope_on_shares_64(share: &mut [u64], position: usize, rope: &RotaryEmbedding) {
+    let half = rope.half_rotary_dim();
+    let cos = rope.cos_at(position);
+    let sin = rope.sin_at(position);
+
+    for i in 0..half {
+        let x0 = share[i] as i64;
+        let x1 = share[half + i] as i64;
+        let c = cos[i] as f64;
+        let s = sin[i] as f64;
+
+        // new_x0 = x0*cos - x1*sin
+        let new_x0 = (x0 as f64 * c - x1 as f64 * s).round() as i64 as u64;
+        // new_x1 = x1*cos + x0*sin
+        let new_x1 = (x1 as f64 * c + x0 as f64 * s).round() as i64 as u64;
+
+        share[i] = new_x0;
+        share[half + i] = new_x1;
+    }
+    // Elements beyond rotary_dim are left unchanged.
+}
+
+/// No-reveal attention forward pass (Q32.32).
+///
+/// Q, K, and attention scores are NEVER revealed individually.
+/// Only softmax inputs are revealed (attention pattern leakage via score reveal).
+///
+/// Protocol:
+/// 1. QKV projections: local (public weights × share)
+/// 2. RoPE on Q, K shares: local (public cos/sin × share)
+/// 3. Append K, V to KvCache64
+/// 4. Attention scores Q·K^T: Beaver dot products (one round-trip per batch)
+/// 5. Softmax: reveal scores → compute softmax publicly (leaks attention pattern)
+/// 6. Weighted V: public softmax × V_share (local)
+/// 7. O projection: local
+///
+/// Leakage: attention scores only (not Q, K, V individually).
+pub fn private_attention_forward_noreveal(
+    party: u8,
+    attention: &Attention,
+    x_share: &SharedVec64,
+    position: usize,
+    rope: &RotaryEmbedding,
+    kv_cache: &mut KvCache64,
+    triples: &mut impl TripleGenerator128,
+    transport: &mut impl Transport,
+) -> io::Result<SharedVec64> {
+    let hidden_size = attention.q_proj.in_features();
+    let num_heads = attention.num_heads();
+    let num_kv_heads = attention.num_kv_heads();
+    let head_dim = attention.head_dim();
+    let gqa_group_size = num_heads / num_kv_heads;
+    let q_out = num_heads * head_dim;
+    let kv_out = num_kv_heads * head_dim;
+
+    // 1. QKV projections (local, no communication)
+    let q_share = shared_linear_forward_64_pq(
+        &attention.q_proj.q32_weights(), hidden_size, q_out, x_share,
+    );
+    let k_share = shared_linear_forward_64_pq(
+        &attention.k_proj.q32_weights(), hidden_size, kv_out, x_share,
+    );
+    let v_share = shared_linear_forward_64_pq(
+        &attention.v_proj.q32_weights(), hidden_size, kv_out, x_share,
+    );
+
+    // 2. RoPE on Q and K shares (local, no communication)
+    let mut q_data = q_share.0;
+    let mut k_data = k_share.0;
+    for h in 0..num_heads {
+        let off = h * head_dim;
+        rope_on_shares_64(&mut q_data[off..off + head_dim], position, rope);
+    }
+    for h in 0..num_kv_heads {
+        let off = h * head_dim;
+        rope_on_shares_64(&mut k_data[off..off + head_dim], position, rope);
+    }
+
+    // 3. Append K, V to cache
+    kv_cache.append(&k_data, &v_share.0);
+    let seq_len = kv_cache.current_len();
+
+    // 4. Attention scores: Q·K^T via Beaver dot products
+    // For each head h, position t: score[h][t] = Q_h · K_h[t] / sqrt(head_dim)
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let total_dots = num_heads * seq_len;
+    let triples_needed = total_dots * head_dim;
+    let dot_triples = triples.generate(triples_needed);
+
+    let mut all_scores = Vec::with_capacity(total_dots);
+    let mut triple_idx = 0;
+    for h in 0..num_heads {
+        let kv_h = h / gqa_group_size;
+        let q_h = &q_data[h * head_dim..(h + 1) * head_dim];
+
+        for t in 0..seq_len {
+            let k_t = kv_cache.k_at(kv_h, t);
+            let score_share = beaver_dot_product_64(
+                party, q_h, k_t,
+                &dot_triples[triple_idx..triple_idx + head_dim],
+                transport,
+            )?;
+            // Scale by 1/sqrt(head_dim): public × share = local
+            let scaled = (score_share as i64 as f64 * scale as f64).round() as i64 as u64;
+            all_scores.push(scaled);
+            triple_idx += head_dim;
+        }
+    }
+
+    // 5. Softmax per head (reveals scores → leaks attention pattern)
+    let softmax_triples_needed = 3 * seq_len; // per head
+    let mut softmax_weights_all = Vec::with_capacity(total_dots);
+    for h in 0..num_heads {
+        let head_scores = &all_scores[h * seq_len..(h + 1) * seq_len];
+        let sm_triples = triples.generate(softmax_triples_needed);
+        let sm = softmax_shared_64(party, head_scores, &sm_triples, transport)?;
+        softmax_weights_all.extend_from_slice(&sm);
+    }
+
+    // 6. Weighted V: public softmax × V_share (local)
+    // softmax weights are re-shared (party 0 has values, party 1 has zeros).
+    // So weighted V = sum_t softmax[t] * V_share[t] is local for each party.
+    let mut output = vec![0u64; q_out];
+    for h in 0..num_heads {
+        let kv_h = h / gqa_group_size;
+        let head_offset = h * head_dim;
+        for t in 0..seq_len {
+            let w = softmax_weights_all[h * seq_len + t];
+            let v_t = kv_cache.v_at(kv_h, t);
+            // w is Q32.32, v_t is Q32.32 share → product is Q64.64 → shift right 32
+            for d in 0..head_dim {
+                let w_val = w as i64;
+                let v_val = v_t[d] as i64;
+                let prod = ((w_val as i128 * v_val as i128) >> FRAC_BITS_64) as i64;
+                output[head_offset + d] = (output[head_offset + d] as i64).wrapping_add(prod) as u64;
+            }
+        }
+    }
+
+    // 7. O projection (local, no communication)
+    let o_share = shared_linear_forward_64_pq(
+        &attention.o_proj.q32_weights(), q_out, hidden_size, &SharedVec64(output),
+    );
+
+    Ok(o_share)
 }
 
 // --- GatedDeltaNet secure forward helpers ---
@@ -531,16 +685,16 @@ pub fn private_deltanet_forward_secure(
 
     // 1. MPC linear projections using pre-quantized weights (local, no communication)
     let qkv_share = shared_linear_forward_64_pq(
-        &dn.in_proj_qkv.weights_q32, hidden_size, qkv_dim, x_share,
+        &dn.in_proj_qkv.q32_weights(), hidden_size, qkv_dim, x_share,
     );
     let z_share = shared_linear_forward_64_pq(
-        &dn.in_proj_z.weights_q32, hidden_size, z_dim, x_share,
+        &dn.in_proj_z.q32_weights(), hidden_size, z_dim, x_share,
     );
     let a_share = shared_linear_forward_64_pq(
-        &dn.in_proj_a.weights_q32, hidden_size, num_heads, x_share,
+        &dn.in_proj_a.q32_weights(), hidden_size, num_heads, x_share,
     );
     let b_share = shared_linear_forward_64_pq(
-        &dn.in_proj_b.weights_q32, hidden_size, num_heads, x_share,
+        &dn.in_proj_b.q32_weights(), hidden_size, num_heads, x_share,
     );
 
     // 2. Reveal QKV (needed for conv + SiLU which are nonlinear)

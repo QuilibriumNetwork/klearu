@@ -11,7 +11,7 @@
 
 use klearu_llm::model::block::{AttentionLayer, TransformerBlock};
 use klearu_llm::model::gated_deltanet::DeltaNetState;
-use klearu_llm::model::kv_cache::KvCache;
+use klearu_llm::model::kv_cache::{KvCache, KvCache64};
 use klearu_llm::model::rope::RotaryEmbedding;
 use klearu_mpc::beaver::{TripleGenerator, TripleGenerator128};
 use klearu_mpc::fixed_point::{from_fixed, to_fixed};
@@ -20,8 +20,14 @@ use klearu_mpc::transport::Transport;
 use klearu_mpc::{SharedVec, SharedVec64};
 use std::io;
 
-use crate::private_attention::{private_attention_forward, private_attention_forward_secure, private_deltanet_forward_secure};
-use crate::private_mlp::{private_dense_mlp_forward, private_dense_mlp_forward_secure, private_sparse_mlp_forward};
+use crate::private_attention::{
+    private_attention_forward, private_attention_forward_secure,
+    private_attention_forward_noreveal, private_deltanet_forward_secure,
+};
+use crate::private_mlp::{
+    private_dense_mlp_forward, private_dense_mlp_forward_secure,
+    private_dense_mlp_forward_noreveal, private_sparse_mlp_forward,
+};
 
 /// Compute effective RmsNorm weights, accounting for one_plus_weight variant.
 pub(crate) fn effective_norm_weights(norm: &klearu_llm::model::rms_norm::RmsNorm) -> Vec<f32> {
@@ -271,6 +277,83 @@ pub fn private_block_forward_secure(
     )?;
 
     // 6. Residual (in-place, avoids allocation)
+    hidden_share.add_assign(&mlp_out);
+
+    Ok(())
+}
+
+/// No-reveal (Q32.32) evaluation of one transformer block.
+///
+/// Uses polynomial SiLU (no gate reveal), Beaver dot products for attention
+/// scores (no Q/K reveal). Only attention patterns are revealed (via softmax).
+///
+/// For GatedDeltaNet layers, falls back to the secure path which reveals
+/// QKV/gates/Z but runs recurrence in plaintext. A fully no-reveal
+/// GatedDeltaNet is prohibitively expensive (~500K triples/layer).
+pub fn private_block_forward_noreveal(
+    party: u8,
+    block: &TransformerBlock,
+    hidden_share: &mut SharedVec64,
+    position: usize,
+    rope: &RotaryEmbedding,
+    kv_cache: &mut KvCache64,
+    deltanet_state: Option<&mut DeltaNetState>,
+    normed_buf: &mut SharedVec64,
+    triples: &mut impl TripleGenerator128,
+    transport: &mut impl Transport,
+) -> io::Result<()> {
+    // 1. Pre-attention RMSNorm
+    normed_buf.0.copy_from_slice(&hidden_share.0);
+    let attn_weights = effective_norm_weights(&block.attn_norm);
+    rmsnorm_shared_64(
+        party,
+        normed_buf,
+        &attn_weights,
+        block.attn_norm.eps(),
+        triples,
+        transport,
+    )?;
+
+    // 2. Attention dispatch
+    let attn_out = match &block.attention {
+        AttentionLayer::Standard(attn) => {
+            private_attention_forward_noreveal(
+                party, attn, normed_buf, position, rope, kv_cache, triples, transport,
+            )?
+        }
+        AttentionLayer::GatedDeltaNet(dn) => {
+            // Fall back to secure path: reveals QKV/gates/Z, plaintext recurrence
+            let state = deltanet_state
+                .expect("DeltaNet state required for GatedDeltaNet layer");
+            private_deltanet_forward_secure(party, dn, normed_buf, state, transport)?
+        }
+    };
+
+    // 3. Residual
+    hidden_share.add_assign(&attn_out);
+
+    // 4. Pre-MLP RMSNorm
+    normed_buf.0.copy_from_slice(&hidden_share.0);
+    let mlp_weights = effective_norm_weights(&block.mlp_norm);
+    rmsnorm_shared_64(
+        party,
+        normed_buf,
+        &mlp_weights,
+        block.mlp_norm.eps(),
+        triples,
+        transport,
+    )?;
+
+    // 5. No-reveal MLP
+    let mlp_out = private_dense_mlp_forward_noreveal(
+        party,
+        &block.mlp,
+        normed_buf,
+        triples,
+        transport,
+    )?;
+
+    // 6. Residual
     hidden_share.add_assign(&mlp_out);
 
     Ok(())

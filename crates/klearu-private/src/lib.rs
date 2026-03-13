@@ -1,11 +1,15 @@
+#[cfg(feature = "native")]
 pub mod ferret_transport;
+#[cfg(feature = "native")]
 pub mod ferret_triples;
+#[cfg(feature = "native")]
 pub mod oprf;
 pub mod private_attention;
 pub mod private_block;
 pub mod private_conv2d;
 pub mod private_mlp;
 pub mod private_model;
+#[cfg(feature = "native")]
 pub mod private_pipeline;
 pub mod tcp_transport;
 pub mod weight_share;

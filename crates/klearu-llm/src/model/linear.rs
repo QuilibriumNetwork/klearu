@@ -1,5 +1,7 @@
 use klearu_accel::memory::ContiguousWeightStore;
 use klearu_accel::simd::dense_dot_dense_simd;
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
 
 /// Bias-free linear layer backed by ContiguousWeightStore.
 ///
@@ -17,10 +19,15 @@ pub struct Linear {
 impl Linear {
     pub fn new(in_features: usize, out_features: usize) -> Self {
         let store = ContiguousWeightStore::new(out_features, in_features);
-        let total = store.as_raw_slice().len();
+        // On WASM, don't pre-allocate q32 to save memory (~2× reduction).
+        // q32 weights are computed on-the-fly via q32_weights() instead.
+        #[cfg(not(target_arch = "wasm32"))]
+        let weights_q32 = vec![0i64; store.as_raw_slice().len()];
+        #[cfg(target_arch = "wasm32")]
+        let weights_q32 = Vec::new();
         Self {
             weights: store,
-            weights_q32: vec![0i64; total],
+            weights_q32,
             in_features,
             out_features,
         }
@@ -28,11 +35,29 @@ impl Linear {
 
     /// Synchronize `weights_q32` from current `weights`.
     /// Must be called after modifying weights and before MPC inference.
+    /// No-op on WASM (q32 computed on-the-fly instead).
     pub fn sync_q32(&mut self) {
-        let raw = self.weights.as_raw_slice();
-        self.weights_q32.resize(raw.len(), 0);
-        for (dst, &src) in self.weights_q32.iter_mut().zip(raw.iter()) {
-            *dst = (src as f64 * 4294967296.0).round() as i64;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let raw = self.weights.as_raw_slice();
+            self.weights_q32.resize(raw.len(), 0);
+            for (dst, &src) in self.weights_q32.iter_mut().zip(raw.iter()) {
+                *dst = (src as f64 * 4294967296.0).round() as i64;
+            }
+        }
+    }
+
+    /// Get Q32.32 pre-quantized weights. Returns cached weights on native,
+    /// computes on-the-fly on WASM (slower but saves ~2× memory).
+    pub fn q32_weights(&self) -> std::borrow::Cow<'_, [i64]> {
+        if !self.weights_q32.is_empty() {
+            std::borrow::Cow::Borrowed(&self.weights_q32)
+        } else {
+            let raw = self.weights.as_raw_slice();
+            let q32: Vec<i64> = raw.iter()
+                .map(|&v| (v as f64 * 4294967296.0).round() as i64)
+                .collect();
+            std::borrow::Cow::Owned(q32)
         }
     }
 
@@ -44,10 +69,33 @@ impl Linear {
         self.out_features
     }
 
+    /// Minimum total FLOPs (out × in) before switching to rayon parallelism.
+    #[cfg(feature = "parallel")]
+    const PARALLEL_THRESHOLD: usize = 4_000_000;
+
     /// Dense forward: `output[i] = dot(weights[i], input)` for all output neurons.
+    /// Auto-parallelizes with rayon when `out_features * in_features >= 4M`
+    /// and the `parallel` feature is enabled.
     pub fn forward(&self, input: &[f32], output: &mut [f32]) {
         debug_assert_eq!(input.len(), self.in_features);
         debug_assert!(output.len() >= self.out_features);
+
+        #[cfg(feature = "parallel")]
+        {
+            let total_work = self.out_features * self.in_features;
+            if total_work >= Self::PARALLEL_THRESHOLD {
+                let in_feat = self.in_features;
+                let weights = &self.weights;
+                output[..self.out_features]
+                    .par_iter_mut()
+                    .enumerate()
+                    .for_each(|(i, out)| {
+                        let w = weights.get_weights(i);
+                        *out = dense_dot_dense_simd(&w[..in_feat], input);
+                    });
+                return;
+            }
+        }
 
         for (i, out) in output.iter_mut().enumerate().take(self.out_features) {
             let w = self.weights.get_weights(i);

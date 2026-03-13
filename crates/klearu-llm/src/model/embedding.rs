@@ -1,5 +1,7 @@
 use klearu_accel::memory::ContiguousWeightStore;
 use klearu_accel::simd::dense_dot_dense_simd;
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
 
 /// Token embedding table backed by ContiguousWeightStore.
 ///
@@ -28,10 +30,27 @@ impl Embedding {
 
     /// Use embedding weights as LM head (tied embeddings).
     /// Computes `logits[i] = dot(hidden, embedding[i])` for each vocab token.
+    /// Parallelized with rayon when the `parallel` feature is enabled.
     pub fn lm_head_forward(&self, hidden: &[f32], logits: &mut [f32]) {
-        for (i, logit) in logits.iter_mut().enumerate().take(self.vocab_size) {
-            let row = self.weights.get_weights(i);
-            *logit = dense_dot_dense_simd(&row[..self.hidden_size], hidden);
+        #[cfg(feature = "parallel")]
+        {
+            let hs = self.hidden_size;
+            let weights = &self.weights;
+            logits[..self.vocab_size]
+                .par_iter_mut()
+                .enumerate()
+                .for_each(|(i, logit)| {
+                    let row = weights.get_weights(i);
+                    *logit = dense_dot_dense_simd(&row[..hs], hidden);
+                });
+            return;
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            for (i, logit) in logits.iter_mut().enumerate().take(self.vocab_size) {
+                let row = self.weights.get_weights(i);
+                *logit = dense_dot_dense_simd(&row[..self.hidden_size], hidden);
+            }
         }
     }
 }

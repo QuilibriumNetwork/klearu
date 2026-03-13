@@ -3,7 +3,10 @@ pub mod error;
 pub mod generate;
 pub mod model;
 pub mod tensor;
+
+#[cfg(feature = "native-io")]
 pub mod tokenizer;
+#[cfg(feature = "native-io")]
 pub mod weight;
 
 #[cfg(feature = "sparse")]

@@ -1,4 +1,6 @@
 use crate::aes_prg::AesPrg;
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
 
 /// A correction word used at each level of the DPF tree.
 #[derive(Clone, Debug)]
@@ -357,7 +359,11 @@ pub fn dpf_eval(prg: &AesPrg, key: &DpfKey, x: u32) -> u32 {
     }
 }
 
-/// Full-domain evaluation.
+/// Minimum number of seeds at a tree level before switching to parallel expansion.
+#[cfg(feature = "parallel")]
+const PARALLEL_DPF_THRESHOLD: usize = 512;
+
+/// Full-domain evaluation with rayon parallelism for large tree levels.
 pub fn dpf_full_eval(prg: &AesPrg, key: &DpfKey) -> Vec<u32> {
     let depth = key.correction_words.len() as u8;
     let domain_size = 1usize << depth;
@@ -367,36 +373,80 @@ pub fn dpf_full_eval(prg: &AesPrg, key: &DpfKey) -> Vec<u32> {
 
     for i in 0..depth {
         let cw = &key.correction_words[i as usize];
+        let _ = i;
+
+        #[cfg(feature = "parallel")]
+        if seeds.len() >= PARALLEL_DPF_THRESHOLD {
+            // Parallel: expand all seeds at this level concurrently
+            let expanded: Vec<_> = seeds.par_iter().zip(controls.par_iter())
+                .map(|(s, &tc)| {
+                    let (mut sl, mut tl, mut sr, mut tr) = prg.expand(s);
+                    if tc {
+                        xor_seeds(&mut sl, &cw.seed);
+                        xor_seeds(&mut sr, &cw.seed);
+                        tl ^= cw.control_left;
+                        tr ^= cw.control_right;
+                    }
+                    (sl, tl, sr, tr)
+                })
+                .collect();
+
+            let mut new_seeds = Vec::with_capacity(expanded.len() * 2);
+            let mut new_controls = Vec::with_capacity(expanded.len() * 2);
+            for (sl, tl, sr, tr) in expanded {
+                new_seeds.push(sl);
+                new_controls.push(tl);
+                new_seeds.push(sr);
+                new_controls.push(tr);
+            }
+            seeds = new_seeds;
+            controls = new_controls;
+            continue;
+        }
+
+        // Sequential for small levels or when parallel feature is disabled
         let mut new_seeds = Vec::with_capacity(seeds.len() * 2);
         let mut new_controls = Vec::with_capacity(seeds.len() * 2);
 
         for (s, &tc) in seeds.iter().zip(controls.iter()) {
             let (mut sl, mut tl, mut sr, mut tr) = prg.expand(s);
-
             if tc {
                 xor_seeds(&mut sl, &cw.seed);
                 xor_seeds(&mut sr, &cw.seed);
                 tl ^= cw.control_left;
                 tr ^= cw.control_right;
             }
-
             new_seeds.push(sl);
             new_controls.push(tl);
             new_seeds.push(sr);
             new_controls.push(tr);
         }
-
         seeds = new_seeds;
         controls = new_controls;
     }
 
     assert_eq!(seeds.len(), domain_size);
 
-    seeds.iter().zip(controls.iter()).map(|(s, &tc)| {
-        let raw = prg.derive_output(s);
-        let val = raw.wrapping_add(if tc { key.output_correction } else { 0 });
-        if key.party == 0 { val } else { val.wrapping_neg() }
-    }).collect()
+    let oc = key.output_correction;
+    let party0 = key.party == 0;
+
+    // Output derivation: parallel when available, sequential otherwise
+    #[cfg(feature = "parallel")]
+    {
+        seeds.par_iter().zip(controls.par_iter()).map(|(s, &tc)| {
+            let raw = prg.derive_output(s);
+            let val = raw.wrapping_add(if tc { oc } else { 0 });
+            if party0 { val } else { val.wrapping_neg() }
+        }).collect()
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        seeds.iter().zip(controls.iter()).map(|(s, &tc)| {
+            let raw = prg.derive_output(s);
+            let val = raw.wrapping_add(if tc { oc } else { 0 });
+            if party0 { val } else { val.wrapping_neg() }
+        }).collect()
+    }
 }
 
 #[cfg(test)]

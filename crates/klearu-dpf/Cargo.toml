@@ -6,5 +6,10 @@ license.workspace = true
 repository.workspace = true
 description = "Distributed Point Functions and Distributed Comparison Functions for private inference"
 
+[features]
+default = ["parallel"]
+parallel = ["dep:rayon"]
+
 [dependencies]
 aes = "0.8"
+rayon = { workspace = true, optional = true }

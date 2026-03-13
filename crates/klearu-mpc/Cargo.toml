@@ -6,10 +6,19 @@ license.workspace = true
 repository.workspace = true
 description = "2-party computation building blocks for private SLIDE inference"
 
+[features]
+default = ["test-transport", "parallel"]
+test-transport = ["dep:crossbeam"]
+parallel = ["dep:rayon", "klearu-dpf/parallel"]
+
 [dependencies]
 klearu-accel = { workspace = true }
 klearu-dpf = { workspace = true }
 rand = { workspace = true }
+rayon = { workspace = true, optional = true }
 thiserror = { workspace = true }
-crossbeam = { workspace = true }
+crossbeam = { workspace = true, optional = true }
 bytemuck = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }

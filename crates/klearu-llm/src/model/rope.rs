@@ -45,6 +45,30 @@ impl RotaryEmbedding {
         }
     }
 
+    /// Get the cos table entry for a given position.
+    /// Returns `&[f32]` of length `half_rotary_dim`.
+    pub fn cos_at(&self, position: usize) -> &[f32] {
+        let base = position * self.half_rotary_dim;
+        &self.cos_cache[base..base + self.half_rotary_dim]
+    }
+
+    /// Get the sin table entry for a given position.
+    /// Returns `&[f32]` of length `half_rotary_dim`.
+    pub fn sin_at(&self, position: usize) -> &[f32] {
+        let base = position * self.half_rotary_dim;
+        &self.sin_cache[base..base + self.half_rotary_dim]
+    }
+
+    /// The number of dimension pairs that are rotated.
+    pub fn half_rotary_dim(&self) -> usize {
+        self.half_rotary_dim
+    }
+
+    /// The head dimension.
+    pub fn head_dim(&self) -> usize {
+        self.head_dim
+    }
+
     /// Apply RoPE to a single head's Q or K vector in-place.
     /// `x` has length `head_dim`.
     /// Only the first `rotary_dim` elements are rotated; the rest pass through.

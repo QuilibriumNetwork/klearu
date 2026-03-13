@@ -5,6 +5,32 @@ pub trait Transport {
     fn send(&mut self, data: &[u8]) -> io::Result<()>;
     fn recv(&mut self, len: usize) -> io::Result<Vec<u8>>;
 
+    /// Receive exactly `buf.len()` bytes into a pre-allocated buffer.
+    /// Default implementation calls `recv` and copies; override for zero-alloc receives.
+    fn recv_into(&mut self, buf: &mut [u8]) -> io::Result<()> {
+        let data = self.recv(buf.len())?;
+        buf.copy_from_slice(&data);
+        Ok(())
+    }
+
+    /// Receive n u32 values into a pre-allocated buffer (zero-copy on LE platforms).
+    #[cfg(target_endian = "little")]
+    fn recv_u32_slice_into(&mut self, buf: &mut [u32]) -> io::Result<()> {
+        self.recv_into(bytemuck::cast_slice_mut(buf))
+    }
+
+    #[cfg(not(target_endian = "little"))]
+    fn recv_u32_slice_into(&mut self, buf: &mut [u32]) -> io::Result<()> {
+        let data = self.recv(buf.len() * 4)?;
+        for (i, out) in buf.iter_mut().enumerate() {
+            let offset = i * 4;
+            *out = u32::from_le_bytes([
+                data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
+            ]);
+        }
+        Ok(())
+    }
+
     /// Send a u32 value.
     fn send_u32(&mut self, v: u32) -> io::Result<()> {
         self.send(&v.to_le_bytes())
@@ -147,43 +173,64 @@ pub trait Transport {
     }
 }
 
-/// In-memory transport for testing, backed by crossbeam channels.
-pub struct MemoryTransport {
-    tx: crossbeam::channel::Sender<Vec<u8>>,
-    rx: crossbeam::channel::Receiver<Vec<u8>>,
-    recv_buf: Vec<u8>,
-}
+#[cfg(feature = "test-transport")]
+mod memory_impl {
+    use super::*;
 
-impl Transport for MemoryTransport {
-    fn send(&mut self, data: &[u8]) -> io::Result<()> {
-        self.tx.send(data.to_vec()).map_err(|e| {
-            io::Error::new(io::ErrorKind::BrokenPipe, e.to_string())
-        })
+    /// In-memory transport for testing, backed by crossbeam channels.
+    pub struct MemoryTransport {
+        tx: crossbeam::channel::Sender<Vec<u8>>,
+        rx: crossbeam::channel::Receiver<Vec<u8>>,
+        recv_buf: Vec<u8>,
     }
 
-    fn recv(&mut self, len: usize) -> io::Result<Vec<u8>> {
-        while self.recv_buf.len() < len {
-            let data = self.rx.recv().map_err(|e| {
-                io::Error::new(io::ErrorKind::UnexpectedEof, e.to_string())
-            })?;
-            self.recv_buf.extend_from_slice(&data);
+    impl Transport for MemoryTransport {
+        fn send(&mut self, data: &[u8]) -> io::Result<()> {
+            self.tx.send(data.to_vec()).map_err(|e| {
+                io::Error::new(io::ErrorKind::BrokenPipe, e.to_string())
+            })
         }
-        Ok(self.recv_buf.drain(..len).collect())
+
+        fn recv(&mut self, len: usize) -> io::Result<Vec<u8>> {
+            while self.recv_buf.len() < len {
+                let data = self.rx.recv().map_err(|e| {
+                    io::Error::new(io::ErrorKind::UnexpectedEof, e.to_string())
+                })?;
+                self.recv_buf.extend_from_slice(&data);
+            }
+            Ok(self.recv_buf.drain(..len).collect())
+        }
+
+        fn recv_into(&mut self, buf: &mut [u8]) -> io::Result<()> {
+            let len = buf.len();
+            while self.recv_buf.len() < len {
+                let data = self.rx.recv().map_err(|e| {
+                    io::Error::new(io::ErrorKind::UnexpectedEof, e.to_string())
+                })?;
+                self.recv_buf.extend_from_slice(&data);
+            }
+            buf.copy_from_slice(&self.recv_buf[..len]);
+            self.recv_buf.drain(..len);
+            Ok(())
+        }
+    }
+
+    /// Create a pair of connected in-memory transports.
+    ///
+    /// Data sent on transport A is received on transport B, and vice versa.
+    pub fn memory_transport_pair() -> (MemoryTransport, MemoryTransport) {
+        let (tx_a, rx_a) = crossbeam::channel::unbounded();
+        let (tx_b, rx_b) = crossbeam::channel::unbounded();
+
+        let a = MemoryTransport { tx: tx_a, rx: rx_b, recv_buf: Vec::new() };
+        let b = MemoryTransport { tx: tx_b, rx: rx_a, recv_buf: Vec::new() };
+
+        (a, b)
     }
 }
 
-/// Create a pair of connected in-memory transports.
-///
-/// Data sent on transport A is received on transport B, and vice versa.
-pub fn memory_transport_pair() -> (MemoryTransport, MemoryTransport) {
-    let (tx_a, rx_a) = crossbeam::channel::unbounded();
-    let (tx_b, rx_b) = crossbeam::channel::unbounded();
-
-    let a = MemoryTransport { tx: tx_a, rx: rx_b, recv_buf: Vec::new() };
-    let b = MemoryTransport { tx: tx_b, rx: rx_a, recv_buf: Vec::new() };
-
-    (a, b)
-}
+#[cfg(feature = "test-transport")]
+pub use memory_impl::{MemoryTransport, memory_transport_pair};
 
 #[cfg(test)]
 mod tests {

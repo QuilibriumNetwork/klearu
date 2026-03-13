@@ -10,19 +10,45 @@ use super::sampler::{SamplerConfig, sample};
 
 /// Detect EOS token ID from a model directory's config files.
 ///
-/// Priority:
-/// 1. `tokenizer_config.json` → `eos_token_id` (integer)
-/// 2. `tokenizer_config.json` → resolve `eos_token` string via `added_tokens_decoder`
-/// 3. `config.json` → top-level `eos_token_id`
-/// 4. `config.json` → `text_config.eos_token_id`
-/// 5. Fallback to 2 (common LLaMA default)
+/// Returns the first EOS token from [`detect_eos_tokens`].
+/// Use `detect_eos_tokens` to get all EOS token IDs.
 pub fn detect_eos_token(model_dir: &Path) -> Option<u32> {
+    detect_eos_tokens(model_dir).into_iter().next()
+}
+
+/// Detect all EOS token IDs from a model directory's config files.
+///
+/// Priority:
+/// 1. `generation_config.json` → `eos_token_id` (most authoritative for generation)
+/// 2. `tokenizer_config.json` → `eos_token_id` (integer or array)
+/// 3. `tokenizer_config.json` → resolve `eos_token` string via `added_tokens_decoder`
+/// 4. `config.json` → top-level `eos_token_id` (integer or array)
+/// 5. `config.json` → `text_config.eos_token_id` (integer or array)
+/// 6. Fallback to `[2]`
+///
+/// Handles both integer and array `eos_token_id` fields.
+/// For Qwen models, `generation_config.json` contains both `<|endoftext|>`
+/// (151645) and `<|im_end|>` (151643), while other files may only list one.
+pub fn detect_eos_tokens(model_dir: &Path) -> Vec<u32> {
+    // generation_config.json is checked FIRST because it's the most authoritative
+    // for generation behavior. It often has the full array of EOS tokens (e.g.,
+    // Qwen: [151645, 151643] for both <|endoftext|> and <|im_end|>), while
+    // tokenizer_config.json may only list a single eos_token_id.
+    let gen_config_path = model_dir.join("generation_config.json");
+    if let Ok(content) = std::fs::read_to_string(gen_config_path) {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+            if let Some(ids) = parse_eos_token_id_field(&json, "eos_token_id") {
+                return ids;
+            }
+        }
+    }
+
     let tok_config_path = model_dir.join("tokenizer_config.json");
     if let Ok(content) = std::fs::read_to_string(&tok_config_path) {
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
-            // Try "eos_token_id" integer first
-            if let Some(id) = json.get("eos_token_id").and_then(|v| v.as_u64()) {
-                return Some(id as u32);
+            // Try "eos_token_id" (integer or array)
+            if let Some(ids) = parse_eos_token_id_field(&json, "eos_token_id") {
+                return ids;
             }
 
             // Try resolving "eos_token" string via "added_tokens_decoder"
@@ -38,7 +64,7 @@ pub fn detect_eos_token(model_dir: &Path) -> Option<u32> {
                         if let Some(content) = info.get("content").and_then(|c| c.as_str()) {
                             if content == eos_str {
                                 if let Ok(id) = id_str.parse::<u32>() {
-                                    return Some(id);
+                                    return vec![id];
                                 }
                             }
                         }
@@ -52,19 +78,34 @@ pub fn detect_eos_token(model_dir: &Path) -> Option<u32> {
     let config_path = model_dir.join("config.json");
     if let Ok(content) = std::fs::read_to_string(config_path) {
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
-            if let Some(id) = json.get("eos_token_id").and_then(|v| v.as_u64()) {
-                return Some(id as u32);
+            if let Some(ids) = parse_eos_token_id_field(&json, "eos_token_id") {
+                return ids;
             }
             if let Some(tc) = json.get("text_config") {
-                if let Some(id) = tc.get("eos_token_id").and_then(|v| v.as_u64()) {
-                    return Some(id as u32);
+                if let Some(ids) = parse_eos_token_id_field(tc, "eos_token_id") {
+                    return ids;
                 }
             }
         }
     }
 
     // Fallback
-    Some(2)
+    vec![2]
+}
+
+/// Parse `eos_token_id` from a JSON value — handles both integer and array.
+fn parse_eos_token_id_field(json: &serde_json::Value, field: &str) -> Option<Vec<u32>> {
+    let val = json.get(field)?;
+    if let Some(id) = val.as_u64() {
+        return Some(vec![id as u32]);
+    }
+    if let Some(arr) = val.as_array() {
+        let ids: Vec<u32> = arr.iter().filter_map(|v| v.as_u64().map(|id| id as u32)).collect();
+        if !ids.is_empty() {
+            return Some(ids);
+        }
+    }
+    None
 }
 
 /// Generation configuration.
@@ -72,8 +113,8 @@ pub fn detect_eos_token(model_dir: &Path) -> Option<u32> {
 pub struct GenerateConfig {
     pub max_new_tokens: usize,
     pub sampler: SamplerConfig,
-    /// EOS token ID. Generation stops when this token is produced.
-    pub eos_token_id: Option<u32>,
+    /// EOS token IDs. Generation stops when any of these tokens is produced.
+    pub eos_token_ids: Vec<u32>,
 }
 
 impl Default for GenerateConfig {
@@ -81,7 +122,7 @@ impl Default for GenerateConfig {
         Self {
             max_new_tokens: 128,
             sampler: SamplerConfig::default(),
-            eos_token_id: Some(2), // common default for LLaMA
+            eos_token_ids: vec![2], // common default for LLaMA
         }
     }
 }
@@ -146,7 +187,7 @@ impl Pipeline {
         for step in 0..config.max_new_tokens {
             let next_token = sample(&mut logits, &config.sampler, &all_ids, rng);
 
-            if config.eos_token_id == Some(next_token) {
+            if config.eos_token_ids.contains(&next_token) {
                 break;
             }
 
@@ -188,7 +229,7 @@ impl Pipeline {
         for step in 0..config.max_new_tokens {
             let next_token = sample(&mut logits, &config.sampler, &all_ids, rng);
 
-            if config.eos_token_id == Some(next_token) {
+            if config.eos_token_ids.contains(&next_token) {
                 break;
             }
 
