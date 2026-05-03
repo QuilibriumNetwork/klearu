@@ -675,13 +675,15 @@ pub fn private_deltanet_forward_secure(
     transport: &mut impl Transport,
 ) -> io::Result<SharedVec64> {
     let hidden_size = dn.out_proj.out_features();
-    let num_heads = dn.num_heads;
+    let num_key_heads = dn.num_key_heads;
+    let num_value_heads = dn.num_value_heads;
+    let group_size = num_value_heads / num_key_heads;
     let key_dim = dn.key_dim;
     let value_dim = dn.value_dim;
     let conv_dim = dn.conv_dim;
     let kernel_size = dn.kernel_size;
-    let qkv_dim = conv_dim; // = num_heads*key_dim*2 + num_heads*value_dim
-    let z_dim = num_heads * value_dim;
+    let qkv_dim = conv_dim; // = num_key_heads*key_dim*2 + num_value_heads*value_dim
+    let z_dim = num_value_heads * value_dim;
 
     // 1. MPC linear projections using pre-quantized weights (local, no communication)
     let qkv_share = shared_linear_forward_64_pq(
@@ -691,10 +693,10 @@ pub fn private_deltanet_forward_secure(
         &dn.in_proj_z.q32_weights(), hidden_size, z_dim, x_share,
     );
     let a_share = shared_linear_forward_64_pq(
-        &dn.in_proj_a.q32_weights(), hidden_size, num_heads, x_share,
+        &dn.in_proj_a.q32_weights(), hidden_size, num_value_heads, x_share,
     );
     let b_share = shared_linear_forward_64_pq(
-        &dn.in_proj_b.q32_weights(), hidden_size, num_heads, x_share,
+        &dn.in_proj_b.q32_weights(), hidden_size, num_value_heads, x_share,
     );
 
     // 2. Reveal QKV (needed for conv + SiLU which are nonlinear)
@@ -720,15 +722,15 @@ pub fn private_deltanet_forward_secure(
         conv_out[ch] = dn_silu(sum);
     }
 
-    // 4. Split q/k/v, L2-normalize, scale Q
-    let q_total = num_heads * key_dim;
-    let k_total = num_heads * key_dim;
+    // 4. Split q/k/v (q,k indexed by key-head; v indexed by value-head), L2-normalize, scale Q
+    let q_total = num_key_heads * key_dim;
+    let k_total = num_key_heads * key_dim;
     let mut q_data = conv_out[..q_total].to_vec();
     let mut k_data = conv_out[q_total..q_total + k_total].to_vec();
     let v_data = &conv_out[q_total + k_total..];
 
     let inv_sqrt_dk = 1.0 / (key_dim as f32).sqrt();
-    for h in 0..num_heads {
+    for h in 0..num_key_heads {
         let offset = h * key_dim;
         dn_l2_normalize(&mut q_data[offset..offset + key_dim]);
         dn_l2_normalize(&mut k_data[offset..offset + key_dim]);
@@ -737,44 +739,47 @@ pub fn private_deltanet_forward_secure(
         }
     }
 
-    // 5. Reveal a, b in a single batch → compute alpha/beta gates (saves 1 round trip)
-    let mut ab_shares = Vec::with_capacity(num_heads * 2);
+    // 5. Reveal a, b in a single batch → compute alpha/beta gates (saves 1 round trip).
+    //    a, b are per-value-head.
+    let mut ab_shares = Vec::with_capacity(num_value_heads * 2);
     ab_shares.extend_from_slice(&a_share.0);
     ab_shares.extend_from_slice(&b_share.0);
     transport.send_u64_slice(&ab_shares)?;
-    let ab_other = transport.recv_u64_slice(num_heads * 2)?;
-    let a_plain: Vec<f32> = (0..num_heads)
+    let ab_other = transport.recv_u64_slice(num_value_heads * 2)?;
+    let a_plain: Vec<f32> = (0..num_value_heads)
         .map(|i| from_fixed64(ab_shares[i].wrapping_add(ab_other[i])))
         .collect();
-    let b_plain: Vec<f32> = (0..num_heads)
-        .map(|i| from_fixed64(ab_shares[num_heads + i].wrapping_add(ab_other[num_heads + i])))
+    let b_plain: Vec<f32> = (0..num_value_heads)
+        .map(|i| from_fixed64(
+            ab_shares[num_value_heads + i].wrapping_add(ab_other[num_value_heads + i])
+        ))
         .collect();
 
-    let mut alpha = vec![0.0f32; num_heads];
-    for h in 0..num_heads {
+    let mut alpha = vec![0.0f32; num_value_heads];
+    for h in 0..num_value_heads {
         let a = dn.a_log[h].exp() * dn_softplus(a_plain[h] + dn.dt_bias[h]);
         alpha[h] = (-a).exp();
     }
 
-    let mut beta = vec![0.0f32; num_heads];
-    for h in 0..num_heads {
+    let mut beta = vec![0.0f32; num_value_heads];
+    for h in 0..num_value_heads {
         beta[h] = sigmoid(b_plain[h]);
     }
 
-    // 6. Per-head recurrence (plaintext, both parties identical)
+    // 6. Per-value-head recurrence (each value head h_v shares q/k with key head h_v / group_size).
     let mut output_heads = vec![0.0f32; z_dim];
 
-    for h in 0..num_heads {
-        let q_h = &q_data[h * key_dim..(h + 1) * key_dim];
-        let k_h = &k_data[h * key_dim..(h + 1) * key_dim];
-        let v_h = &v_data[h * value_dim..(h + 1) * value_dim];
+    for h_v in 0..num_value_heads {
+        let h_k = h_v / group_size;
+        let q_h = &q_data[h_k * key_dim..(h_k + 1) * key_dim];
+        let k_h = &k_data[h_k * key_dim..(h_k + 1) * key_dim];
+        let v_h = &v_data[h_v * value_dim..(h_v + 1) * value_dim];
 
-        // Access state.ssm_state directly (public field)
-        let s_offset = h * key_dim * value_dim;
+        let s_offset = h_v * key_dim * value_dim;
         let s = &mut state.ssm_state[s_offset..s_offset + key_dim * value_dim];
 
         // S = alpha * S
-        let a = alpha[h];
+        let a = alpha[h_v];
         for val in s.iter_mut() {
             *val *= a;
         }
@@ -790,7 +795,7 @@ pub fn private_deltanet_forward_secure(
         }
 
         // S[i,j] += beta * k_i * err_j
-        let b = beta[h];
+        let b = beta[h_v];
         for i in 0..key_dim {
             let bk = b * k_h[i];
             let s_row = &mut s[i * value_dim..(i + 1) * value_dim];
@@ -799,8 +804,8 @@ pub fn private_deltanet_forward_secure(
             }
         }
 
-        // o = S^T·q  (restructured for contiguous inner-loop access)
-        let o_h = &mut output_heads[h * value_dim..(h + 1) * value_dim];
+        // o = S^T·q
+        let o_h = &mut output_heads[h_v * value_dim..(h_v + 1) * value_dim];
         o_h.fill(0.0);
         for i in 0..key_dim {
             let q_i = q_h[i];
@@ -814,7 +819,7 @@ pub fn private_deltanet_forward_secure(
     // 7. Reveal Z → output gate: rms_norm(o) * silu(z)
     let z_plain = reveal_u64_as_f32(&z_share.0, transport)?;
 
-    for h in 0..num_heads {
+    for h in 0..num_value_heads {
         let o_h = &mut output_heads[h * value_dim..(h + 1) * value_dim];
 
         // RMSNorm with weight scaling

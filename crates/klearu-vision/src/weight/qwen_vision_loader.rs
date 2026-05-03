@@ -92,8 +92,8 @@ fn load_qwen_weight(
                     got: format!("[{got} total] (shape {shape:?})"),
                 });
             }
-            // The reshaping is a no-op on the flat data since we treat
-            // Conv3d [out, in, T, H, W] as Conv2d [out, in*T, H, W]
+            // The reshaping is a no-op on the flat data: Conv3d
+            // [out, in, T, H, W] is treated as Conv2d [out, in*T, H, W].
             encoder.patch_embed.weight.copy_from_slice(data);
         }
         "patch_embed.proj.bias" => {

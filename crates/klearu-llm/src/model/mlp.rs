@@ -50,6 +50,36 @@ impl Mlp {
         output.iter_mut().for_each(|v| *v = 0.0);
         self.down_proj.forward(&gate_buf[..self.intermediate_size], output);
     }
+
+    /// Forward pass that additionally copies the pre-SiLU gate projection
+    /// (i.e. `gate_proj(input)`) into `gate_preact_out` before the in-place
+    /// SiLU multiply overwrites it.
+    ///
+    /// Functionally equivalent to `forward_into` for the main output; the
+    /// capture is a side-channel used by research tooling for
+    /// polytope-boundary / stratification analyses. `gate_preact_out` must
+    /// have length >= `intermediate_size`.
+    pub fn forward_into_capture_gate(
+        &self,
+        input: &[f32],
+        output: &mut [f32],
+        gate_buf: &mut [f32],
+        up_buf: &mut [f32],
+        gate_preact_out: &mut [f32],
+    ) {
+        self.gate_proj.forward(input, gate_buf);
+        self.up_proj.forward(input, up_buf);
+
+        gate_preact_out[..self.intermediate_size]
+            .copy_from_slice(&gate_buf[..self.intermediate_size]);
+
+        for (g, u) in gate_buf.iter_mut().zip(up_buf.iter()).take(self.intermediate_size) {
+            *g = silu(*g) * u;
+        }
+
+        output.iter_mut().for_each(|v| *v = 0.0);
+        self.down_proj.forward(&gate_buf[..self.intermediate_size], output);
+    }
 }
 
 /// SiLU (Sigmoid Linear Unit): `x * sigmoid(x)`

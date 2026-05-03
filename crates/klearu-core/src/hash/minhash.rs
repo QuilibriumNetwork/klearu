@@ -259,15 +259,10 @@ mod tests {
         // Test that densification wraps around.
         let mut bins = vec![u32::MAX, 5, u32::MAX, u32::MAX];
         MinHash::densify(&mut bins);
-        // bin 0: searches forward, finds bin 1 => 5
-        // bin 2: searches forward, finds bin 1 (wrapped from bin 3 empty -> bin 0 empty -> bin 1)
-        // Actually: bin 2 -> bin 3 (MAX) -> bin 0 (already filled? No, densify uses
-        //   the original values). Let's trace:
         // Original: [MAX, 5, MAX, MAX]
+        // Densification iterates in-place; later searches see earlier fills.
         // i=0: search from 1: bins[1]=5, so bins[0]=5
-        // i=2: search from 3: bins[3]=MAX, wrap to 0: bins[0] was set to 5 => bins[2]=5
-        //   Wait, we're iterating and modifying in place; i=0 already set bins[0]=5.
-        //   But the search uses the modified array. That's fine, it still finds 5.
+        // i=2: search from 3: bins[3]=MAX, wrap to 0: bins[0]=5 => bins[2]=5
         // i=3: search from 0: bins[0]=5 => bins[3]=5
         assert_eq!(bins, vec![5, 5, 5, 5]);
     }

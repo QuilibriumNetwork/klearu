@@ -140,20 +140,27 @@ impl DeltaNetStateStore {
 }
 
 /// GatedDeltaNet linear attention module (Qwen3.5).
+///
+/// Supports GQA-style split between key and value heads:
+/// `num_key_heads` ≤ `num_value_heads`, with each key head shared by
+/// `num_value_heads / num_key_heads` value heads. Qwen3.5-0.8B has
+/// `num_key_heads = num_value_heads = 16` (1:1 mapping); Qwen3.5-4B has
+/// `num_key_heads = 16, num_value_heads = 32` (1:2 mapping).
 pub struct GatedDeltaNet {
-    pub in_proj_qkv: Linear,  // hidden → (num_heads * key_dim + num_heads * key_dim + num_heads * value_dim)
-    pub in_proj_z: Linear,     // hidden → num_heads * value_dim (output gate)
-    pub in_proj_a: Linear,     // hidden → num_heads (alpha gate)
-    pub in_proj_b: Linear,     // hidden → num_heads (beta gate)
+    pub in_proj_qkv: Linear,   // hidden → (num_key_heads*key_dim + num_key_heads*key_dim + num_value_heads*value_dim)
+    pub in_proj_z: Linear,     // hidden → num_value_heads * value_dim (output gate)
+    pub in_proj_a: Linear,     // hidden → num_value_heads (alpha gate)
+    pub in_proj_b: Linear,     // hidden → num_value_heads (beta gate)
     pub conv_weight: Vec<f32>, // [conv_dim × kernel_size] (depthwise)
-    pub dt_bias: Vec<f32>,     // [num_heads]
-    pub a_log: Vec<f32>,       // [num_heads]
+    pub dt_bias: Vec<f32>,     // [num_value_heads]
+    pub a_log: Vec<f32>,       // [num_value_heads]
     pub norm_weight: Vec<f32>, // [value_dim] for output RMSNorm (per-head, shared weights)
-    pub out_proj: Linear,      // num_heads * value_dim → hidden
-    pub num_heads: usize,
+    pub out_proj: Linear,      // num_value_heads * value_dim → hidden
+    pub num_key_heads: usize,
+    pub num_value_heads: usize,
     pub key_dim: usize,
     pub value_dim: usize,
-    pub conv_dim: usize,       // = num_heads * (key_dim + key_dim + value_dim) ... no: num_heads * key_dim * 2 + num_heads * value_dim
+    pub conv_dim: usize,       // = num_key_heads * key_dim * 2 + num_value_heads * value_dim
     pub kernel_size: usize,
     pub rms_norm_eps: f32,
 }
@@ -161,27 +168,34 @@ pub struct GatedDeltaNet {
 impl GatedDeltaNet {
     pub fn new(
         hidden_size: usize,
-        num_heads: usize,
+        num_key_heads: usize,
+        num_value_heads: usize,
         key_dim: usize,
         value_dim: usize,
         kernel_size: usize,
         rms_norm_eps: f32,
     ) -> Self {
-        // qkv projection: q(num_heads*key_dim) + k(num_heads*key_dim) + v(num_heads*value_dim)
-        let qkv_dim = num_heads * key_dim + num_heads * key_dim + num_heads * value_dim;
-        let z_dim = num_heads * value_dim;
+        assert!(
+            num_value_heads.is_multiple_of(num_key_heads),
+            "num_value_heads {num_value_heads} must be a multiple of num_key_heads {num_key_heads}"
+        );
+        // qkv projection: q(num_key_heads*key_dim) + k(num_key_heads*key_dim) + v(num_value_heads*value_dim)
+        let qkv_dim =
+            num_key_heads * key_dim + num_key_heads * key_dim + num_value_heads * value_dim;
+        let z_dim = num_value_heads * value_dim;
 
         Self {
             in_proj_qkv: Linear::new(hidden_size, qkv_dim),
             in_proj_z: Linear::new(hidden_size, z_dim),
-            in_proj_a: Linear::new(hidden_size, num_heads),
-            in_proj_b: Linear::new(hidden_size, num_heads),
+            in_proj_a: Linear::new(hidden_size, num_value_heads),
+            in_proj_b: Linear::new(hidden_size, num_value_heads),
             conv_weight: vec![0.0; qkv_dim * kernel_size],
-            dt_bias: vec![0.0; num_heads],
-            a_log: vec![0.0; num_heads],
+            dt_bias: vec![0.0; num_value_heads],
+            a_log: vec![0.0; num_value_heads],
             norm_weight: vec![0.0; value_dim],
             out_proj: Linear::new(z_dim, hidden_size),
-            num_heads,
+            num_key_heads,
+            num_value_heads,
             key_dim,
             value_dim,
             conv_dim: qkv_dim,
@@ -193,7 +207,7 @@ impl GatedDeltaNet {
     /// Create a new DeltaNetState for this layer.
     pub fn create_state(&self) -> DeltaNetState {
         DeltaNetState::new(
-            self.num_heads,
+            self.num_value_heads,
             self.key_dim,
             self.value_dim,
             self.conv_dim,
@@ -214,7 +228,8 @@ impl GatedDeltaNet {
     /// Forward pass writing into a pre-allocated output buffer.
     pub fn forward_decode_into(&self, input: &[f32], state: &mut DeltaNetState, output: &mut [f32]) {
         let qkv_dim = self.conv_dim;
-        let z_dim = self.num_heads * self.value_dim;
+        let z_dim = self.num_value_heads * self.value_dim;
+        let group_size = self.num_value_heads / self.num_key_heads;
 
         // 1. Project QKV
         let mut qkv = vec![0.0f32; qkv_dim];
@@ -242,61 +257,58 @@ impl GatedDeltaNet {
             conv_out[ch] = silu(sum);
         }
 
-        // 3. Split conv_out into q, k, v per head (zero-copy via split_at_mut)
-        let q_total = self.num_heads * self.key_dim;
-        let k_total = self.num_heads * self.key_dim;
+        // 3. Split conv_out into q, k, v (k_total uses num_key_heads, v uses num_value_heads).
+        let q_total = self.num_key_heads * self.key_dim;
+        let k_total = self.num_key_heads * self.key_dim;
         let (qk_part, v_data) = conv_out.split_at_mut(q_total + k_total);
         let (q_data, k_data) = qk_part.split_at_mut(q_total);
 
-        // L2-normalize Q and K per head, then scale Q by 1/sqrt(key_dim)
+        // L2-normalize Q and K per key-head, then scale Q by 1/sqrt(key_dim)
         let inv_sqrt_dk = 1.0 / (self.key_dim as f32).sqrt();
-        for h in 0..self.num_heads {
+        for h in 0..self.num_key_heads {
             let offset = h * self.key_dim;
             l2_normalize(&mut q_data[offset..offset + self.key_dim]);
             l2_normalize(&mut k_data[offset..offset + self.key_dim]);
-            // Scale Q by 1/sqrt(key_dim)
             for i in 0..self.key_dim {
                 q_data[offset + i] *= inv_sqrt_dk;
             }
         }
 
-        // 4. Compute gates
-        let mut a_proj = vec![0.0f32; self.num_heads];
-        let mut b_proj = vec![0.0f32; self.num_heads];
+        // 4. Compute gates (per value-head)
+        let mut a_proj = vec![0.0f32; self.num_value_heads];
+        let mut b_proj = vec![0.0f32; self.num_value_heads];
         self.in_proj_a.forward(input, &mut a_proj);
         self.in_proj_b.forward(input, &mut b_proj);
 
-        // alpha_h = exp(-exp(a_log_h) * softplus(a_proj_h + dt_bias_h))
-        let mut alpha = vec![0.0f32; self.num_heads];
-        for h in 0..self.num_heads {
+        let mut alpha = vec![0.0f32; self.num_value_heads];
+        for h in 0..self.num_value_heads {
             let a = self.a_log[h].exp() * softplus(a_proj[h] + self.dt_bias[h]);
             alpha[h] = (-a).exp();
         }
 
-        // beta_h = sigmoid(b_proj_h)
-        let mut beta = vec![0.0f32; self.num_heads];
-        for h in 0..self.num_heads {
+        let mut beta = vec![0.0f32; self.num_value_heads];
+        for h in 0..self.num_value_heads {
             beta[h] = sigmoid(b_proj[h]);
         }
 
-        // 5. Per-head recurrence and output
+        // 5. Per-value-head recurrence and output. Each value head h_v shares its
+        // q/k with key head h_k = h_v / group_size.
         let mut output_heads = vec![0.0f32; z_dim];
         let mut err = vec![0.0f32; self.value_dim];
 
-        for h in 0..self.num_heads {
-            let q_h = &q_data[h * self.key_dim..(h + 1) * self.key_dim];
-            let k_h = &k_data[h * self.key_dim..(h + 1) * self.key_dim];
-            let v_h = &v_data[h * self.value_dim..(h + 1) * self.value_dim];
+        for h_v in 0..self.num_value_heads {
+            let h_k = h_v / group_size;
+            let q_h = &q_data[h_k * self.key_dim..(h_k + 1) * self.key_dim];
+            let k_h = &k_data[h_k * self.key_dim..(h_k + 1) * self.key_dim];
+            let v_h = &v_data[h_v * self.value_dim..(h_v + 1) * self.value_dim];
 
-            let s = state.s_head_mut(h);
+            let s = state.s_head_mut(h_v);
 
-            // S = alpha * S
-            let a = alpha[h];
+            let a = alpha[h_v];
             for val in s.iter_mut() {
                 *val *= a;
             }
 
-            // err = v - S^T · k (restructured for contiguous inner-loop access)
             err.copy_from_slice(v_h);
             for i in 0..self.key_dim {
                 let k_i = k_h[i];
@@ -306,8 +318,7 @@ impl GatedDeltaNet {
                 }
             }
 
-            // S[i,j] += beta * k_i * err_j
-            let b = beta[h];
+            let b = beta[h_v];
             for i in 0..self.key_dim {
                 let bk = b * k_h[i];
                 let s_row = &mut s[i * self.value_dim..(i + 1) * self.value_dim];
@@ -316,8 +327,7 @@ impl GatedDeltaNet {
                 }
             }
 
-            // o = S^T · q (restructured for contiguous inner-loop access)
-            let o_h = &mut output_heads[h * self.value_dim..(h + 1) * self.value_dim];
+            let o_h = &mut output_heads[h_v * self.value_dim..(h_v + 1) * self.value_dim];
             o_h.fill(0.0);
             for i in 0..self.key_dim {
                 let q_i = q_h[i];
@@ -332,11 +342,8 @@ impl GatedDeltaNet {
         let mut z = vec![0.0f32; z_dim];
         self.in_proj_z.forward(input, &mut z);
 
-        // Apply per-head RMSNorm to output, then gate
-        for h in 0..self.num_heads {
+        for h in 0..self.num_value_heads {
             let o_h = &mut output_heads[h * self.value_dim..(h + 1) * self.value_dim];
-
-            // RMSNorm with weight scaling (Qwen3_5RMSNormGated: weight init to 1.0)
             let mut sum_sq = 0.0f32;
             for &v in o_h.iter() {
                 sum_sq += v * v;
@@ -350,7 +357,6 @@ impl GatedDeltaNet {
             }
         }
 
-        // 7. Output projection
         output.iter_mut().for_each(|v| *v = 0.0);
         self.out_proj.forward(&output_heads, output);
     }
@@ -382,8 +388,9 @@ mod tests {
 
     #[test]
     fn test_gated_deltanet_creation() {
-        let dn = GatedDeltaNet::new(32, 4, 8, 8, 4, 1e-5);
-        assert_eq!(dn.num_heads, 4);
+        let dn = GatedDeltaNet::new(32, 4, 4, 8, 8, 4, 1e-5);
+        assert_eq!(dn.num_key_heads, 4);
+        assert_eq!(dn.num_value_heads, 4);
         assert_eq!(dn.key_dim, 8);
         assert_eq!(dn.value_dim, 8);
         // qkv_dim = 4*8 + 4*8 + 4*8 = 96
@@ -395,8 +402,27 @@ mod tests {
     }
 
     #[test]
+    fn test_gated_deltanet_creation_gqa_split() {
+        // Qwen3.5-4B-style: 16 key heads, 32 value heads.
+        let dn = GatedDeltaNet::new(2560, 16, 32, 128, 128, 4, 1e-6);
+        assert_eq!(dn.num_key_heads, 16);
+        assert_eq!(dn.num_value_heads, 32);
+        // qkv_dim = 16*128 + 16*128 + 32*128 = 8192
+        assert_eq!(dn.conv_dim, 8192);
+        assert_eq!(dn.in_proj_qkv.out_features(), 8192);
+        assert_eq!(dn.in_proj_z.out_features(), 4096); // 32 * 128
+        assert_eq!(dn.in_proj_a.out_features(), 32);
+        assert_eq!(dn.in_proj_b.out_features(), 32);
+        assert_eq!(dn.out_proj.in_features(), 4096);
+        assert_eq!(dn.out_proj.out_features(), 2560);
+        assert_eq!(dn.dt_bias.len(), 32);
+        assert_eq!(dn.a_log.len(), 32);
+        assert_eq!(dn.conv_weight.len(), 8192 * 4);
+    }
+
+    #[test]
     fn test_gated_deltanet_forward_produces_finite() {
-        let dn = GatedDeltaNet::new(16, 2, 4, 4, 4, 1e-5);
+        let dn = GatedDeltaNet::new(16, 2, 2, 4, 4, 4, 1e-5);
         let mut state = dn.create_state();
 
         let input = vec![0.1; 16];
@@ -407,20 +433,28 @@ mod tests {
     }
 
     #[test]
+    fn test_gated_deltanet_forward_gqa_finite() {
+        // 2 key heads, 4 value heads (group_size = 2).
+        let dn = GatedDeltaNet::new(16, 2, 4, 4, 4, 4, 1e-5);
+        let mut state = dn.create_state();
+        let input = vec![0.1; 16];
+        let output = dn.forward_decode(&input, &mut state);
+        assert_eq!(output.len(), 16);
+        assert!(output.iter().all(|x| x.is_finite()));
+    }
+
+    #[test]
     fn test_gated_deltanet_state_evolves() {
-        let dn = GatedDeltaNet::new(16, 2, 4, 4, 4, 1e-5);
+        let dn = GatedDeltaNet::new(16, 2, 2, 4, 4, 4, 1e-5);
         let mut state = dn.create_state();
 
         let input = vec![0.1; 16];
         let out1 = dn.forward_decode(&input, &mut state);
         let out2 = dn.forward_decode(&input, &mut state);
 
-        // State should make outputs differ even with same input
-        // (due to conv state and SSM state evolution)
         let diff: f32 = out1.iter().zip(out2.iter()).map(|(a, b)| (a - b).abs()).sum();
-        // With zero weights, outputs might be similar but state should change
         assert!(state.conv_pos > 0 || state.ssm_state.iter().any(|&v| v != 0.0)
-            || diff >= 0.0, // always true, just checking finite
+            || diff >= 0.0,
             "State or output should have changed");
     }
 
@@ -452,8 +486,8 @@ mod tests {
 
     #[test]
     fn test_gated_deltanet_qwen35_dims() {
-        // Qwen3.5 0.8B dimensions: hidden=1024, 16 heads, key=128, value=128, kernel=4
-        let dn = GatedDeltaNet::new(1024, 16, 128, 128, 4, 1e-6);
+        // Qwen3.5 0.8B dimensions: hidden=1024, 16 key=value heads, key=128, value=128, kernel=4
+        let dn = GatedDeltaNet::new(1024, 16, 16, 128, 128, 4, 1e-6);
         // qkv_dim = 16*128 + 16*128 + 16*128 = 6144
         assert_eq!(dn.conv_dim, 6144);
         assert_eq!(dn.in_proj_qkv.out_features(), 6144);

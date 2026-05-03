@@ -432,12 +432,9 @@ mod tests {
 
         // Client: use a dummy tokenizer-like decode via on_token
         let mut generated_tokens = Vec::new();
-        // We can't easily construct a real Tokenizer without files,
-        // so we test the protocol flow by checking the server completes.
-
-        // Build a minimal mock: since we can't construct a Tokenizer without a file,
-        // we call the lower-level protocol directly.
-        // For this test we just verify the server thread doesn't deadlock/error.
+        // Constructing a real Tokenizer requires files, so this test exercises
+        // the lower-level protocol directly and verifies the server thread
+        // completes without deadlock or error.
 
         // Client side: manual protocol
         let party: u8 = 0;

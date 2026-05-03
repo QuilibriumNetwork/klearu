@@ -77,7 +77,7 @@ pub fn shared_conv2d_forward(
 
     // Add bias (party 0 only would be correct for shares, but since both parties
     // compute the same local operation with public weights, and bias is public,
-    // we add bias to the share directly — it's absorbed into the share value)
+    // bias is added to the share directly — it's absorbed into the share value)
     if let Some(bias) = bias {
         use klearu_mpc::to_fixed;
         for oc in 0..out_channels {

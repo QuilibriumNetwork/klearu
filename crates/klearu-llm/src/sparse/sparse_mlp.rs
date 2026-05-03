@@ -18,9 +18,9 @@ pub fn forward_sparse(mlp: &Mlp, input: &[f32], active_neurons: &[usize]) -> Vec
         *g = silu(*g) * u;
     }
 
-    // Down projection: need to compute using sparse input
+    // Down projection: compute using sparse input.
     // down_proj has shape [hidden_size × intermediate_size]
-    // We need: output[j] = sum_i (down_proj[j][active_neurons[i]] * gate_sparse[i])
+    // output[j] = sum_i (down_proj[j][active_neurons[i]] * gate_sparse[i])
     let hidden_size = mlp.down_proj.out_features();
     let mut output = vec![0.0f32; hidden_size];
 

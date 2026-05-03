@@ -269,7 +269,7 @@ mod tests {
         let result0 = private_dense_mlp_forward(0, &mlp, &share0, &mut gen0, &mut trans_a);
         let result1 = handle.join().unwrap();
 
-        // Both should succeed (we're using zero weights so output should be near zero)
+        // Both should succeed (zero weights, so output should be near zero)
         assert!(result0.is_ok());
         assert!(result1.is_ok());
     }

@@ -75,8 +75,8 @@ pub fn shared_linear_forward_sparse(
 
 /// Variant that takes f32 input shares (not Q16.16).
 ///
-/// Used when the input is already in f32 (e.g., attention output) and we want
-/// to avoid the quantization loss of converting to Q16.16 first.
+/// Used when the input is already in f32 (e.g., attention output) to avoid
+/// the quantization loss of converting to Q16.16 first.
 /// Output is Q16.16 for compatibility with the rest of the pipeline.
 /// Uses SIMD-accelerated dot product for the inner loop.
 pub fn shared_linear_forward_f32_input(
@@ -170,7 +170,7 @@ pub fn shared_linear_forward_sparse_64(
 /// Q32.32 variant taking f32 input (not Q32.32 shares).
 ///
 /// Used when the input is already in f32 (e.g., attention output after reveal)
-/// and we want Q32.32 output. Uses SIMD-accelerated dot product.
+/// to produce Q32.32 output. Uses SIMD-accelerated dot product.
 pub fn shared_linear_forward_f32_input_64(
     weights: &[f32],
     in_features: usize,

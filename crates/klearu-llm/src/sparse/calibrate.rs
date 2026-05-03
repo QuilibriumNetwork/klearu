@@ -138,8 +138,8 @@ impl CalibrationData {
             let neuron_targets = normalize_scores(&self.neuron_importance[layer_idx]);
 
             // Use a synthetic input derived from the importance scores themselves.
-            // In practice, calibration would store actual hidden states; here we
-            // use a simple uniform input so the predictor learns the bias pattern.
+            // In practice, calibration would store actual hidden states; this
+            // uses a simple uniform input so the predictor learns the bias pattern.
             let input = vec![1.0f32 / input_dim as f32; input_dim];
 
             // Train head predictor

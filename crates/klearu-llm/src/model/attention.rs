@@ -115,6 +115,42 @@ impl Attention {
         kv_cache: &mut KvCache,
         output: &mut [f32],
     ) {
+        self.forward_into_opt_entropy(input, position, rope, kv_cache, output, None);
+    }
+
+    /// Forward pass that additionally records the Shannon entropy of each
+    /// head's softmax attention weights at this query position into
+    /// `entropy_out`. `entropy_out.len()` must equal `num_heads`; values
+    /// range in `[0, ln(seq_len)]`. Used by research tooling for the
+    /// attention-dominance stratification.
+    pub fn forward_into_with_entropy(
+        &self,
+        input: &[f32],
+        position: usize,
+        rope: &RotaryEmbedding,
+        kv_cache: &mut KvCache,
+        output: &mut [f32],
+        entropy_out: &mut [f32],
+    ) {
+        assert_eq!(
+            entropy_out.len(),
+            self.num_heads,
+            "entropy_out.len() ({}) must equal num_heads ({})",
+            entropy_out.len(),
+            self.num_heads
+        );
+        self.forward_into_opt_entropy(input, position, rope, kv_cache, output, Some(entropy_out));
+    }
+
+    fn forward_into_opt_entropy(
+        &self,
+        input: &[f32],
+        position: usize,
+        rope: &RotaryEmbedding,
+        kv_cache: &mut KvCache,
+        output: &mut [f32],
+        mut entropy_out: Option<&mut [f32]>,
+    ) {
         let q_dim = self.num_heads * self.head_dim;
         let kv_dim = self.num_kv_heads * self.head_dim;
 
@@ -128,7 +164,7 @@ impl Attention {
         let (mut q, gate) = if self.output_gate {
             // q_proj output is [num_heads × (head_dim * 2)], interleaved per-head:
             // [head0_query(head_dim) | head0_gate(head_dim) | head1_query | head1_gate | ...]
-            // We must de-interleave into separate q[num_heads × head_dim] and gate[num_heads × head_dim].
+            // De-interleave into separate q[num_heads × head_dim] and gate[num_heads × head_dim].
             let mut q_gate = vec![0.0f32; q_dim * 2];
             self.q_proj.forward(input, &mut q_gate);
             let mut q = vec![0.0f32; q_dim];
@@ -196,6 +232,17 @@ impl Attention {
 
             // Softmax
             softmax_inplace(&mut scores[..seq_len]);
+
+            // Optional entropy capture: -Σ p log p over key positions.
+            if let Some(ref mut buf) = entropy_out {
+                let mut s = 0.0f32;
+                for &p in &scores[..seq_len] {
+                    if p > 0.0 {
+                        s -= p * p.ln();
+                    }
+                }
+                buf[h] = s;
+            }
 
             // Weighted sum of V
             let head_out = &mut attn_concat[h * self.head_dim..(h + 1) * self.head_dim];
@@ -408,6 +455,40 @@ mod tests {
         // Should be monotonically increasing
         assert!(x[0] < x[1]);
         assert!(x[1] < x[2]);
+    }
+
+    #[test]
+    fn entropy_uniform_approaches_ln_n() {
+        // Softmax of a uniform logit vector has entropy ln(n).
+        let n = 8;
+        let mut scores = vec![0.0f32; n];
+        softmax_inplace(&mut scores);
+        let mut h = 0.0f32;
+        for &p in &scores {
+            if p > 0.0 {
+                h -= p * p.ln();
+            }
+        }
+        let expected = (n as f32).ln();
+        assert!(
+            (h - expected).abs() < 1e-5,
+            "entropy of uniform softmax = {h}, expected ln({n}) = {expected}"
+        );
+    }
+
+    #[test]
+    fn entropy_peaky_approaches_zero() {
+        // Very peaked logits produce near-zero entropy.
+        let mut scores = vec![0.0f32; 8];
+        scores[3] = 50.0;
+        softmax_inplace(&mut scores);
+        let mut h = 0.0f32;
+        for &p in &scores {
+            if p > 0.0 {
+                h -= p * p.ln();
+            }
+        }
+        assert!(h < 1e-5, "entropy of peaky softmax = {h}, expected ≈ 0");
     }
 
     #[test]

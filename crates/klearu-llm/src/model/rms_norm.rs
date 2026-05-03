@@ -64,7 +64,7 @@ impl RmsNorm {
     }
 
     /// Apply RMSNorm to a subset of x (for per-head norm).
-    /// `x` is the full buffer, but we normalize using only our weight dimension.
+    /// `x` is the full buffer; normalization uses only the weight dimension.
     pub fn forward_slice(&self, x: &mut [f32]) {
         self.forward(x);
     }

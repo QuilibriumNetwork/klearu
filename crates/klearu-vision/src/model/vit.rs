@@ -480,8 +480,8 @@ mod tests {
         let logits1 = model.forward(&image1);
         let logits2 = model.forward(&image2);
 
-        // Different inputs should produce different outputs (unless all weights are zero)
-        // With zero-initialized weights, outputs may be similar, but let's verify finite
+        // Different inputs should produce different outputs (unless all weights are zero).
+        // With zero-initialized weights, outputs may be similar; verify finite at minimum.
         for &v in logits1.iter().chain(logits2.iter()) {
             assert!(v.is_finite());
         }

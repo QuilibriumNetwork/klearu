@@ -207,6 +207,89 @@ impl Pipeline {
         self.tokenizer.decode(&generated)
     }
 
+    /// Generate text with streaming, applying a per-user steering vector
+    /// to the post-final-norm hidden at every step. The vector is added
+    /// scaled by `alpha`, and an LM head is run on the steered hidden to
+    /// produce the actual logits used for sampling.
+    ///
+    /// `steering_vec` must be `model.config.hidden_size` floats. Pass a
+    /// zero vector or `alpha = 0.0` to disable steering and recover
+    /// `generate_streaming` behaviour exactly.
+    ///
+    /// Also calls `on_response_hidden` once at the end with the post-
+    /// final-norm hidden of the *last* token of the response — useful
+    /// for feedback-driven Welford updates of the user vector.
+    pub fn generate_streaming_steered(
+        &mut self,
+        prompt: &str,
+        config: &GenerateConfig,
+        rng: &mut impl Rng,
+        steering_vec: &[f32],
+        alpha: f32,
+        mut on_token: impl FnMut(&str) -> bool,
+        mut on_response_hidden: impl FnMut(&[f32]),
+    ) -> Result<String> {
+        assert_eq!(
+            steering_vec.len(),
+            self.model.config.hidden_size,
+            "steering_vec length {} ≠ hidden_size {}",
+            steering_vec.len(),
+            self.model.config.hidden_size
+        );
+
+        let input_ids = self.tokenizer.encode(prompt)?;
+        self.model.reset_kv_caches();
+
+        let mut all_ids: Vec<u32> = input_ids.to_vec();
+        let mut generated = Vec::new();
+
+        if input_ids.len() > 1 {
+            let _ = self.model.forward_prefill(&input_ids[..input_ids.len() - 1]);
+        }
+
+        let last_input = *input_ids.last().unwrap_or(&0);
+        let position = if input_ids.is_empty() { 0 } else { input_ids.len() - 1 };
+
+        // First step: get hidden, steer, LM-head.
+        let mut hidden = self.model.forward_decode_hidden(last_input, position);
+        let mut last_hidden = hidden.clone();
+        if alpha != 0.0 {
+            for (h, &v) in hidden.iter_mut().zip(steering_vec.iter()) {
+                *h += alpha * v;
+            }
+        }
+        let mut logits = self.model.apply_lm_head(&hidden);
+
+        for step in 0..config.max_new_tokens {
+            let next_token = sample(&mut logits, &config.sampler, &all_ids, rng);
+
+            if config.eos_token_ids.contains(&next_token) {
+                break;
+            }
+
+            all_ids.push(next_token);
+            generated.push(next_token);
+
+            let token_text = self.tokenizer.decode(&[next_token])?;
+            if !on_token(&token_text) {
+                break;
+            }
+
+            let pos = input_ids.len() + step;
+            hidden = self.model.forward_decode_hidden(next_token, pos);
+            last_hidden = hidden.clone();
+            if alpha != 0.0 {
+                for (h, &v) in hidden.iter_mut().zip(steering_vec.iter()) {
+                    *h += alpha * v;
+                }
+            }
+            logits = self.model.apply_lm_head(&hidden);
+        }
+
+        on_response_hidden(&last_hidden);
+        self.tokenizer.decode(&generated)
+    }
+
     /// Generate token IDs from input token IDs (non-streaming).
     pub fn generate_ids(
         &mut self,

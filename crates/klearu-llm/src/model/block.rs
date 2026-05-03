@@ -47,6 +47,7 @@ impl TransformerBlock {
                 AttentionLayer::GatedDeltaNet(GatedDeltaNet::new(
                     config.hidden_size,
                     config.linear_num_key_heads,
+                    config.linear_num_value_heads,
                     config.linear_key_head_dim,
                     config.linear_value_head_dim,
                     config.linear_conv_kernel_dim,

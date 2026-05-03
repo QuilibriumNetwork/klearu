@@ -4,7 +4,7 @@
 //! gets random `(m0[k], m1[k])` and the receiver (with choice bit b_k) gets
 //! `m_{b_k}[k]`. These are NOT chosen-message OT; the values are random.
 //!
-//! To implement Gilboa multiplication, we use ROT + arithmetic corrections:
+//! Gilboa multiplication is implemented via ROT + arithmetic corrections:
 //!
 //! For each triple (a, b, c) where c = a*b mod 2^64:
 //! 1. Run ROT: sender gets (m0[k], m1[k]), receiver gets m_{b_k}[k]

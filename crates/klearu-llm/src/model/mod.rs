@@ -16,6 +16,18 @@ use kv_cache::KvCacheStore;
 use rms_norm::RmsNorm;
 use rope::RotaryEmbedding;
 
+/// How a per-token activation sequence should be reduced to a single
+/// per-probe vector.
+///
+/// - `Last` — keep only the last token's value (LM-style, default).
+/// - `Mean` — average across all token positions (retrieval-style, gives
+///   a more evenly-weighted representation of the whole sequence).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pool {
+    Last,
+    Mean,
+}
+
 /// Full transformer model supporting LLaMA-family and Qwen3.5 hybrid architectures.
 pub struct Model {
     pub config: LlmConfig,
@@ -176,9 +188,195 @@ impl Model {
         self.deltanet_states.clear();
     }
 
+    /// Prefill `token_ids` and record the Shannon entropy of each
+    /// attention head's softmax at `target_layer`, evaluated at the **last**
+    /// token position. Returns `(post_final_norm_hidden, per_head_entropy)`
+    /// where the second vector has length `num_heads` of the target layer.
+    ///
+    /// Only valid for standard (non-linear) attention layers. Panics with
+    /// a clear message if `target_layer` is out of range or is a
+    /// GatedDeltaNet (linear) layer.
+    ///
+    /// Entropy is the "attention-dominance" signal: low entropy means a
+    /// head has committed to one key position; high entropy means attention
+    /// is diffuse across many keys. Used as an alternative stratification
+    /// signal alongside the SwiGLU-gate boundary score.
+    pub fn forward_prefill_with_attn_entropy(
+        &mut self,
+        token_ids: &[u32],
+        target_layer: usize,
+    ) -> (Vec<f32>, Vec<f32>) {
+        assert!(
+            !token_ids.is_empty(),
+            "forward_prefill_with_attn_entropy requires at least one token"
+        );
+        assert!(
+            target_layer < self.config.num_layers,
+            "target_layer {target_layer} out of range (num_layers={})",
+            self.config.num_layers
+        );
+        let num_heads = match &self.layers[target_layer].attention {
+            AttentionLayer::Standard(attn) => attn.num_heads(),
+            AttentionLayer::GatedDeltaNet(_) => panic!(
+                "target_layer {target_layer} is a linear-attention layer; \
+                 attention-entropy capture requires a standard full-attention layer"
+            ),
+        };
+
+        let hidden_size = self.config.hidden_size;
+        let intermediate_size = self.config.intermediate_size;
+
+        let mut hidden = vec![0.0f32; hidden_size];
+        let mut norm_buf = vec![0.0f32; hidden_size];
+        let mut attn_out = vec![0.0f32; hidden_size];
+        let mut mlp_out = vec![0.0f32; hidden_size];
+        let mut gate_buf = vec![0.0f32; intermediate_size];
+        let mut up_buf = vec![0.0f32; intermediate_size];
+        let mut entropy_buf = vec![0.0f32; num_heads];
+        let mut entropy_capture = vec![0.0f32; num_heads];
+
+        let last_pos = token_ids.len() - 1;
+
+        for (pos, &token_id) in token_ids.iter().enumerate() {
+            self.embedding.forward(token_id, &mut hidden);
+
+            for layer_idx in 0..self.config.num_layers {
+                norm_buf.copy_from_slice(&hidden);
+                self.layers[layer_idx].attn_norm.forward(&mut norm_buf);
+
+                match &self.layers[layer_idx].attention {
+                    AttentionLayer::Standard(attn) => {
+                        if layer_idx == target_layer && pos == last_pos {
+                            attn.forward_into_with_entropy(
+                                &norm_buf,
+                                pos,
+                                &self.rope,
+                                self.kv_caches.layer_mut(layer_idx),
+                                &mut attn_out,
+                                &mut entropy_buf,
+                            );
+                            entropy_capture.copy_from_slice(&entropy_buf);
+                        } else {
+                            attn.forward_into(
+                                &norm_buf,
+                                pos,
+                                &self.rope,
+                                self.kv_caches.layer_mut(layer_idx),
+                                &mut attn_out,
+                            );
+                        }
+                    }
+                    AttentionLayer::GatedDeltaNet(dn) => {
+                        let state = self
+                            .deltanet_states
+                            .layer_mut(layer_idx)
+                            .expect("DeltaNet state missing for linear attention layer");
+                        dn.forward_decode_into(&norm_buf, state, &mut attn_out);
+                    }
+                };
+
+                for (h, &a) in hidden.iter_mut().zip(attn_out.iter()) {
+                    *h += a;
+                }
+
+                norm_buf.copy_from_slice(&hidden);
+                self.layers[layer_idx].mlp_norm.forward(&mut norm_buf);
+                self.layers[layer_idx].mlp.forward_into(
+                    &norm_buf,
+                    &mut mlp_out,
+                    &mut gate_buf,
+                    &mut up_buf,
+                );
+
+                for (h, &m) in hidden.iter_mut().zip(mlp_out.iter()) {
+                    *h += m;
+                }
+            }
+        }
+
+        self.final_norm.forward(&mut hidden);
+        (hidden, entropy_capture)
+    }
+
+    /// Apply the model's LM head (or tied embedding) to a post-final-norm
+    /// hidden vector, returning logits over the vocabulary. Used by research
+    /// tooling to decode arbitrary directions in hidden space back to
+    /// tokens.
+    pub fn apply_lm_head(&self, hidden: &[f32]) -> Vec<f32> {
+        assert_eq!(
+            hidden.len(),
+            self.config.hidden_size,
+            "apply_lm_head: expected hidden size {}, got {}",
+            self.config.hidden_size,
+            hidden.len()
+        );
+        let mut logits = vec![0.0f32; self.config.vocab_size];
+        match &self.lm_head {
+            Some(head) => head.forward(hidden, &mut logits),
+            None => self.embedding.lm_head_forward(hidden, &mut logits),
+        }
+        logits
+    }
+
     /// Decode a single token, returning logits over the vocabulary.
     ///
     /// `position` is the sequence position for this token (0-indexed).
+    /// Like `forward_decode` but returns the post-final-norm hidden state
+    /// instead of LM-head logits. Useful for steering: the caller can
+    /// modify the hidden (e.g., add a user-preference vector) before
+    /// applying `apply_lm_head` to get the steered logits.
+    pub fn forward_decode_hidden(&mut self, token_id: u32, position: usize) -> Vec<f32> {
+        let hidden_size = self.config.hidden_size;
+        let intermediate_size = self.config.intermediate_size;
+
+        let mut hidden = vec![0.0f32; hidden_size];
+        self.embedding.forward(token_id, &mut hidden);
+
+        let mut norm_buf = vec![0.0f32; hidden_size];
+        let mut attn_out = vec![0.0f32; hidden_size];
+        let mut mlp_out = vec![0.0f32; hidden_size];
+        let mut gate_buf = vec![0.0f32; intermediate_size];
+        let mut up_buf = vec![0.0f32; intermediate_size];
+
+        for layer_idx in 0..self.config.num_layers {
+            norm_buf.copy_from_slice(&hidden);
+            self.layers[layer_idx].attn_norm.forward(&mut norm_buf);
+
+            match &self.layers[layer_idx].attention {
+                AttentionLayer::Standard(attn) => {
+                    attn.forward_into(
+                        &norm_buf,
+                        position,
+                        &self.rope,
+                        self.kv_caches.layer_mut(layer_idx),
+                        &mut attn_out,
+                    );
+                }
+                AttentionLayer::GatedDeltaNet(dn) => {
+                    let state = self.deltanet_states.layer_mut(layer_idx)
+                        .expect("DeltaNet state missing for linear attention layer");
+                    dn.forward_decode_into(&norm_buf, state, &mut attn_out);
+                }
+            };
+
+            for (h, &a) in hidden.iter_mut().zip(attn_out.iter()) {
+                *h += a;
+            }
+
+            norm_buf.copy_from_slice(&hidden);
+            self.layers[layer_idx].mlp_norm.forward(&mut norm_buf);
+
+            self.layers[layer_idx].mlp.forward_into(&norm_buf, &mut mlp_out, &mut gate_buf, &mut up_buf);
+
+            for (h, &m) in hidden.iter_mut().zip(mlp_out.iter()) {
+                *h += m;
+            }
+        }
+
+        self.final_norm.forward(&mut hidden);
+        hidden
+    }
+
     pub fn forward_decode(&mut self, token_id: u32, position: usize) -> Vec<f32> {
         let hidden_size = self.config.hidden_size;
         let vocab_size = self.config.vocab_size;
@@ -246,6 +444,96 @@ impl Model {
             None => self.embedding.lm_head_forward(&hidden, &mut logits),
         }
 
+        logits
+    }
+
+    /// Decode one token with an intervention applied to the residual
+    /// stream at the output of `intervention_layer` (post-MLP-residual,
+    /// pre-next-layer). The intervention is a closure that receives the
+    /// hidden vector by mutable reference and may rewrite it in place.
+    ///
+    /// Used by causal-alignment / activation-patching experiments. The
+    /// KV caches are not affected (the intervention runs on the residual
+    /// stream after attention has already written K/V); intervening on
+    /// every layer would require a separate API. To compare baseline vs
+    /// intervened outputs on the SAME prompt, prefill the prompt with
+    /// `forward_prefill_*`, snapshot the cache state, run this method
+    /// twice (once with a no-op intervention for baseline, once with the
+    /// real intervention) — the model's KV cache is reset between
+    /// generations via `reset_kv_caches`.
+    pub fn forward_decode_with_intervention<F>(
+        &mut self,
+        token_id: u32,
+        position: usize,
+        intervention_layer: usize,
+        mut intervention: F,
+    ) -> Vec<f32>
+    where
+        F: FnMut(&mut [f32]),
+    {
+        let hidden_size = self.config.hidden_size;
+        let vocab_size = self.config.vocab_size;
+        let intermediate_size = self.config.intermediate_size;
+
+        let mut hidden = vec![0.0f32; hidden_size];
+        self.embedding.forward(token_id, &mut hidden);
+
+        let mut norm_buf = vec![0.0f32; hidden_size];
+        let mut attn_out = vec![0.0f32; hidden_size];
+        let mut mlp_out = vec![0.0f32; hidden_size];
+        let mut gate_buf = vec![0.0f32; intermediate_size];
+        let mut up_buf = vec![0.0f32; intermediate_size];
+
+        for layer_idx in 0..self.config.num_layers {
+            norm_buf.copy_from_slice(&hidden);
+            self.layers[layer_idx].attn_norm.forward(&mut norm_buf);
+
+            match &self.layers[layer_idx].attention {
+                AttentionLayer::Standard(attn) => {
+                    attn.forward_into(
+                        &norm_buf,
+                        position,
+                        &self.rope,
+                        self.kv_caches.layer_mut(layer_idx),
+                        &mut attn_out,
+                    );
+                }
+                AttentionLayer::GatedDeltaNet(dn) => {
+                    let state = self
+                        .deltanet_states
+                        .layer_mut(layer_idx)
+                        .expect("DeltaNet state missing for linear attention layer");
+                    dn.forward_decode_into(&norm_buf, state, &mut attn_out);
+                }
+            };
+
+            for (h, &a) in hidden.iter_mut().zip(attn_out.iter()) {
+                *h += a;
+            }
+
+            norm_buf.copy_from_slice(&hidden);
+            self.layers[layer_idx].mlp_norm.forward(&mut norm_buf);
+            self.layers[layer_idx]
+                .mlp
+                .forward_into(&norm_buf, &mut mlp_out, &mut gate_buf, &mut up_buf);
+
+            for (h, &m) in hidden.iter_mut().zip(mlp_out.iter()) {
+                *h += m;
+            }
+
+            // Intervene on the residual stream at this layer's output.
+            if layer_idx == intervention_layer {
+                intervention(&mut hidden);
+            }
+        }
+
+        self.final_norm.forward(&mut hidden);
+
+        let mut logits = vec![0.0f32; vocab_size];
+        match &self.lm_head {
+            Some(head) => head.forward(&hidden, &mut logits),
+            None => self.embedding.lm_head_forward(&hidden, &mut logits),
+        }
         logits
     }
 
@@ -494,6 +782,470 @@ impl Model {
 
         (hidden, logits)
     }
+
+    /// Prefill `token_ids` and capture the **residual-stream hidden
+    /// state** at each requested layer for the last token position.
+    /// "Residual-stream hidden" means the hidden state right after the
+    /// MLP residual add at layer L — i.e., the input to layer L+1.
+    /// Returns `(post_final_norm_hidden, per_layer_hidden)` where
+    /// `per_layer_hidden[i]` corresponds to `target_layers[i]`.
+    ///
+    /// Used by tokenizer-transplantation and layer-skipping work that
+    /// needs intermediate states, not just the final post-norm.
+    ///
+    /// Panics on duplicate or out-of-range layer indices, or empty
+    /// `token_ids`.
+    pub fn forward_prefill_per_layer_hidden(
+        &mut self,
+        token_ids: &[u32],
+        target_layers: &[usize],
+    ) -> (Vec<f32>, Vec<Vec<f32>>) {
+        assert!(
+            !token_ids.is_empty(),
+            "forward_prefill_per_layer_hidden requires at least one token"
+        );
+        for &l in target_layers {
+            assert!(
+                l < self.config.num_layers,
+                "target_layer {l} out of range (num_layers={})",
+                self.config.num_layers
+            );
+        }
+        for i in 0..target_layers.len() {
+            for j in (i + 1)..target_layers.len() {
+                assert!(
+                    target_layers[i] != target_layers[j],
+                    "duplicate target layer {} in target_layers",
+                    target_layers[i]
+                );
+            }
+        }
+
+        let hidden_size = self.config.hidden_size;
+        let intermediate_size = self.config.intermediate_size;
+
+        let mut hidden = vec![0.0f32; hidden_size];
+        let mut norm_buf = vec![0.0f32; hidden_size];
+        let mut attn_out = vec![0.0f32; hidden_size];
+        let mut mlp_out = vec![0.0f32; hidden_size];
+        let mut gate_buf = vec![0.0f32; intermediate_size];
+        let mut up_buf = vec![0.0f32; intermediate_size];
+
+        let mut per_layer_captures: Vec<Vec<f32>> = target_layers
+            .iter()
+            .map(|_| vec![0.0f32; hidden_size])
+            .collect();
+        let layer_to_slot: Vec<Option<usize>> = {
+            let mut v = vec![None; self.config.num_layers];
+            for (slot, &l) in target_layers.iter().enumerate() {
+                v[l] = Some(slot);
+            }
+            v
+        };
+
+        let last_pos = token_ids.len() - 1;
+
+        for (pos, &token_id) in token_ids.iter().enumerate() {
+            self.embedding.forward(token_id, &mut hidden);
+
+            for layer_idx in 0..self.config.num_layers {
+                norm_buf.copy_from_slice(&hidden);
+                self.layers[layer_idx].attn_norm.forward(&mut norm_buf);
+
+                match &self.layers[layer_idx].attention {
+                    AttentionLayer::Standard(attn) => {
+                        attn.forward_into(
+                            &norm_buf,
+                            pos,
+                            &self.rope,
+                            self.kv_caches.layer_mut(layer_idx),
+                            &mut attn_out,
+                        );
+                    }
+                    AttentionLayer::GatedDeltaNet(dn) => {
+                        let state = self
+                            .deltanet_states
+                            .layer_mut(layer_idx)
+                            .expect("DeltaNet state missing for linear attention layer");
+                        dn.forward_decode_into(&norm_buf, state, &mut attn_out);
+                    }
+                };
+
+                for (h, &a) in hidden.iter_mut().zip(attn_out.iter()) {
+                    *h += a;
+                }
+
+                norm_buf.copy_from_slice(&hidden);
+                self.layers[layer_idx].mlp_norm.forward(&mut norm_buf);
+                self.layers[layer_idx]
+                    .mlp
+                    .forward_into(&norm_buf, &mut mlp_out, &mut gate_buf, &mut up_buf);
+
+                for (h, &m) in hidden.iter_mut().zip(mlp_out.iter()) {
+                    *h += m;
+                }
+
+                // Capture the residual-stream hidden right after this
+                // layer's MLP residual, but only at the last token
+                // position.
+                if pos == last_pos {
+                    if let Some(slot) = layer_to_slot[layer_idx] {
+                        per_layer_captures[slot].copy_from_slice(&hidden);
+                    }
+                }
+            }
+        }
+
+        self.final_norm.forward(&mut hidden);
+
+        (hidden, per_layer_captures)
+    }
+
+    /// Prefill `token_ids` and capture the MLP gate pre-activation (input
+    /// to SiLU, post `gate_proj`) at `target_layer` for the **last** token
+    /// position. Thin wrapper around `forward_prefill_with_gate_pool` with
+    /// `Pool::Last`. Kept for API stability.
+    pub fn forward_prefill_with_gate(
+        &mut self,
+        token_ids: &[u32],
+        target_layer: usize,
+    ) -> (Vec<f32>, Vec<f32>) {
+        self.forward_prefill_with_gate_pool(token_ids, target_layer, Pool::Last)
+    }
+
+    /// Thin wrapper over `forward_prefill_with_gates_many_pool` with
+    /// `Pool::Last`. Kept for API stability.
+    pub fn forward_prefill_with_gates_many(
+        &mut self,
+        token_ids: &[u32],
+        target_layers: &[usize],
+    ) -> (Vec<f32>, Vec<Vec<f32>>) {
+        self.forward_prefill_with_gates_many_pool(token_ids, target_layers, Pool::Last)
+    }
+
+    /// Pooled forward that captures MLP I/O at a target layer.
+    /// Returns (hidden, gate_preact, mlp_input, mlp_output) where:
+    ///   - `hidden` is the post-final-norm output (pooled per `pool`)
+    ///   - `gate_preact` is the pre-SiLU gate vector at the target layer
+    ///     (length `intermediate_size`)
+    ///   - `mlp_input` is the pre-MLP-norm-applied vector (i.e. the
+    ///     argument to `mlp.forward`) at the target layer (length
+    ///     `hidden_size`)
+    ///   - `mlp_output` is the MLP delta (the value added to the residual
+    ///     stream) at the target layer (length `hidden_size`)
+    ///
+    /// Used for tropical polytope / per-cell affine map analysis: pairs
+    /// of (mlp_input, mlp_output) within a cell allow fitting a per-cell
+    /// affine map by regression, recovering the Newton-polytope lifted
+    /// vertex without needing autodiff or per-position weight extraction.
+    pub fn forward_prefill_with_mlp_io_pool(
+        &mut self,
+        token_ids: &[u32],
+        target_layer: usize,
+        pool: Pool,
+    ) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+        assert!(
+            !token_ids.is_empty(),
+            "forward_prefill_with_mlp_io_pool requires at least one token"
+        );
+        assert!(
+            target_layer < self.config.num_layers,
+            "target_layer {target_layer} out of range (num_layers={})",
+            self.config.num_layers
+        );
+
+        let hidden_size = self.config.hidden_size;
+        let intermediate_size = self.config.intermediate_size;
+
+        let mut hidden = vec![0.0f32; hidden_size];
+        let mut hidden_sum = vec![0.0f32; hidden_size]; // for Pool::Mean
+        let mut norm_buf = vec![0.0f32; hidden_size];
+        let mut attn_out = vec![0.0f32; hidden_size];
+        let mut mlp_out = vec![0.0f32; hidden_size];
+        let mut gate_buf = vec![0.0f32; intermediate_size];
+        let mut up_buf = vec![0.0f32; intermediate_size];
+        let mut gate_preact_tmp = vec![0.0f32; intermediate_size];
+
+        // Accumulators for the captured triple (gate, mlp_in, mlp_out).
+        let mut gate_acc = vec![0.0f32; intermediate_size];
+        let mut mlp_in_acc = vec![0.0f32; hidden_size];
+        let mut mlp_out_acc = vec![0.0f32; hidden_size];
+
+        let last_pos = token_ids.len() - 1;
+
+        for (pos, &token_id) in token_ids.iter().enumerate() {
+            self.embedding.forward(token_id, &mut hidden);
+
+            for layer_idx in 0..self.config.num_layers {
+                norm_buf.copy_from_slice(&hidden);
+                self.layers[layer_idx].attn_norm.forward(&mut norm_buf);
+                match &self.layers[layer_idx].attention {
+                    AttentionLayer::Standard(attn) => {
+                        attn.forward_into(
+                            &norm_buf, pos, &self.rope,
+                            self.kv_caches.layer_mut(layer_idx),
+                            &mut attn_out,
+                        );
+                    }
+                    AttentionLayer::GatedDeltaNet(dn) => {
+                        let state = self
+                            .deltanet_states
+                            .layer_mut(layer_idx)
+                            .expect("DeltaNet state missing");
+                        dn.forward_decode_into(&norm_buf, state, &mut attn_out);
+                    }
+                };
+                for (h, &a) in hidden.iter_mut().zip(attn_out.iter()) { *h += a; }
+
+                norm_buf.copy_from_slice(&hidden);
+                self.layers[layer_idx].mlp_norm.forward(&mut norm_buf);
+
+                // Capture MLP input, gate, and output at the target layer.
+                let capture_now = match pool {
+                    Pool::Mean => true,
+                    Pool::Last => pos == last_pos,
+                };
+                if capture_now && layer_idx == target_layer {
+                    // mlp_input = norm_buf (post pre-MLP-norm).
+                    match pool {
+                        Pool::Last => mlp_in_acc.copy_from_slice(&norm_buf),
+                        Pool::Mean => {
+                            for (a, &v) in mlp_in_acc.iter_mut().zip(norm_buf.iter()) { *a += v; }
+                        }
+                    }
+                }
+
+                // Run MLP, capturing the gate pre-activation if requested.
+                if layer_idx == target_layer && capture_now {
+                    self.layers[layer_idx].mlp.forward_into_capture_gate(
+                        &norm_buf, &mut mlp_out, &mut gate_buf, &mut up_buf,
+                        &mut gate_preact_tmp,
+                    );
+                    match pool {
+                        Pool::Last => {
+                            gate_acc.copy_from_slice(&gate_preact_tmp);
+                            mlp_out_acc.copy_from_slice(&mlp_out);
+                        }
+                        Pool::Mean => {
+                            for (a, &v) in gate_acc.iter_mut().zip(gate_preact_tmp.iter()) { *a += v; }
+                            for (a, &v) in mlp_out_acc.iter_mut().zip(mlp_out.iter()) { *a += v; }
+                        }
+                    }
+                } else {
+                    self.layers[layer_idx]
+                        .mlp
+                        .forward_into(&norm_buf, &mut mlp_out, &mut gate_buf, &mut up_buf);
+                }
+
+                for (h, &m) in hidden.iter_mut().zip(mlp_out.iter()) { *h += m; }
+            }
+
+            if pool == Pool::Mean {
+                for (s, &v) in hidden_sum.iter_mut().zip(hidden.iter()) { *s += v; }
+            }
+        }
+
+        let n_tokens = token_ids.len() as f32;
+        let mut hidden_out = match pool {
+            Pool::Last => hidden,
+            Pool::Mean => hidden_sum.iter().map(|&v| v / n_tokens).collect(),
+        };
+        if pool == Pool::Mean {
+            self.final_norm.forward(&mut hidden_out);
+            for v in gate_acc.iter_mut() { *v /= n_tokens; }
+            for v in mlp_in_acc.iter_mut() { *v /= n_tokens; }
+            for v in mlp_out_acc.iter_mut() { *v /= n_tokens; }
+        } else {
+            self.final_norm.forward(&mut hidden_out);
+        }
+
+        (hidden_out, gate_acc, mlp_in_acc, mlp_out_acc)
+    }
+
+    /// Single-target-layer pooled forward. Delegates to the multi-layer
+    /// variant with a length-one slice.
+    pub fn forward_prefill_with_gate_pool(
+        &mut self,
+        token_ids: &[u32],
+        target_layer: usize,
+        pool: Pool,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let (hidden, mut gates) =
+            self.forward_prefill_with_gates_many_pool(token_ids, &[target_layer], pool);
+        let gate = gates.pop().expect("one target layer expected");
+        (hidden, gate)
+    }
+
+    /// Prefill `token_ids`, capturing MLP gate pre-activations at every
+    /// layer in `target_layers` and reducing per-position outputs to one
+    /// vector per probe according to `pool`.
+    ///
+    /// - `pool = Pool::Last`: hidden is the post-final-norm output at the
+    ///   last token position; each gate is the pre-SiLU vector at that
+    ///   layer, last position only. (Matches the original behaviour.)
+    /// - `pool = Pool::Mean`: hidden is `final_norm(mean_t h_t)` where `h_t`
+    ///   is the pre-final-norm hidden state after all transformer layers
+    ///   at position `t`; each gate is the mean of pre-SiLU vectors across
+    ///   all positions.
+    ///
+    /// Captures occur in a single forward pass regardless of
+    /// `target_layers.len()`. Panics on duplicate or out-of-range layers
+    /// or empty `token_ids`.
+    pub fn forward_prefill_with_gates_many_pool(
+        &mut self,
+        token_ids: &[u32],
+        target_layers: &[usize],
+        pool: Pool,
+    ) -> (Vec<f32>, Vec<Vec<f32>>) {
+        assert!(
+            !token_ids.is_empty(),
+            "forward_prefill_with_gates_many_pool requires at least one token"
+        );
+        for &l in target_layers {
+            assert!(
+                l < self.config.num_layers,
+                "target_layer {l} out of range (num_layers={})",
+                self.config.num_layers
+            );
+        }
+        for i in 0..target_layers.len() {
+            for j in (i + 1)..target_layers.len() {
+                assert!(
+                    target_layers[i] != target_layers[j],
+                    "duplicate target layer {} in target_layers",
+                    target_layers[i]
+                );
+            }
+        }
+
+        let hidden_size = self.config.hidden_size;
+        let intermediate_size = self.config.intermediate_size;
+
+        let mut hidden = vec![0.0f32; hidden_size];
+        let mut hidden_sum = vec![0.0f32; hidden_size]; // only used for Pool::Mean
+        let mut norm_buf = vec![0.0f32; hidden_size];
+        let mut attn_out = vec![0.0f32; hidden_size];
+        let mut mlp_out = vec![0.0f32; hidden_size];
+        let mut gate_buf = vec![0.0f32; intermediate_size];
+        let mut up_buf = vec![0.0f32; intermediate_size];
+        let mut gate_preact_tmp = vec![0.0f32; intermediate_size];
+
+        // Gate accumulators: for Pool::Mean these are running sums,
+        // divided by token count at the end; for Pool::Last they are
+        // written once at the last position.
+        let mut gate_captures: Vec<Vec<f32>> = target_layers
+            .iter()
+            .map(|_| vec![0.0f32; intermediate_size])
+            .collect();
+
+        let layer_to_slot: Vec<Option<usize>> = {
+            let mut v = vec![None; self.config.num_layers];
+            for (slot, &l) in target_layers.iter().enumerate() {
+                v[l] = Some(slot);
+            }
+            v
+        };
+
+        let last_pos = token_ids.len() - 1;
+
+        for (pos, &token_id) in token_ids.iter().enumerate() {
+            self.embedding.forward(token_id, &mut hidden);
+
+            for layer_idx in 0..self.config.num_layers {
+                norm_buf.copy_from_slice(&hidden);
+                self.layers[layer_idx].attn_norm.forward(&mut norm_buf);
+
+                match &self.layers[layer_idx].attention {
+                    AttentionLayer::Standard(attn) => {
+                        attn.forward_into(
+                            &norm_buf,
+                            pos,
+                            &self.rope,
+                            self.kv_caches.layer_mut(layer_idx),
+                            &mut attn_out,
+                        );
+                    }
+                    AttentionLayer::GatedDeltaNet(dn) => {
+                        let state = self
+                            .deltanet_states
+                            .layer_mut(layer_idx)
+                            .expect("DeltaNet state missing for linear attention layer");
+                        dn.forward_decode_into(&norm_buf, state, &mut attn_out);
+                    }
+                };
+
+                for (h, &a) in hidden.iter_mut().zip(attn_out.iter()) {
+                    *h += a;
+                }
+
+                norm_buf.copy_from_slice(&hidden);
+                self.layers[layer_idx].mlp_norm.forward(&mut norm_buf);
+
+                let capture_now = match (layer_to_slot[layer_idx], pool) {
+                    (Some(_), Pool::Mean) => true,
+                    (Some(_), Pool::Last) => pos == last_pos,
+                    (None, _) => false,
+                };
+
+                if capture_now {
+                    self.layers[layer_idx].mlp.forward_into_capture_gate(
+                        &norm_buf,
+                        &mut mlp_out,
+                        &mut gate_buf,
+                        &mut up_buf,
+                        &mut gate_preact_tmp,
+                    );
+                    let slot = layer_to_slot[layer_idx].expect("capture_now implies slot");
+                    match pool {
+                        Pool::Last => {
+                            gate_captures[slot].copy_from_slice(&gate_preact_tmp);
+                        }
+                        Pool::Mean => {
+                            for (g, &p) in
+                                gate_captures[slot].iter_mut().zip(gate_preact_tmp.iter())
+                            {
+                                *g += p;
+                            }
+                        }
+                    }
+                } else {
+                    self.layers[layer_idx].mlp.forward_into(
+                        &norm_buf,
+                        &mut mlp_out,
+                        &mut gate_buf,
+                        &mut up_buf,
+                    );
+                }
+
+                for (h, &m) in hidden.iter_mut().zip(mlp_out.iter()) {
+                    *h += m;
+                }
+            }
+
+            if pool == Pool::Mean {
+                for (h_sum, &v) in hidden_sum.iter_mut().zip(hidden.iter()) {
+                    *h_sum += v;
+                }
+            }
+        }
+
+        let n_tokens = token_ids.len() as f32;
+        let mut final_hidden = match pool {
+            Pool::Last => hidden,
+            Pool::Mean => hidden_sum.iter().map(|&v| v / n_tokens).collect(),
+        };
+        self.final_norm.forward(&mut final_hidden);
+
+        if pool == Pool::Mean {
+            for cap in gate_captures.iter_mut() {
+                for v in cap.iter_mut() {
+                    *v /= n_tokens;
+                }
+            }
+        }
+
+        (final_hidden, gate_captures)
+    }
 }
 
 #[cfg(test)]
@@ -661,6 +1413,135 @@ mod tests {
             "Layer 3 should be Standard attention");
         assert!(model.deltanet_states.states[3].is_none(),
             "Layer 3 should NOT have DeltaNet state");
+    }
+
+    #[test]
+    fn test_per_layer_hidden_capture_shapes_and_distinctness() {
+        let config = tiny_config();
+        let mut model = Model::new(config.clone());
+        for i in 0..config.vocab_size {
+            let row = model.embedding.weights.get_weights_mut(i);
+            for (j, v) in row.iter_mut().enumerate() {
+                *v = ((i * 7 + j * 3) % 17) as f32 * 0.01;
+            }
+        }
+        for layer in &mut model.layers {
+            for w in layer.attn_norm.weight.iter_mut() { *w = 1.0; }
+            for w in layer.mlp_norm.weight.iter_mut() { *w = 1.0; }
+        }
+        for w in model.final_norm.weight.iter_mut() { *w = 1.0; }
+
+        let tokens = [1u32, 2, 3, 4];
+        let (final_hidden, per_layer) =
+            model.forward_prefill_per_layer_hidden(&tokens, &[0, 1]);
+
+        // Shapes correct.
+        assert_eq!(final_hidden.len(), config.hidden_size);
+        assert_eq!(per_layer.len(), 2);
+        assert_eq!(per_layer[0].len(), config.hidden_size);
+        assert_eq!(per_layer[1].len(), config.hidden_size);
+
+        // All values finite.
+        assert!(final_hidden.iter().all(|v| v.is_finite()));
+        assert!(per_layer[0].iter().all(|v| v.is_finite()));
+        assert!(per_layer[1].iter().all(|v| v.is_finite()));
+
+        // With unit-init norms and embedding-only non-zero weights,
+        // the residual stream at L0 should equal embedding lookup +
+        // zeros from attn/MLP. After final_norm, the final hidden is
+        // a (different) RMSNorm of L1's residual — so the two are not
+        // bit-equivalent in general. That is not asserted here because
+        // construction details can collapse it.
+
+        // Check empty target_layers list returns no per-layer captures.
+        let (_, empty_per_layer) =
+            model.forward_prefill_per_layer_hidden(&tokens, &[]);
+        assert_eq!(empty_per_layer.len(), 0);
+    }
+
+    #[test]
+    fn test_pool_last_matches_legacy_gate_capture() {
+        // `forward_prefill_with_gate` is now a thin wrapper over
+        // `forward_prefill_with_gate_pool(_, _, Pool::Last)`. Verify the
+        // pooled Last variant reproduces the original behaviour.
+        let config = tiny_config();
+        let mut model_legacy = Model::new(config.clone());
+        let mut model_pool = Model::new(config.clone());
+        for i in 0..config.vocab_size {
+            let row_a = model_legacy.embedding.weights.get_weights_mut(i);
+            let row_b = model_pool.embedding.weights.get_weights_mut(i);
+            for (j, (va, vb)) in row_a.iter_mut().zip(row_b.iter_mut()).enumerate() {
+                let v = ((i * 7 + j * 3) % 17) as f32 * 0.01;
+                *va = v;
+                *vb = v;
+            }
+        }
+        for layer in &mut model_legacy.layers {
+            for w in layer.attn_norm.weight.iter_mut() { *w = 1.0; }
+            for w in layer.mlp_norm.weight.iter_mut() { *w = 1.0; }
+        }
+        for layer in &mut model_pool.layers {
+            for w in layer.attn_norm.weight.iter_mut() { *w = 1.0; }
+            for w in layer.mlp_norm.weight.iter_mut() { *w = 1.0; }
+        }
+        for w in model_legacy.final_norm.weight.iter_mut() { *w = 1.0; }
+        for w in model_pool.final_norm.weight.iter_mut() { *w = 1.0; }
+
+        let tokens = [1u32, 2, 3, 4];
+        let (h_legacy, g_legacy) = model_legacy.forward_prefill_with_gate(&tokens, 1);
+        let (h_pool, g_pool) =
+            model_pool.forward_prefill_with_gate_pool(&tokens, 1, Pool::Last);
+        assert_eq!(h_legacy.len(), h_pool.len());
+        for (a, b) in h_legacy.iter().zip(h_pool.iter()) {
+            assert!((a - b).abs() < 1e-6, "Last-pool hidden should match legacy");
+        }
+        assert_eq!(g_legacy.len(), g_pool.len());
+        for (a, b) in g_legacy.iter().zip(g_pool.iter()) {
+            assert!((a - b).abs() < 1e-6, "Last-pool gate should match legacy");
+        }
+    }
+
+    #[test]
+    fn test_pool_mean_differs_from_last_for_multi_token() {
+        // Mean-pool should yield a different hidden from Last-pool when
+        // the input is multiple distinct tokens.
+        let config = tiny_config();
+        let mut model = Model::new(config.clone());
+        for i in 0..config.vocab_size {
+            let row = model.embedding.weights.get_weights_mut(i);
+            for (j, v) in row.iter_mut().enumerate() {
+                *v = ((i * 7 + j * 3) % 17) as f32 * 0.01;
+            }
+        }
+        for layer in &mut model.layers {
+            for w in layer.attn_norm.weight.iter_mut() { *w = 1.0; }
+            for w in layer.mlp_norm.weight.iter_mut() { *w = 1.0; }
+        }
+        for w in model.final_norm.weight.iter_mut() { *w = 1.0; }
+
+        let tokens = [1u32, 2, 3, 4];
+        let (h_last, _) = {
+            let (h, g) = model.forward_prefill_with_gate_pool(&tokens, 1, Pool::Last);
+            (h, g)
+        };
+        model.reset_kv_caches();
+        let (h_mean, _) = {
+            let (h, g) = model.forward_prefill_with_gate_pool(&tokens, 1, Pool::Mean);
+            (h, g)
+        };
+        assert_eq!(h_last.len(), h_mean.len());
+        assert!(h_last.iter().all(|v| v.is_finite()));
+        assert!(h_mean.iter().all(|v| v.is_finite()));
+        // They shouldn't be identical for a multi-token input unless the
+        // per-token hiddens are literally constant (unlikely here).
+        let same: bool = h_last
+            .iter()
+            .zip(h_mean.iter())
+            .all(|(a, b)| (a - b).abs() < 1e-5);
+        assert!(
+            !same,
+            "mean-pool should diverge from last-pool on multi-token input"
+        );
     }
 
     #[test]

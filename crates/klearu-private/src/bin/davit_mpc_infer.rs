@@ -52,8 +52,7 @@ fn main() {
     eprintln!("  Time: {:.1}ms", t1.elapsed().as_secs_f64() * 1000.0);
     print_top5("  Plaintext", &plaintext_logits);
 
-    // We need two copies of the model for the two MPC parties.
-    // Reload to get independent copies.
+    // Two independent copies of the model are required, one per MPC party.
     let model0 = klearu_vision::weight::load_davit_model(&model_dir)
         .expect("Failed to load model (party 0)");
     let model1 = klearu_vision::weight::load_davit_model(&model_dir)

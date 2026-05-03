@@ -92,7 +92,7 @@ impl Default for OprfClient {
 /// Hash an arbitrary byte string to a Ristretto point.
 ///
 /// Uses a simple hash-and-check approach: SHA-512 the input with a counter
-/// until we get a valid point. This is not constant-time but is sufficient
+/// until a valid point is produced. This is not constant-time but is sufficient
 /// for the semi-honest model.
 pub fn hash_to_point(input: &[u8]) -> RistrettoPoint {
     // Simple approach: hash input to 64 bytes, use Ristretto's from_uniform_bytes
@@ -101,13 +101,9 @@ pub fn hash_to_point(input: &[u8]) -> RistrettoPoint {
     hasher_input.extend_from_slice(b"klearu-oprf-v1:");
     hasher_input.extend_from_slice(input);
 
-    // Simple 64-byte hash using two rounds of the AES-based PRG
-    // (we already have aes as a dependency via klearu-dpf, but let's keep
-    // this self-contained using a simpler approach)
-    //
-    // Actually, curve25519-dalek provides from_uniform_bytes which takes [u8; 64].
-    // We need a hash function. Let's use a simple one based on what we have.
-    // For production, use SHA-512. For now, use a deterministic expansion.
+    // 64-byte hash via two rounds of an AES-based PRG, then
+    // curve25519-dalek's from_uniform_bytes maps [u8; 64] to a Ristretto point.
+    // For production-grade use, replace with SHA-512.
     let mut output = [0u8; 64];
     // Use AES-based expansion
     use aes::cipher::{BlockEncrypt, KeyInit};

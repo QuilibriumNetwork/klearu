@@ -596,7 +596,7 @@ pub fn reveal_logits(
 }
 
 // ---------------------------------------------------------------------------
-// Sparse MPC helpers (Phase 4)
+// Sparse MPC helpers
 // ---------------------------------------------------------------------------
 
 /// Sparse MLP in Q32.32: compute only selected fc1 neurons.

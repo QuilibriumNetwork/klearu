@@ -87,159 +87,26 @@ pub fn dpf_gen(prg: &AesPrg, alpha: u32, beta: u32, depth: u8) -> (DpfKey, DpfKe
         let keep = alpha_bit as usize; // 0 = left, 1 = right
         let lose = 1 - keep;
 
-        // Correction word seed: XOR of the "lose" children
-        // When applied (via XOR), this makes the lose children equal
+        // Correction word seed: XOR of the "lose" children. When applied via XOR
+        // (gated on t[b]), the lose-side seeds become equal across parties.
         let mut cw_seed = [0u8; 16];
         for j in 0..16 {
             cw_seed[j] = s_children[0][lose][j] ^ s_children[1][lose][j];
         }
 
-        // Correction word control bits
-        // After applying CW to party b's child (if t[b] is set):
-        //   t'[b][side] = t_children[b][side] XOR (t[b] * tcw[side])
-        //
-        // We need the invariant t'[0][keep] XOR t'[1][keep] = 1 to continue.
-        // On the lose side, we need t'[0][lose] XOR t'[1][lose] to be such that
-        // the outputs cancel (both parties with same seed, one adds output_correction
-        // and the other doesn't -- actually the outputs cancel because the seeds
-        // match and the signs are opposite).
-        //
-        // For the LOSE side: we want both parties to end up with the SAME seed.
-        // The CW seed makes s'[0][lose] = s'[1][lose] (after XOR correction).
-        // For the KEEP side: we want both parties to have DIFFERENT seeds (so
-        // the protocol continues to the target point).
-        // The CW seed XOR is applied to BOTH sides when t[b]=1, but since
-        // s_keep[0] != s_keep[1] in general, the CW doesn't destroy the difference.
-        //
-        // Wait - that's the problem. The CW seed is XORed into BOTH left and right
-        // children when t[b]=1. So it affects both the keep and lose sides.
-        // This is correct: on the lose side, it cancels the difference.
-        // On the keep side, it may change the values but both parties still have
-        // different seeds (the difference is preserved, just modified).
-        //
-        // Control bits: need t'[0] XOR t'[1] = 1 on the keep side.
-        //   t'[0][keep] XOR t'[1][keep]
-        //     = (t_children[0][keep] XOR t[0]*tcw[keep]) XOR (t_children[1][keep] XOR t[1]*tcw[keep])
-        //     = t_children[0][keep] XOR t_children[1][keep] XOR (t[0] XOR t[1])*tcw[keep]
-        //     = t_children[0][keep] XOR t_children[1][keep] XOR tcw[keep]  (since t[0]^t[1]=1)
-        // Want = 1:
-        //   tcw[keep] = t_children[0][keep] XOR t_children[1][keep] XOR 1
-
-        // Similarly for lose side:
-        //   tcw[lose] = t_children[0][lose] XOR t_children[1][lose] XOR 1
-        // This ensures both sides maintain the invariant.
-        // But wait: on the lose side, we want the outputs to cancel.
-        // The outputs cancel if the seeds are the same AND the output corrections
-        // are applied to exactly one party (since signs are opposite).
-        // That means we want t'[0][lose] XOR t'[1][lose] = 1 as well (so one
-        // applies the correction and the other doesn't).
-        // But actually, on non-target leaves, neither should apply the correction!
-        // Hmm, let me reconsider.
-        //
-        // Actually, the invariant t[0] XOR t[1] = 1 is maintained everywhere.
-        // This means at EVERY leaf, one party has t=0 and the other has t=1.
-        // But the seeds are the same on non-target paths, so:
-        //   Party 0 output = (+1) * (convert(s) + t0*oc)
-        //   Party 1 output = (-1) * (convert(s) + t1*oc)
-        //   Sum = convert(s) + t0*oc - convert(s) - t1*oc = (t0-t1)*oc
-        // Since exactly one of t0, t1 is true: sum = +/-oc
-        // This is NOT zero unless oc = 0!
-        //
-        // I see the issue: the standard DPF doesn't use the (-1)^b sign convention.
-        // Instead, both parties output the SAME sign, and the control bits ensure
-        // cancellation via a different mechanism.
-        //
-        // Let me switch to the standard convention where:
-        //   Party b's output at leaf x = convert(s_b) + t_b * output_correction
-        //   And the DPF output is: output_0 - output_1  (or output_0 + output_1 in Z_{2^32})
-        //
-        // At a non-target leaf where s0 = s1 and t0 XOR t1 = 1:
-        //   output_0 + output_1 = convert(s) + t0*oc + convert(s) + t1*oc
-        //                       = 2*convert(s) + oc   (since t0+t1 = 1)
-        // This is NOT zero either!
-        //
-        // OK, the standard BGI DPF uses SUBTRACTION, not addition:
-        //   DPF(x) = (-1)^party * [convert(s) + t * oc]
-        //   sum = (+1)*[convert(s0) + t0*oc] + (-1)*[convert(s1) + t1*oc]
-        //       = convert(s0) - convert(s1) + (t0*oc - t1*oc)
-        //
-        // At non-target: s0=s1, so convert(s0)=convert(s1), and:
-        //   sum = (t0-t1)*oc = ±oc
-        //
-        // This still doesn't cancel! Something is fundamentally wrong with my understanding.
-        //
-        // The ACTUAL standard approach:
-        //   - On the LOSE side, we want seeds to be EQUAL and control bits to be EQUAL (both 0)
-        //   - The control bit is what determines if correction is applied
-        //   - If both parties have t=0 on the lose side, neither applies correction
-        //   - Then output_0 - output_1 = convert(s) - convert(s) = 0 ✓
-        //
-        // But if both controls are 0, the invariant t0 XOR t1 = 1 is violated on lose.
-        // That's the point: the invariant ONLY holds on the KEEP path!
-        //
-        // Let me re-derive the correction word computation:
-        //   On the KEEP side: want t'0 XOR t'1 = 1 (maintain invariant)
-        //   On the LOSE side: want t'0 = t'1 = 0 (both false, so no correction applied)
-        //     AND want s'0 = s'1 (same seed, so convert gives same value)
-        //
-        // For the lose side with t'0 = t'1 = 0:
-        //   t'b[lose] = t_children[b][lose] XOR (t[b] * tcw[lose])
-        //   Want t'0[lose] = 0: tcw[lose] must correct t_children[0][lose]
-        //     if t[0]=0: t'0 = t_children[0][lose], so need t_children[0][lose]=false
-        //     if t[0]=1: t'0 = t_children[0][lose] XOR tcw[lose]
-        //   Similarly for party 1.
-        //
-        // Since t[0] XOR t[1] = 1, exactly one of t[0], t[1] is true.
-        // WLOG say t[0]=false, t[1]=true:
-        //   t'0[lose] = t_children[0][lose]
-        //   t'1[lose] = t_children[1][lose] XOR tcw[lose]
-        //   Want both = 0: tcw[lose] = t_children[1][lose], and need t_children[0][lose] = false
-        //
-        // But t_children[0][lose] might be true! So we can't guarantee both are 0.
-        //
-        // Hmm, I think the issue is that on the lose subtree (below the current level),
-        // everything cancels because the ENTIRE subtree of party 0 equals party 1's subtree.
-        // Not just at this level, but all the way down. That's because both parties have the
-        // same seed at the lose node, and the same correction words are used from here on.
-        // So even if t values differ at the lose node, the subtrees below still cancel because
-        // the same CW is applied to the same seeds!
-        //
-        // Actually wait. If s0=s1 but t0 != t1 at the lose node, then at the next level:
-        //   Both parties expand the same seed (same s0=s1)
-        //   But party with t=1 applies the CW, party with t=0 doesn't
-        //   So they diverge again!
-        //
-        // I think the correct approach is:
-        //   On the LOSE side: want s'0 = s'1 AND t'0 = t'1
-        //   (both parties have identical state, so entire subtree is identical,
-        //    and since we use (-1)^party sign, their contributions cancel)
-        //
-        // With (-1)^party convention:
-        //   party 0's output = (+1) * val, party 1's output = (-1) * val
-        //   Sum = val - val = 0 ✓
-        //
-        // So on the lose side, we need s'0=s'1 AND t'0=t'1.
-        // The CW seed already ensures s'0=s'1.
-        // For control bits, with t[0] XOR t[1] = 1 (WLOG t[0]=0, t[1]=1):
-        //   t'0[lose] = t_children[0][lose]  (t[0]=0, no CW applied)
-        //   t'1[lose] = t_children[1][lose] XOR tcw[lose]  (t[1]=1, CW applied)
-        //   Want equal: tcw[lose] = t_children[0][lose] XOR t_children[1][lose]
-        //
-        // For keep side, want t'0 XOR t'1 = 1:
-        //   t'0[keep] = t_children[0][keep]
-        //   t'1[keep] = t_children[1][keep] XOR tcw[keep]
-        //   Want XOR = 1: tcw[keep] = t_children[0][keep] XOR t_children[1][keep] XOR 1
-        //
-        // Now for general case (not WLOG):
-        //   t'b[side] = t_children[b][side] XOR (t[b] AND tcw[side])
-        //   t'0[side] XOR t'1[side]
-        //     = t_children[0][side] XOR t_children[1][side] XOR (t[0] XOR t[1]) AND tcw[side]
+        // Correction word control bits.
+        // After applying CW to party b's child (gated on t[b]):
+        //   t'[b][side] = t_children[b][side] XOR (t[b] AND tcw[side])
+        // Since the invariant t[0] XOR t[1] = 1 holds on the keep path:
+        //   t'[0][side] XOR t'[1][side]
         //     = t_children[0][side] XOR t_children[1][side] XOR tcw[side]
         //
-        // For lose (want t'0 = t'1, i.e., XOR = 0):
+        // Goal on the LOSE side: s'0 = s'1 AND t'0 = t'1 so that subtree contributions
+        // cancel under the (-1)^party output sign.
         //   tcw[lose] = t_children[0][lose] XOR t_children[1][lose]
         //
-        // For keep (want t'0 XOR t'1 = 1):
+        // Goal on the KEEP side: maintain t'0 XOR t'1 = 1 so the recursion continues
+        // to the target leaf with diverged state.
         //   tcw[keep] = t_children[0][keep] XOR t_children[1][keep] XOR 1
 
         let tcw = [

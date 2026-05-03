@@ -15,7 +15,7 @@ pub enum DaViTWeightTarget {
 
     // Block components (stage_idx, block_idx within stage)
     // In timm, blocks alternate: even=Spatial, odd=Channel.
-    // block_idx here maps to our (SpatialBlock, ChannelBlock) tuple.
+    // block_idx here maps to the (SpatialBlock, ChannelBlock) tuple.
     BlockCpe1Weight(usize, usize, BlockType),
     BlockCpe1Bias(usize, usize, BlockType),
     BlockNorm1Weight(usize, usize, BlockType),

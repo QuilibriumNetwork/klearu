@@ -20,8 +20,8 @@ impl SparseHieraModel {
 
     /// Build a `VisionPredictorStore` for Hiera with per-stage dimensions.
     ///
-    /// Since Hiera has varying embed_dims and num_heads across stages, we
-    /// construct each block's predictor with the correct input/output dims
+    /// Since Hiera has varying embed_dims and num_heads across stages, each
+    /// block's predictor is constructed with the correct input/output dims
     /// rather than using `VisionPredictorStore::new` (which assumes uniform dims).
     pub fn build_predictors(
         config: &HieraConfig,

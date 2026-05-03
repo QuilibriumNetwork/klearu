@@ -1,4 +1,4 @@
-/// Number of fractional bits in our fixed-point representation (Q16.16).
+/// Number of fractional bits in the fixed-point representation (Q16.16).
 pub const FRAC_BITS: u32 = 16;
 
 /// Scale factor: 2^FRAC_BITS = 65536.

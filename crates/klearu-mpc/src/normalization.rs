@@ -70,7 +70,7 @@ pub fn rmsnorm_shared_64(
 
     // Generate n squaring triples in Z_{2^128}.
     // Each triple (a, b, c) where c = a*b mod 2^128.
-    // We use x as both inputs: d = x - a, e = x - b.
+    // x is used as both inputs: d = x - a, e = x - b.
     let sq_triples = triples.generate(n);
 
     // d[k] = x_share[k] - triple.a (in Z_{2^128}, sign-extending u64→u128)

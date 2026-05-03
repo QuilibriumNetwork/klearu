@@ -14,6 +14,7 @@ members = [
     "crates/klearu-vision",
     "crates/klearu-wasm",
     "crates/klearu-server",
+    "crates/klearu-diffusion",
 ]
 
 [workspace.package]
