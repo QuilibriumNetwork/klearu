@@ -10,7 +10,9 @@
 //!   - Works at 20-50 inference steps for SD 1.5.
 
 pub mod ddim;
+pub mod flow_match;
 pub use ddim::DDIMScheduler;
+pub use flow_match::{FlowMatchConfig, FlowMatchScheduler};
 
 /// Common interface for any scheduler used in the SD pipeline.
 pub trait Scheduler {

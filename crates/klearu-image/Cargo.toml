@@ -1,0 +1,48 @@
+[package]
+name = "klearu-image"
+description = "Transformer-based image generation: tokenizer + autoregressive transformer + decoder. Designed for CPU training via klearu's sparse-routing primitives."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+# CLI binaries for training and sampling.
+cli = ["dep:image"]
+# Apple Accelerate (cblas_sgemm + AMX) for the heavy matmuls.
+accelerate = ["klearu-diffusion/accelerate"]
+# Metal residence for GPU inference.
+metal = ["klearu-diffusion/metal"]
+
+[dependencies]
+klearu-core = { workspace = true }
+klearu-accel = { workspace = true }
+klearu-llm = { workspace = true }
+klearu-diffusion = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+safetensors = "0.4"
+memmap2 = "0.9"
+half = { workspace = true }
+image = { version = "0.25", optional = true }
+tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
+rand = { workspace = true }
+matrixmultiply = "0.3"
+rayon = "1"
+
+[[bin]]
+name = "img_train"
+path = "src/bin/img_train.rs"
+
+[[bin]]
+name = "img_sample"
+path = "src/bin/img_sample.rs"
+
+[[bin]]
+name = "plan_prompts"
+path = "src/bin/plan_prompts.rs"

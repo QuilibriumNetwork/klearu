@@ -15,6 +15,7 @@ members = [
     "crates/klearu-wasm",
     "crates/klearu-server",
     "crates/klearu-diffusion",
+    "crates/klearu-image",
 ]
 
 [workspace.package]
@@ -37,6 +38,8 @@ klearu-private = { path = "crates/klearu-private", default-features = false }
 klearu-vision = { path = "crates/klearu-vision" }
 klearu-wasm = { path = "crates/klearu-wasm" }
 klearu-server = { path = "crates/klearu-server" }
+klearu-diffusion = { path = "crates/klearu-diffusion" }
+klearu-image = { path = "crates/klearu-image" }
 
 # Core dependencies
 ndarray = { version = "0.16", features = ["rayon"] }

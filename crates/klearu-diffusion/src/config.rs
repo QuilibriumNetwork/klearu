@@ -195,7 +195,31 @@ pub struct VAEConfig {
     #[serde(default = "default_vae_sample_size")]
     pub sample_size: usize, // 512
     #[serde(default = "default_vae_scaling_factor")]
-    pub scaling_factor: f32, // 0.18215 for SD 1.5
+    pub scaling_factor: f32, // 0.18215 for SD 1.5; 0.13025 for SDXL; 0.3611 for Flux
+    /// Diffusers' `shift_factor`. Latent normalization formula:
+    ///   `latent_for_unet = (latent - shift_factor) * scaling_factor`
+    ///   `latent_for_decode = latent / scaling_factor + shift_factor`
+    /// SD/SDXL leave this at 0.0 (no shift); Flux uses 0.1159.
+    #[serde(default = "default_vae_shift_factor")]
+    pub shift_factor: f32,
+}
+
+impl VAEConfig {
+    /// Flux 16-channel VAE preset (matches BFL `ae.safetensors`).
+    pub fn flux() -> Self {
+        Self {
+            in_channels: 3,
+            out_channels: 3,
+            latent_channels: 16,
+            block_out_channels: vec![128, 256, 512, 512],
+            layers_per_block: 2,
+            act_fn: "silu".into(),
+            norm_num_groups: 32,
+            sample_size: 1024,
+            scaling_factor: 0.3611,
+            shift_factor: 0.1159,
+        }
+    }
 }
 
 fn default_vae_in_channels() -> usize { 3 }
@@ -207,6 +231,7 @@ fn default_vae_act_fn() -> String { "silu".into() }
 fn default_vae_norm_num_groups() -> usize { 32 }
 fn default_vae_sample_size() -> usize { 512 }
 fn default_vae_scaling_factor() -> f32 { 0.18215 }
+fn default_vae_shift_factor() -> f32 { 0.0 }
 
 /// CLIP text encoder config (used as text_encoder/config.json).
 #[derive(Debug, Deserialize, Clone)]
@@ -379,6 +404,7 @@ impl CheckpointConfig {
                 norm_num_groups: 32,
                 sample_size: 512,
                 scaling_factor: 0.18215,
+                shift_factor: 0.0,
             },
             text_encoder: CLIPTextConfig {
                 vocab_size: 49408,

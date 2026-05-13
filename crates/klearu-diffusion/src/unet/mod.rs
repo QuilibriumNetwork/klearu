@@ -23,11 +23,13 @@
 //!   - block_out_channels = [320, 640, 1280] (SD 1.5 has four blocks).
 
 pub mod blocks;
+pub mod flux;
 pub mod resnet_block;
 pub mod text_time_embedding;
 pub mod time_embedding;
 pub mod transformer_2d;
 pub use blocks::{DownBlock2D, MidBlock, UpBlock2D};
+pub use flux::{FluxConfig, FluxTransformer};
 pub use resnet_block::ResnetBlock2D;
 pub use text_time_embedding::TextTimeEmbedding;
 pub use time_embedding::{TimeEmbedding, sinusoidal_embedding};
@@ -242,6 +244,20 @@ impl UNet2DConditionModel {
         timestep: f32,
         text_embedding: &[f32],
     ) -> Result<Vec<f32>> {
+        self.forward_with_controlnet(latent, timestep, text_embedding, None, None)
+    }
+
+    /// Same as `forward` but with optional ControlNet residuals added to
+    /// each skip and the mid-block output. The residual list must match
+    /// `all_skips` length; pass `None` for plain UNet behavior.
+    pub fn forward_with_controlnet(
+        &self,
+        latent: &[f32],
+        timestep: f32,
+        text_embedding: &[f32],
+        down_residuals: Option<&[Vec<f32>]>,
+        mid_residual: Option<&[f32]>,
+    ) -> Result<Vec<f32>> {
         let h = self.config.sample_size;
         let w = self.config.sample_size;
         let n = (latent.len() / (self.config.in_channels * h * w)).max(1);
@@ -277,8 +293,22 @@ impl UNet2DConditionModel {
             h_cur = hn; w_cur = wn;
         }
 
+        // ControlNet residual injection: add to each skip and to mid.
+        if let Some(res) = down_residuals {
+            inject_residuals_cpu(&mut all_skips, res)?;
+        }
+
         // Mid.
         x = self.mid_block.forward(&x, n, h_cur, w_cur, &time_emb, text_embedding, text_seq);
+        if let Some(mr) = mid_residual {
+            if mr.len() != x.len() {
+                return Err(DiffusionError::ShapeMismatch {
+                    expected: format!("mid residual len {}", x.len()),
+                    got: format!("{}", mr.len()),
+                });
+            }
+            for (a, b) in x.iter_mut().zip(mr.iter()) { *a += b; }
+        }
 
         // Up path.
         for ub in &self.up_blocks {
@@ -310,6 +340,21 @@ impl UNet2DConditionModel {
         text_embedding: &[f32],
         pooled_text_embedding: &[f32],
         additional_cond: SDXLAdditionalConditioning,
+    ) -> Result<Vec<f32>> {
+        self.forward_sdxl_with_controlnet(latent, timestep, text_embedding,
+            pooled_text_embedding, additional_cond, None, None)
+    }
+
+    /// Same as `forward_sdxl` but with optional ControlNet residuals.
+    pub fn forward_sdxl_with_controlnet(
+        &self,
+        latent: &[f32],
+        timestep: f32,
+        text_embedding: &[f32],
+        pooled_text_embedding: &[f32],
+        additional_cond: SDXLAdditionalConditioning,
+        down_residuals: Option<&[Vec<f32>]>,
+        mid_residual: Option<&[f32]>,
     ) -> Result<Vec<f32>> {
         if !self.config.is_sdxl() {
             return Err(DiffusionError::Unsupported(
@@ -361,7 +406,20 @@ impl UNet2DConditionModel {
             h_cur = hn; w_cur = wn;
         }
 
+        if let Some(res) = down_residuals {
+            inject_residuals_cpu(&mut all_skips, res)?;
+        }
+
         x = self.mid_block.forward(&x, n, h_cur, w_cur, &time_emb, text_embedding, text_seq);
+        if let Some(mr) = mid_residual {
+            if mr.len() != x.len() {
+                return Err(DiffusionError::ShapeMismatch {
+                    expected: format!("mid residual len {}", x.len()),
+                    got: format!("{}", mr.len()),
+                });
+            }
+            for (a, b) in x.iter_mut().zip(mr.iter()) { *a += b; }
+        }
 
         for ub in &self.up_blocks {
             let (out, hn, wn) = ub.forward(&x, n, h_cur, w_cur, &mut all_skips, &mut all_skip_channels, &time_emb, text_embedding, text_seq);
@@ -387,12 +445,24 @@ impl UNet2DConditionModel {
         timestep: f32,
         text_embedding: &[f32],
     ) -> Result<Vec<f32>> {
+        self.forward_gpu_with_controlnet(latent, timestep, text_embedding, None, None, 1.0)
+    }
+
+    /// Same as `forward_gpu` but with optional ControlNet residuals.
+    /// `residual_scale` multiplies each residual element-wise during
+    /// injection (Metal `eadd_scaled` kernel). Pass 1.0 to skip the
+    /// scaling overhead.
+    #[cfg(feature = "metal")]
+    pub fn forward_gpu_with_controlnet(
+        &self,
+        latent: &[f32],
+        timestep: f32,
+        text_embedding: &[f32],
+        down_residuals: Option<&[crate::metal_backend::GpuTensor]>,
+        mid_residual: Option<&crate::metal_backend::GpuTensor>,
+        residual_scale: f32,
+    ) -> Result<Vec<f32>> {
         use crate::metal_backend::*;
-        // Open a batched command buffer for the entire UNet step. Every
-        // `*_f16_gpu` and MPS sgemm appends to this single cmd buffer
-        // instead of creating its own — saves ~600+ new_command_buffer +
-        // commit pairs per step. The `download_to_f32()` at the end
-        // implicitly closes the batch via `flush()`.
         begin_batch();
         let h = self.config.sample_size;
         let w = self.config.sample_size;
@@ -451,8 +521,19 @@ impl UNet2DConditionModel {
             trace_stat(&format!("after down_block[{db_idx}]"), &x);
         }
 
+        if let Some(res) = down_residuals {
+            inject_residuals_gpu(&mut all_skips, res, residual_scale)?;
+        }
+
         // Mid.
         x = self.mid_block.forward_gpu(&x, n, h_cur, w_cur, &time_emb, text_embedding, text_seq);
+        if let Some(mr) = mid_residual {
+            if (residual_scale - 1.0).abs() < 1e-6 {
+                eadd_f16_gpu(&mut x, mr);
+            } else {
+                eadd_scaled_f16_gpu(&mut x, mr, residual_scale);
+            }
+        }
         trace_stat("after mid_block", &x);
 
         // Up path.
@@ -497,6 +578,24 @@ impl UNet2DConditionModel {
         text_embedding: &[f32],
         pooled_text_embedding: &[f32],
         additional_cond: SDXLAdditionalConditioning,
+    ) -> Result<Vec<f32>> {
+        self.forward_sdxl_gpu_with_controlnet(latent, timestep, text_embedding,
+            pooled_text_embedding, additional_cond, None, None, 1.0)
+    }
+
+    /// Same as `forward_sdxl_gpu` but with optional ControlNet residuals.
+    /// See `forward_gpu_with_controlnet` for `residual_scale` semantics.
+    #[cfg(feature = "metal")]
+    pub fn forward_sdxl_gpu_with_controlnet(
+        &self,
+        latent: &[f32],
+        timestep: f32,
+        text_embedding: &[f32],
+        pooled_text_embedding: &[f32],
+        additional_cond: SDXLAdditionalConditioning,
+        down_residuals: Option<&[crate::metal_backend::GpuTensor]>,
+        mid_residual: Option<&crate::metal_backend::GpuTensor>,
+        residual_scale: f32,
     ) -> Result<Vec<f32>> {
         use crate::metal_backend::*;
         begin_batch();
@@ -567,8 +666,19 @@ impl UNet2DConditionModel {
             tick(&format!("down_block[{i}] @{h_cur}×{w_cur}"), t);
         }
 
+        if let Some(res) = down_residuals {
+            inject_residuals_gpu(&mut all_skips, res, residual_scale)?;
+        }
+
         let t = std::time::Instant::now();
         x = self.mid_block.forward_gpu(&x, n, h_cur, w_cur, &time_emb, text_embedding, text_seq);
+        if let Some(mr) = mid_residual {
+            if (residual_scale - 1.0).abs() < 1e-6 {
+                eadd_f16_gpu(&mut x, mr);
+            } else {
+                eadd_scaled_f16_gpu(&mut x, mr, residual_scale);
+            }
+        }
         tick("mid_block", t);
 
         for (i, ub) in self.up_blocks.iter().enumerate() {
@@ -727,7 +837,54 @@ impl UNet2DConditionModel {
     }
 }
 
-fn expand_attention_head_dim(d: &AttentionHeadDim, n_blocks: usize) -> Vec<usize> {
+/// Add `residuals[i]` element-wise to `all_skips[i]` for every i. The
+/// lengths must match exactly; element counts within each pair must
+/// match. Used by the ControlNet integration (the residuals come from
+/// `ControlNet2DModel::forward`'s down_residuals output).
+fn inject_residuals_cpu(
+    all_skips: &mut [Vec<f32>],
+    residuals: &[Vec<f32>],
+) -> Result<()> {
+    if all_skips.len() != residuals.len() {
+        return Err(DiffusionError::ShapeMismatch {
+            expected: format!("residual count == skip count ({})", all_skips.len()),
+            got: format!("{}", residuals.len()),
+        });
+    }
+    for (i, (skip, res)) in all_skips.iter_mut().zip(residuals.iter()).enumerate() {
+        if skip.len() != res.len() {
+            return Err(DiffusionError::ShapeMismatch {
+                expected: format!("skip[{i}] residual len {}", skip.len()),
+                got: format!("{}", res.len()),
+            });
+        }
+        for (a, b) in skip.iter_mut().zip(res.iter()) { *a += b; }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "metal")]
+fn inject_residuals_gpu(
+    all_skips: &mut [crate::metal_backend::GpuTensor],
+    residuals: &[crate::metal_backend::GpuTensor],
+    scale: f32,
+) -> Result<()> {
+    use crate::metal_backend::{eadd_f16_gpu, eadd_scaled_f16_gpu};
+    if all_skips.len() != residuals.len() {
+        return Err(DiffusionError::ShapeMismatch {
+            expected: format!("residual count == skip count ({})", all_skips.len()),
+            got: format!("{}", residuals.len()),
+        });
+    }
+    let unit = (scale - 1.0).abs() < 1e-6;
+    for (skip, res) in all_skips.iter_mut().zip(residuals.iter()) {
+        if unit { eadd_f16_gpu(skip, res); }
+        else    { eadd_scaled_f16_gpu(skip, res, scale); }
+    }
+    Ok(())
+}
+
+pub fn expand_attention_head_dim(d: &AttentionHeadDim, n_blocks: usize) -> Vec<usize> {
     match d {
         AttentionHeadDim::Single(n) => vec![*n; n_blocks],
         AttentionHeadDim::PerBlock(v) => v.clone(),

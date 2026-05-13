@@ -148,3 +148,63 @@ impl CLIPTokenizer {
         self.inner.get_vocab_size(true)
     }
 }
+
+// ============================================================================
+// T5 tokenizer for Flux's T5-XXL text encoder
+// ============================================================================
+
+/// T5 sentencepiece tokenizer (loaded via HF `tokenizers` crate from a
+/// `tokenizer.json` produced by `T5TokenizerFast.save_pretrained`).
+///
+/// Differences vs CLIP:
+///   - No BOS. EOS = `</s>` = id 1.
+///   - Pad with id 0.
+///   - Default max_length is 256 for Flux dev, 512 for Flux dev with
+///     long-form prompts. Flux schnell uses 256.
+pub struct T5Tokenizer {
+    inner: tokenizers::Tokenizer,
+    pub max_length: usize,
+    pub eos_id: u32,
+    pub pad_id: u32,
+}
+
+impl T5Tokenizer {
+    /// Load from a `tokenizer.json` file (HF merged format).
+    pub fn from_file(path: &Path, max_length: usize) -> Result<Self> {
+        let inner = tokenizers::Tokenizer::from_file(path)
+            .map_err(|e| DiffusionError::Unsupported(format!("T5 tokenizer: {e}")))?;
+        // T5 conventions: id 0 = <pad>, id 1 = </s>.
+        Ok(Self {
+            inner,
+            max_length,
+            eos_id: 1,
+            pad_id: 0,
+        })
+    }
+
+    /// Encode `text` to a fixed-length sequence of `max_length` ids, with
+    /// EOS appended and right-padded with the pad id. Returns the ids and
+    /// a parallel attention mask (`true` = real token, `false` = padding).
+    pub fn encode_padded(&self, text: &str) -> Result<(Vec<u32>, Vec<bool>)> {
+        let encoding = self.inner.encode(text, false)
+            .map_err(|e| DiffusionError::Unsupported(format!("encode: {e}")))?;
+        let mut ids = Vec::with_capacity(self.max_length);
+        let mut mask = Vec::with_capacity(self.max_length);
+        for &id in encoding.get_ids() {
+            if ids.len() >= self.max_length - 1 { break; } // leave room for EOS
+            ids.push(id);
+            mask.push(true);
+        }
+        ids.push(self.eos_id);
+        mask.push(true);
+        while ids.len() < self.max_length {
+            ids.push(self.pad_id);
+            mask.push(false);
+        }
+        Ok((ids, mask))
+    }
+
+    pub fn vocab_size(&self) -> usize {
+        self.inner.get_vocab_size(true)
+    }
+}

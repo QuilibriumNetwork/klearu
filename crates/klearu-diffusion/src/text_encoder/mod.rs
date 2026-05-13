@@ -1,12 +1,13 @@
-//! CLIP text encoder for SD's prompt → embedding path.
+//! Text encoders for diffusion-pipeline prompt → embedding paths.
 //!
-//! Pre-norm Transformer with LayerNorm + multi-head self-attention +
-//! quick_gelu MLP. Learned absolute position embeddings (77 max).
-//! Causal mask during attention so each token only sees prior tokens
-//! (this is how OpenAI's CLIP was trained).
-//!
-//! Same architecture serves CLIP-L (768d/12 layers) and CLIP-G
-//! (1280d/32 layers); only the config dimensions differ.
+//! - **CLIP-L / CLIP-G** (this file): pre-norm Transformer with LayerNorm +
+//!   multi-head self-attention + quick_gelu MLP. Learned absolute position
+//!   embeddings (77 max). Causal mask during attention. Used by SD 1.5 /
+//!   SDXL / Flux (Flux uses CLIP-L for the pooled vector input).
+//! - **T5** (`t5` submodule): T5-XXL encoder used by Flux for the bulk of
+//!   the text conditioning (4096-dim per-token embedding, 256–512 tokens).
+
+pub mod t5;
 
 use crate::config::CLIPTextConfig;
 use crate::error::{DiffusionError, Result};

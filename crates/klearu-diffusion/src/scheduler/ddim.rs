@@ -52,7 +52,7 @@ impl DDIMScheduler {
         }
     }
 
-    fn alpha_bar_at(&self, t: i64) -> f32 {
+    pub fn alpha_bar_at(&self, t: i64) -> f32 {
         if t < 0 {
             // Match Diffusers SD 1.5 default: set_alpha_to_one=False uses
             // alphas_cumprod[0] (≈0.99915) as the final-step α_bar_prev,

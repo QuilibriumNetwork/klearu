@@ -49,3 +49,8 @@ path = "src/bin/sd_inventory.rs"
 name = "sd_generate"
 path = "src/bin/sd_generate.rs"
 required-features = ["cli"]
+
+[[bin]]
+name = "flux_generate"
+path = "src/bin/flux_generate.rs"
+required-features = ["cli"]

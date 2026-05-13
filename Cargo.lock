@@ -1697,6 +1697,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "klearu-image"
+version = "0.1.0"
+dependencies = [
+ "half",
+ "image",
+ "klearu-accel",
+ "klearu-core",
+ "klearu-diffusion",
+ "klearu-llm",
+ "matrixmultiply",
+ "memmap2",
+ "rand 0.8.5",
+ "rayon",
+ "safetensors",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokenizers",
+ "tracing",
+]
+
+[[package]]
 name = "klearu-llm"
 version = "0.1.0"
 dependencies = [

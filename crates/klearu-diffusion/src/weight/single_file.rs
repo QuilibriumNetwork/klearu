@@ -86,7 +86,8 @@ impl ModelSpec {
         match self.architecture.as_deref() {
             Some(a) => {
                 let a = a.to_ascii_lowercase();
-                if a.contains("xl") { SDFormat::Sdxl }
+                if a.contains("flux") { SDFormat::Flux }
+                else if a.contains("xl") { SDFormat::Sdxl }
                 else if a.contains("stable-diffusion") || a.contains("sd-") || a.contains("sd-v") {
                     SDFormat::Sd15
                 } else { SDFormat::Unknown }
@@ -108,10 +109,34 @@ impl ModelSpec {
 pub enum SDFormat {
     Sd15,    // CompVis SD 1.x or 2.x with single CLIP-L
     Sdxl,    // CompVis SDXL with CLIP-L + OpenCLIP CLIP-G
+    /// Black-forest-labs Flux (flux1-dev / flux1-schnell). MMDiT backbone with
+    /// double-stream + single-stream blocks, T5-XXL + CLIP-L text encoders,
+    /// 16-channel VAE, flow-matching scheduler. The BFL release ships the
+    /// transformer as a single safetensors file with BFL-native naming
+    /// (`double_blocks.*`, `single_blocks.*`); the VAE ships separately
+    /// (`ae.safetensors`).
+    Flux,
     Unknown,
 }
 
 impl SingleFileLoader {
+    /// Detect whether this checkpoint is an *inpainting* UNet (9 input
+    /// channels: 4 noisy latent + 4 masked init latent + 1 mask). Returns
+    /// the conv_in's input-channel count, or None if conv_in isn't present
+    /// (e.g., this is a Flux file or a standalone VAE).
+    ///
+    /// SD 1.5 / SDXL inpaint models (RunwayML / Stability) store their
+    /// first conv at `model.diffusion_model.input_blocks.0.0.weight` with
+    /// shape `[block_out_channels[0], in_channels, 3, 3]`. Standard SD has
+    /// `in_channels = 4`; inpaint has `in_channels = 9`.
+    pub fn unet_in_channels(&self) -> Option<usize> {
+        // CompVis-style key (SD/SDXL single-file).
+        let key = "model.diffusion_model.input_blocks.0.0.weight";
+        let r = self.raw_tensors.get(key)?;
+        // shape is [out_c, in_c, kh, kw]
+        if r.shape.len() == 4 { Some(r.shape[1]) } else { None }
+    }
+
     pub fn open(path: &Path) -> Result<Self> {
         let file = std::fs::File::open(path)?;
         let mmap = unsafe { Mmap::map(&file)? };
@@ -147,7 +172,15 @@ impl SingleFileLoader {
         // Variant detection: prefer modelspec.architecture, fall back to tensor-name heuristic.
         let variant = match metadata.architecture_variant() {
             SDFormat::Unknown => {
-                if raw_tensors.contains_key("conditioner.embedders.1.model.transformer.resblocks.0.attn.in_proj_weight") {
+                if raw_tensors.contains_key("double_blocks.0.img_attn.qkv.weight")
+                    || raw_tensors.contains_key("model.diffusion_model.double_blocks.0.img_attn.qkv.weight")
+                {
+                    // BFL-native Flux transformer (flux1-dev / flux1-schnell).
+                    // The `model.diffusion_model.` prefix is added by SD-style
+                    // (ComfyUI / A1111 / Civitai) packagings; the loader
+                    // strips it during the mapping pass.
+                    SDFormat::Flux
+                } else if raw_tensors.contains_key("conditioner.embedders.1.model.transformer.resblocks.0.attn.in_proj_weight") {
                     SDFormat::Sdxl
                 } else if raw_tensors.contains_key("cond_stage_model.transformer.text_model.encoder.layers.0.self_attn.q_proj.weight") {
                     SDFormat::Sd15
@@ -174,6 +207,11 @@ impl SingleFileLoader {
             (SDFormat::Sdxl, "vae") => sd_vae_mappings(),
             (SDFormat::Sdxl, "text_encoder") => sdxl_clip_l_mappings(),
             (SDFormat::Sdxl, "text_encoder_2") => sdxl_clip_g_mappings(),
+            // Flux: pass-through identity mapping. The MMDiT consumer reads
+            // BFL-native names directly (`double_blocks.*`, `single_blocks.*`,
+            // `img_in.*`, `time_in.*`, etc.), so no rename is needed.
+            (SDFormat::Flux, "transformer") => flux_transformer_mappings(&self.raw_tensors),
+            (SDFormat::Flux, "vae") => flux_vae_mappings(&self.raw_tensors),
             _ => {
                 return Err(DiffusionError::Unsupported(
                     format!("no single-file mapping for variant={:?}, component={name}", self.variant)
@@ -766,6 +804,163 @@ fn push_vae_attn(m: &mut Vec<(String, Mapping)>, diffusers: &str, compvis: &str)
     push_linear(m, &format!("{diffusers}.to_k"), &format!("{compvis}.k"));
     push_linear(m, &format!("{diffusers}.to_v"), &format!("{compvis}.v"));
     push_linear(m, &format!("{diffusers}.to_out.0"), &format!("{compvis}.proj_out"));
+}
+
+// ============================================================================
+// Flux mapping tables (BFL-native naming)
+// ============================================================================
+//
+// Flux ships its transformer as a single safetensors file with the following
+// top-level structure (BFL-native naming, used directly by the MMDiT module
+// in this crate — no rename to a different convention):
+//
+//   img_in.{weight,bias}                    image patch projector
+//   txt_in.{weight,bias}                    text token projector (after T5)
+//   time_in.{in_layer,out_layer}.{w,b}      timestep embedder MLP
+//   vector_in.{in_layer,out_layer}.{w,b}    pooled CLIP-L vector embedder MLP
+//   guidance_in.{in_layer,out_layer}.{w,b}  guidance scalar embedder (dev only;
+//                                           absent on flux1-schnell)
+//   double_blocks.{0..18}.img_mod.lin.{w,b} 6-way modulation projector (img)
+//   double_blocks.{0..18}.img_attn.qkv.{w,b}        fused QKV (split 3-way at use)
+//   double_blocks.{0..18}.img_attn.norm.query_norm.scale  RMS-norm scale
+//   double_blocks.{0..18}.img_attn.norm.key_norm.scale    RMS-norm scale
+//   double_blocks.{0..18}.img_attn.proj.{w,b}             attention output proj
+//   double_blocks.{0..18}.img_mlp.0.{w,b}                 MLP fc1
+//   double_blocks.{0..18}.img_mlp.2.{w,b}                 MLP fc2
+//   double_blocks.{0..18}.txt_mod.lin.{w,b}               (txt branch, mirrors img)
+//   double_blocks.{0..18}.txt_attn.qkv.{w,b}
+//   double_blocks.{0..18}.txt_attn.norm.{query,key}_norm.scale
+//   double_blocks.{0..18}.txt_attn.proj.{w,b}
+//   double_blocks.{0..18}.txt_mlp.0.{w,b}
+//   double_blocks.{0..18}.txt_mlp.2.{w,b}
+//   single_blocks.{0..37}.modulation.lin.{w,b}    3-way modulation projector
+//   single_blocks.{0..37}.linear1.{w,b}    fused [Q, K, V, MLP_in] (4-way split)
+//   single_blocks.{0..37}.linear2.{w,b}    fused [out_proj, MLP_out] (concat input)
+//   single_blocks.{0..37}.norm.{query,key}_norm.scale
+//   final_layer.adaLN_modulation.1.{w,b}   final LN scale/shift modulator
+//   final_layer.linear.{w,b}               unpatchify projector
+//
+// flux1-dev: 19 double + 38 single blocks, hidden_size=3072, num_heads=24,
+//   guidance_in present.
+// flux1-schnell: same shape, no guidance_in (set to None at runtime).
+//
+// Pass-through: no key rename. The Component map produced for "transformer"
+// contains exactly the keys above, looked up directly by the MMDiT consumer.
+
+/// Build mappings for the Flux transformer file. The MMDiT reader consumes
+/// BFL-native names (`double_blocks.…`, `single_blocks.…`, `img_in.…`,
+/// `time_in.…`, …) directly. SD-style packagings (ComfyUI, A1111, Civitai)
+/// wrap those names with a `model.diffusion_model.` prefix; we detect the
+/// prefix once and emit aliases that strip it at lookup time so the
+/// downstream loader doesn't need to care.
+///
+/// Tensors that belong to the VAE / text encoder are filtered out (in case
+/// the user passed a single all-in-one file rather than the BFL split).
+fn flux_transformer_mappings(raw: &HashMap<String, TensorRef>) -> Vec<(String, Mapping)> {
+    let prefix = if raw.contains_key("model.diffusion_model.double_blocks.0.img_attn.qkv.weight") {
+        "model.diffusion_model."
+    } else {
+        ""
+    };
+    let is_transformer_key = |k: &str| -> bool {
+        let stripped = k.strip_prefix(prefix).unwrap_or(k);
+        stripped.starts_with("double_blocks.")
+            || stripped.starts_with("single_blocks.")
+            || stripped.starts_with("img_in.")
+            || stripped.starts_with("txt_in.")
+            || stripped.starts_with("time_in.")
+            || stripped.starts_with("vector_in.")
+            || stripped.starts_with("guidance_in.")
+            || stripped.starts_with("final_layer.")
+    };
+    raw.keys()
+        .filter(|k| is_transformer_key(k))
+        .map(|k| {
+            let bfl_name = k.strip_prefix(prefix).unwrap_or(k).to_string();
+            (bfl_name, Mapping::Alias(k.clone()))
+        })
+        .collect()
+}
+
+/// Build pass-through mappings for the Flux 16-channel VAE file
+/// (`ae.safetensors` from black-forest-labs). Architecture matches the SD/SDXL
+/// KL-VAE family — same encoder/decoder shape — but with `z_channels=16`
+/// (vs SD's 4), giving `conv_out` shape [32, 512, 3, 3] in the encoder
+/// (32 = 16 mean + 16 logvar) and [16, …] in the decoder's `conv_in`.
+///
+/// Naming inside `ae.safetensors` is the original CompVis VAE convention
+/// (`encoder.conv_in.*`, `encoder.down.<i>.block.<j>.*`, `encoder.mid.*`,
+/// `decoder.up.<i>.block.<j>.*`, etc.) without the `first_stage_model.`
+/// prefix. We translate to the diffusers-style naming used by the rest of
+/// our VAE code, then the existing VAE module can consume Flux weights
+/// (subject to per-block channel counts being driven by config, not hard-
+/// coded — see vae adapter task #184).
+pub(crate) fn flux_vae_mappings(raw: &HashMap<String, TensorRef>) -> Vec<(String, Mapping)> {
+    let mut m: Vec<(String, Mapping)> = Vec::new();
+
+    // Detect VAE naming prefix:
+    //   - `first_stage_model.` → CompVis SD-style packaging
+    //   - `vae.`               → ComfyUI / Civitai all-in-one bundle
+    //   - empty                → bare `ae.safetensors` (BFL release)
+    let prefix = if raw.contains_key("first_stage_model.encoder.conv_in.weight") {
+        "first_stage_model."
+    } else if raw.contains_key("vae.encoder.conv_in.weight") {
+        "vae."
+    } else {
+        ""
+    };
+
+    let p = |s: &str| format!("{prefix}{s}");
+
+    // Encoder
+    push_conv(&mut m, "encoder.conv_in", &p("encoder.conv_in"));
+    for i in 0..4 {
+        for j in 0..2 {
+            push_vae_resnet(&mut m,
+                &format!("encoder.down_blocks.{i}.resnets.{j}"),
+                &p(&format!("encoder.down.{i}.block.{j}")));
+        }
+        if i < 3 {
+            push_conv(&mut m,
+                &format!("encoder.down_blocks.{i}.downsamplers.0.conv"),
+                &p(&format!("encoder.down.{i}.downsample.conv")));
+        }
+    }
+    push_vae_resnet(&mut m, "encoder.mid_block.resnets.0", &p("encoder.mid.block_1"));
+    push_vae_attn(&mut m, "encoder.mid_block.attentions.0", &p("encoder.mid.attn_1"));
+    push_vae_resnet(&mut m, "encoder.mid_block.resnets.1", &p("encoder.mid.block_2"));
+    push_group_norm(&mut m, "encoder.conv_norm_out", &p("encoder.norm_out"));
+    push_conv(&mut m, "encoder.conv_out", &p("encoder.conv_out"));
+
+    // Flux's ae.safetensors does NOT carry quant_conv / post_quant_conv —
+    // unlike SD's first_stage_model. Mean/logvar are produced directly by
+    // encoder.conv_out (out_channels = 2 * z_channels). The VAE adapter
+    // detects absence of quant_conv at runtime and skips it.
+    push_conv(&mut m, "quant_conv", &p("quant_conv"));
+    push_conv(&mut m, "post_quant_conv", &p("post_quant_conv"));
+
+    // Decoder
+    push_conv(&mut m, "decoder.conv_in", &p("decoder.conv_in"));
+    push_vae_resnet(&mut m, "decoder.mid_block.resnets.0", &p("decoder.mid.block_1"));
+    push_vae_attn(&mut m, "decoder.mid_block.attentions.0", &p("decoder.mid.attn_1"));
+    push_vae_resnet(&mut m, "decoder.mid_block.resnets.1", &p("decoder.mid.block_2"));
+    for i in 0..4 {
+        let cv_i = 3 - i;
+        for j in 0..3 {
+            push_vae_resnet(&mut m,
+                &format!("decoder.up_blocks.{i}.resnets.{j}"),
+                &p(&format!("decoder.up.{cv_i}.block.{j}")));
+        }
+        if i < 3 {
+            push_conv(&mut m,
+                &format!("decoder.up_blocks.{i}.upsamplers.0.conv"),
+                &p(&format!("decoder.up.{cv_i}.upsample.conv")));
+        }
+    }
+    push_group_norm(&mut m, "decoder.conv_norm_out", &p("decoder.norm_out"));
+    push_conv(&mut m, "decoder.conv_out", &p("decoder.conv_out"));
+
+    m
 }
 
 fn push_transformer(m: &mut Vec<(String, Mapping)>, diffusers: &str, compvis: &str, n_blocks: usize) {

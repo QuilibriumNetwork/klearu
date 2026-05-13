@@ -421,6 +421,101 @@ impl VAEEncoder {
         }
     }
 
+    /// GPU-resident encode forward. Mirror of `forward` (down + mid + out)
+    /// but every op chains on Metal via fp16 GpuTensors. One boundary
+    /// upload (image) + one download (concatenated mean|logvar). Returns
+    /// the raw `2 * latent_channels` output tensor in CHW layout —
+    /// `AutoencoderKL::encode_gpu` splits it into (mean, logvar) and
+    /// optionally applies `quant_conv`.
+    #[cfg(feature = "metal")]
+    pub fn forward_gpu(&self, image: &[f32], n: usize, h: usize, w: usize) -> Vec<f32> {
+        // Wrap the entire encoder body in an autoreleasepool so MPSGraph's
+        // transient Cocoa allocations (NSArray feeds, MPSGraphTensorData
+        // wrappers, graph compilation intermediates from conv2d / GroupNorm
+        // / SiLU dispatches) drain on every encode call. Without this,
+        // back-to-back encode_gpu calls in batch / REPL mode accumulate
+        // autoreleased state that eventually pushes intermediate fp16
+        // results through Inf → NaN.
+        objc2::rc::autoreleasepool(|_| self.forward_gpu_inner(image, n, h, w))
+    }
+
+    #[cfg(feature = "metal")]
+    fn forward_gpu_inner(&self, image: &[f32], n: usize, h: usize, w: usize) -> Vec<f32> {
+        use crate::metal_backend::*;
+        // Diagnostic mode: when KLEARU_VAE_TRACE is set, snapshot stats at
+        // every stage so the first NaN/Inf can be pinned to a specific op.
+        // Each snapshot forces a download (flushes the batch), which makes
+        // the encode much slower — only enable for bug-hunting.
+        let trace = std::env::var_os("KLEARU_VAE_TRACE").is_some();
+        let snap = |label: &str, t: &GpuTensor| {
+            if !trace { return; }
+            let v = t.clone_data().download_to_f32();
+            let mut mn = f32::INFINITY; let mut mx = f32::NEG_INFINITY;
+            let mut nan = 0_usize; let mut inf = 0_usize;
+            let mut sa = 0.0_f64;
+            for &x in &v {
+                if x.is_nan() { nan += 1; }
+                else if x.is_infinite() { inf += 1; }
+                else { mn = mn.min(x); mx = mx.max(x); sa += x.abs() as f64; }
+            }
+            eprintln!("[vae-trace] {label:<28} shape={:?}, len={}, min={mn:.3}, max={mx:.3}, mean_abs={:.5}, NaN={nan}, Inf={inf}",
+                t.shape, v.len(), sa / v.len() as f64);
+        };
+
+        begin_batch();
+        set_use_f32_sgemm(true);
+
+        let in_c = self.conv_in.in_channels;
+        let x_in = GpuTensor::upload_f32_as_f16(vec![n, in_c, h, w], image);
+        snap("input (uploaded)", &x_in);
+        let (mut x, mut h_cur, mut w_cur) = self.conv_in.forward_gpu(&x_in, n, h, w);
+        drop(x_in);
+        snap("after conv_in", &x);
+
+        // Down blocks: each has resnets + optional downsample.
+        for (i, db) in self.down_blocks.iter().enumerate() {
+            for (j, r) in db.resnets.iter().enumerate() {
+                x = r.forward_gpu(&x, n, h_cur, w_cur, &[]);
+                snap(&format!("down{i}.resnet{j}"), &x);
+            }
+            if let Some(d) = &db.downsample {
+                let (next, hn, wn) = d.forward_gpu(&x, n, h_cur, w_cur);
+                x = next; h_cur = hn; w_cur = wn;
+                snap(&format!("down{i}.downsample"), &x);
+            }
+        }
+
+        // Mid block: resnet → attn → resnet (no time conditioning).
+        x = self.mid_resnet_1.forward_gpu(&x, n, h_cur, w_cur, &[]);
+        snap("mid.resnet_1", &x);
+        x = self.mid_attn.forward_gpu(&x, n, h_cur, w_cur);
+        snap("mid.attn", &x);
+        x = self.mid_resnet_2.forward_gpu(&x, n, h_cur, w_cur, &[]);
+        snap("mid.resnet_2", &x);
+
+        // conv_norm_out + SiLU + conv_out (top_c → 2 * latent_channels).
+        let no_g = weight_f16_buffer(&self.conv_norm_out.gamma);
+        let no_b = weight_f16_buffer(&self.conv_norm_out.beta);
+        let c_now = x.shape[1];
+        let disable_fused = std::env::var_os("KLEARU_DISABLE_FUSED_NORMS").is_some();
+        if disable_fused {
+            groupnorm_f16_gpu(&mut x, &no_g, &no_b,
+                              n, c_now, h_cur, w_cur,
+                              self.conv_norm_out.num_groups, self.conv_norm_out.eps);
+            silu_f16_gpu(&mut x);
+        } else {
+            groupnorm_silu_f16_gpu_inplace(&mut x, &no_g, &no_b,
+                              n, c_now, h_cur, w_cur,
+                              self.conv_norm_out.num_groups, self.conv_norm_out.eps);
+        }
+        snap("after norm_out + silu", &x);
+        let (out_gpu, _, _) = self.conv_out.forward_gpu(&x, n, h_cur, w_cur);
+        snap("after conv_out", &out_gpu);
+        let result = out_gpu.download_to_f32();
+        set_use_f32_sgemm(false);
+        result
+    }
+
     /// Encode image [N, 3, H, W] → mean + logvar, each [N, latent_channels, H/8, W/8].
     /// Returns (mean, logvar) flat vecs.
     pub fn forward(&self, image: &[f32], n: usize, h: usize, w: usize) -> (Vec<f32>, Vec<f32>) {
@@ -472,7 +567,13 @@ pub struct AutoencoderKL {
     /// decode is `decoder(post_quant_conv(latent))` — without this, the
     /// decoder receives the latent in the wrong "space" and produces an
     /// image roughly anti-correlated with the correct one (cos≈-0.4).
+    /// Absent on Flux's `ae.safetensors`; presence is tracked by
+    /// `has_quant_conv` (set during `load_from`).
     pub post_quant_conv: Conv2d,
+    /// True when both `quant_conv` and `post_quant_conv` were present in
+    /// the loaded checkpoint. False ⇒ skip the 1×1 conv at encode/decode
+    /// boundaries (Flux behavior).
+    pub has_quant_conv: bool,
 }
 
 impl AutoencoderKL {
@@ -482,7 +583,7 @@ impl AutoencoderKL {
         let post_quant_conv = Conv2d::new(
             config.latent_channels, config.latent_channels, 1, 1, 0, true,
         );
-        Self { config, decoder, encoder, post_quant_conv }
+        Self { config, decoder, encoder, post_quant_conv, has_quant_conv: true }
     }
 
     /// Load all VAE weights (encoder + decoder + quant convs) from a
@@ -525,10 +626,15 @@ impl AutoencoderKL {
         self.encoder.mid_resnet_2.load_from(comp, "encoder.mid_block.resnets.1")?;
         load_group_norm(comp, "encoder.conv_norm_out", &mut self.encoder.conv_norm_out)?;
         load_conv2d(comp, "encoder.conv_out", &mut self.encoder.conv_out)?;
-        // quant_conv (encoder side): named just `quant_conv` at the top level.
-        load_conv2d(comp, "quant_conv", &mut self.encoder.quant_conv)?;
-        // post_quant_conv: applied to the latent before decode. 1×1 conv.
-        load_conv2d(comp, "post_quant_conv", &mut self.post_quant_conv)?;
+        // quant_conv / post_quant_conv: present on SD 1.5 / SDXL, absent
+        // on Flux's `ae.safetensors`. When absent, leave the conv weights
+        // at their default (zero-init by `Conv2d::new`) and signal the
+        // forward path to skip via `has_quant_conv`.
+        self.has_quant_conv = comp.has("quant_conv.weight");
+        if self.has_quant_conv {
+            load_conv2d(comp, "quant_conv", &mut self.encoder.quant_conv)?;
+            load_conv2d(comp, "post_quant_conv", &mut self.post_quant_conv)?;
+        }
         Ok(())
     }
 
@@ -560,9 +666,38 @@ impl AutoencoderKL {
 
     /// Decode with explicit [N, latent_C, H, W] dimensions (preferred).
     pub fn decode_with_dims(&self, latent: &[f32], n: usize, h: usize, w: usize) -> Vec<f32> {
-        let mut z = Vec::new();
-        self.post_quant_conv.forward(latent, n, h, w, &mut z);
+        let z = if self.has_quant_conv {
+            let mut buf = Vec::new();
+            self.post_quant_conv.forward(latent, n, h, w, &mut buf);
+            buf
+        } else {
+            latent.to_vec()
+        };
         self.decoder.forward(&z, n, h, w)
+    }
+
+    /// Convert a sampler-space latent (the model's working representation)
+    /// to a decoder-space latent. SD/SDXL use `x = z / scaling_factor`;
+    /// Flux uses `x = z / scaling_factor + shift_factor`. Apply this on
+    /// the sampler output before calling `decode_with_dims`.
+    pub fn unscale_latent(&self, z: &mut [f32]) {
+        let s = self.config.scaling_factor;
+        let shift = self.config.shift_factor;
+        if s == 0.0 { return; }
+        let inv = 1.0 / s;
+        for x in z.iter_mut() {
+            *x = *x * inv + shift;
+        }
+    }
+
+    /// Inverse of `unscale_latent`. `z = (x - shift_factor) * scaling_factor`.
+    /// Apply to the encoder output before feeding it to the sampler/UNet.
+    pub fn scale_latent(&self, x: &mut [f32]) {
+        let s = self.config.scaling_factor;
+        let shift = self.config.shift_factor;
+        for v in x.iter_mut() {
+            *v = (*v - shift) * s;
+        }
     }
 
     /// GPU-resident decode. Applies `post_quant_conv` then `decoder.forward_gpu`,
@@ -573,16 +708,19 @@ impl AutoencoderKL {
     #[cfg(feature = "metal")]
     pub fn decode_with_dims_gpu(&self, latent: &[f32], n: usize, h: usize, w: usize) -> Vec<f32> {
         use crate::metal_backend::*;
-        // post_quant_conv on GPU. Upload latent, run 1×1 conv, then hand the
-        // GPU buffer straight to the decoder.
         let lc = self.config.latent_channels;
-        let x_in = GpuTensor::upload_f32_as_f16(vec![n, lc, h, w], latent);
-        let (z_gpu, _, _) = self.post_quant_conv.forward_gpu(&x_in, n, h, w);
-        drop(x_in);
-        // Download z to feed decoder.forward_gpu (which re-uploads inside).
-        // Cheap for an 8KB latent. A future optim could plumb GpuTensor through.
-        let z_cpu = z_gpu.download_to_f32();
-        drop(z_gpu);
+        let z_cpu = if self.has_quant_conv {
+            let x_in = GpuTensor::upload_f32_as_f16(vec![n, lc, h, w], latent);
+            let (z_gpu, _, _) = self.post_quant_conv.forward_gpu(&x_in, n, h, w);
+            drop(x_in);
+            // Download z to feed decoder.forward_gpu (which re-uploads inside).
+            // Cheap for an 8KB latent. A future optim could plumb GpuTensor through.
+            let cpu = z_gpu.download_to_f32();
+            drop(z_gpu);
+            cpu
+        } else {
+            latent.to_vec()
+        };
         self.decoder.forward_gpu(&z_cpu, n, h, w)
     }
 
@@ -590,6 +728,55 @@ impl AutoencoderKL {
     /// logvar and use the mode of the distribution). Output [N, latent_C, H/8, W/8].
     pub fn encode(&self, image: &[f32], n: usize, h: usize, w: usize) -> Result<Vec<f32>> {
         let (mean, _logvar) = self.encoder.forward(image, n, h, w);
+        Ok(mean)
+    }
+
+    /// GPU-resident encode. Runs the entire encoder + (when present)
+    /// `quant_conv` on Metal in fp16, downloads to f32 once, then splits
+    /// off the mean half. Mirror of `decode_with_dims_gpu`.
+    ///
+    /// On a 512×512 image, this is ~10× faster than `encode` for SD 1.5
+    /// (the encoder runs full-resolution conv2d at 3 → 128 → … → 512
+    /// channels through stride-2 downsamples; CPU sgemm dominates).
+    #[cfg(feature = "metal")]
+    pub fn encode_gpu(&self, image: &[f32], n: usize, h: usize, w: usize) -> Result<Vec<f32>> {
+        // Defensive reset: ensure no stale f32-sgemm state from a prior
+        // GPU op (decode, UNet sampling) leaks into the encode pass. Both
+        // encoder.forward_gpu and quant_conv.forward_gpu manage the flag
+        // themselves, but the global default should be `false` between
+        // independent calls.
+        crate::metal_backend::set_use_f32_sgemm(false);
+
+        // VAEEncoder::forward_gpu returns the raw `[n, 2·latent_C, h/8, w/8]`
+        // pre-quant tensor as a flat f32 Vec.
+        let mut conv_out = self.encoder.forward_gpu(image, n, h, w);
+
+        // Apply quant_conv (1×1) when present. Same input/output shape;
+        // for Flux the encoder writes mean|logvar directly and there is
+        // no quant_conv.
+        if self.has_quant_conv {
+            use crate::metal_backend::*;
+            let lh = h / 8;
+            let lw = w / 8;
+            let two_lc = 2 * self.config.latent_channels;
+            let g = GpuTensor::upload_f32_as_f16(vec![n, two_lc, lh, lw], &conv_out);
+            let (q_gpu, _, _) = self.encoder.quant_conv.forward_gpu(&g, n, lh, lw);
+            conv_out = q_gpu.download_to_f32();
+        }
+
+        // Split off the first half (mean); discard logvar.
+        let lc = self.config.latent_channels;
+        let lh = h / 8;
+        let lw = w / 8;
+        let mut mean = vec![0.0_f32; n * lc * lh * lw];
+        for ni in 0..n {
+            for ci in 0..lc {
+                let src_off = ni * (2 * lc) * lh * lw + ci * lh * lw;
+                let dst_off = ni * lc * lh * lw + ci * lh * lw;
+                mean[dst_off..dst_off + lh * lw]
+                    .copy_from_slice(&conv_out[src_off..src_off + lh * lw]);
+            }
+        }
         Ok(mean)
     }
 }
@@ -611,6 +798,7 @@ mod tests {
             norm_num_groups: 4,
             sample_size: 8,
             scaling_factor: 0.18215,
+            shift_factor: 0.0,
         }
     }
 

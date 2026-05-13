@@ -206,11 +206,90 @@ fn bytes_to_f32(bytes: &[u8], dtype: Dtype, expected_count: usize) -> Result<Vec
                 out.push(half::bf16::from_le_bytes([chunk[0], chunk[1]]).to_f32());
             }
         }
+        Dtype::F8_E4M3 => {
+            // OFP8 E4M3 (1 sign / 4 exponent / 3 mantissa bits, exponent
+            // bias 7). Used by quantized Flux releases (flux1-dev-fp8.…)
+            // to halve checkpoint size. We dequantize to f32 at load time.
+            if bytes.len() != expected_count {
+                return Err(DiffusionError::ShapeMismatch {
+                    expected: format!("{expected_count} bytes (fp8 E4M3)"),
+                    got: format!("{}", bytes.len()),
+                });
+            }
+            for &b in bytes {
+                out.push(f8_e4m3_to_f32(b));
+            }
+        }
+        Dtype::F8_E5M2 => {
+            // OFP8 E5M2 (1/5/2, exponent bias 15). Less common in Flux
+            // checkpoints but ships with some quantized variants.
+            if bytes.len() != expected_count {
+                return Err(DiffusionError::ShapeMismatch {
+                    expected: format!("{expected_count} bytes (fp8 E5M2)"),
+                    got: format!("{}", bytes.len()),
+                });
+            }
+            for &b in bytes {
+                out.push(f8_e5m2_to_f32(b));
+            }
+        }
         other => {
             return Err(DiffusionError::Unsupported(format!("dtype {other:?}")));
         }
     }
     Ok(out)
+}
+
+/// Decode one OFP8 E4M3 byte to f32. Layout: bit 7 = sign, bits 3-6 =
+/// exponent (bias 7), bits 0-2 = mantissa. Special: e=0xF & m=0x7 → NaN
+/// (E4M3 has no infinities). Subnormals: e=0 ⇒ value = (-1)^s · 2^-6 · m/8.
+fn f8_e4m3_to_f32(b: u8) -> f32 {
+    let sign = (b >> 7) & 0x1;
+    let exp = (b >> 3) & 0xF;
+    let mant = b & 0x7;
+    let s: f32 = if sign == 1 { -1.0 } else { 1.0 };
+    if exp == 0 {
+        // Zero or subnormal. value = s · 2^-6 · (mant / 8)
+        if mant == 0 { return s * 0.0; }
+        return s * (mant as f32) * (1.0 / 8.0) * (1.0 / 64.0); // 2^-6 = 1/64
+    }
+    if exp == 0xF && mant == 0x7 {
+        return f32::NAN; // E4M3's only NaN encoding
+    }
+    // Normal: value = s · 2^(exp - 7) · (1 + mant/8)
+    let exponent = (exp as i32) - 7;
+    let mantissa = 1.0 + (mant as f32) * (1.0 / 8.0);
+    let pow = if exponent >= 0 {
+        (1u64 << exponent) as f32
+    } else {
+        1.0 / (1u64 << (-exponent)) as f32
+    };
+    s * pow * mantissa
+}
+
+/// Decode one OFP8 E5M2 byte to f32. Layout: 1/5/2, exponent bias 15.
+/// E5M2 *does* have infinities (e=0x1F & m=0) and NaNs (e=0x1F & m≠0).
+fn f8_e5m2_to_f32(b: u8) -> f32 {
+    let sign = (b >> 7) & 0x1;
+    let exp = (b >> 2) & 0x1F;
+    let mant = b & 0x3;
+    let s: f32 = if sign == 1 { -1.0 } else { 1.0 };
+    if exp == 0 {
+        if mant == 0 { return s * 0.0; }
+        // Subnormal: s · 2^-14 · (mant / 4)
+        return s * (mant as f32) * 0.25 * (1.0 / 16384.0);
+    }
+    if exp == 0x1F {
+        return if mant == 0 { s * f32::INFINITY } else { f32::NAN };
+    }
+    let exponent = (exp as i32) - 15;
+    let mantissa = 1.0 + (mant as f32) * 0.25;
+    let pow = if exponent >= 0 {
+        (1u64 << exponent) as f32
+    } else {
+        1.0 / (1u64 << (-exponent)) as f32
+    };
+    s * pow * mantissa
 }
 
 /// Convenience: try several names in order, return the first that exists.

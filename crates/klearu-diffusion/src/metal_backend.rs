@@ -432,6 +432,19 @@ kernel void elementwise_add_f16(
     a[gid] = bfloat(float(a[gid]) + float(b[gid]));
 }
 
+// Scaled element-wise add: a[i] += scale * b[i]. Used by the ControlNet
+// residual injection so a non-1.0 controlnet_weight applies on the Metal
+// residence path. With scale=1.0 it's equivalent to elementwise_add_f16
+// at the cost of one extra fp32 multiply per thread.
+kernel void elementwise_add_scaled_f16(
+    device bfloat*       a     [[buffer(0)]],
+    device bfloat*     b     [[buffer(1)]],
+    constant float&    scale [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    a[gid] = bfloat(float(a[gid]) + scale * float(b[gid]));
+}
+
 kernel void layer_norm_f16(
     device bfloat*       x       [[buffer(0)]],
     device bfloat*     gamma   [[buffer(1)]],
@@ -1150,6 +1163,125 @@ kernel void flash_attention(
         O[q_base + tid] = o_d / l_tg;
     }
 }
+
+// Causal flash attention (f32). Same as `flash_attention` plus a causal
+// mask: when lk > lq, that K/V row contributes -INFINITY to s, so its p =
+// exp(s − m_new) = 0 and the iteration is a no-op (factor = 1, m_new
+// unchanged). The L_kv loop still runs to keep barriers synchronised
+// across the threadgroup; the masked iterations are cheap, and the
+// real-world gain is having a single GPU kernel handle the per-query
+// SDPA in decoder-only transformers (klearu-image).
+kernel void flash_attention_causal(
+    const device float* Q       [[buffer(0)]],
+    const device float* K       [[buffer(1)]],
+    const device float* V       [[buffer(2)]],
+    device float*       O       [[buffer(3)]],
+    constant uint&      L_q     [[buffer(4)]],
+    constant uint&      L_kv    [[buffer(5)]],
+    constant uint&      D       [[buffer(6)]],
+    constant float&     scale   [[buffer(7)]],
+    threadgroup float*  smem    [[threadgroup(0)]],
+    uint                tid     [[thread_position_in_threadgroup]],
+    uint                tpg     [[threads_per_threadgroup]],
+    uint                gid     [[threadgroup_position_in_grid]]
+) {
+    uint nh = gid / L_q;
+    uint lq = gid % L_q;
+    uint q_base = (nh * L_q + lq) * D;
+    uint kv_nh_base = nh * L_kv * D;
+
+    threadgroup float* k_row  = smem;
+    threadgroup float* v_row  = smem + tpg;
+    threadgroup float* reduce = smem + 2u * tpg;
+
+    float q_d = (tid < D) ? Q[q_base + tid] * scale : 0.0;
+    float o_d = 0.0;
+
+    threadgroup float m_tg;
+    threadgroup float l_tg;
+    if (tid == 0) {
+        m_tg = -INFINITY;
+        l_tg = 0.0;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint lk = 0; lk < L_kv; ++lk) {
+        if (tid < D) {
+            k_row[tid] = K[kv_nh_base + lk * D + tid];
+            v_row[tid] = V[kv_nh_base + lk * D + tid];
+        } else {
+            k_row[tid] = 0.0;
+            v_row[tid] = 0.0;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        reduce[tid] = q_d * k_row[tid];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = tpg / 2u; stride > 0u; stride /= 2u) {
+            if (tid < stride) reduce[tid] += reduce[tid + stride];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        float s = (lk > lq) ? -INFINITY : reduce[0];
+
+        float m_old = m_tg;
+        float m_new = max(m_old, s);
+        float factor = exp(m_old - m_new);
+        float p      = exp(s - m_new);
+
+        if (tid < D) {
+            o_d = o_d * factor + p * v_row[tid];
+        }
+        if (tid == 0) {
+            l_tg = l_tg * factor + p;
+            m_tg = m_new;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid < D) {
+        // l_tg may be 0 if every K position was masked (lq == 0 path is
+        // fine because lk=0 satisfies lk <= lq). Guard against division
+        // by zero defensively.
+        O[q_base + tid] = (l_tg > 0.0) ? (o_d / l_tg) : 0.0;
+    }
+}
+
+// RMSNorm (f32). y_i = gamma_i · x_i / sqrt(mean(x²) + eps).
+// One threadgroup per row. Matches `layer_norm` shape conventions:
+//   x:     [N, dim] flat, row-major. In place.
+//   gamma: [dim]
+kernel void rms_norm(
+    device float*       x       [[buffer(0)]],
+    constant float*     gamma   [[buffer(1)]],
+    constant uint&      dim     [[buffer(2)]],
+    constant float&     eps     [[buffer(3)]],
+    threadgroup float*  scratch [[threadgroup(0)]],
+    uint                tid     [[thread_position_in_threadgroup]],
+    uint                tpg     [[threads_per_threadgroup]],
+    uint                gid     [[threadgroup_position_in_grid]]
+) {
+    uint row = gid;
+    uint row_off = row * dim;
+
+    float lss = 0.0;
+    for (uint i = tid; i < dim; i += tpg) {
+        float v = x[row_off + i];
+        lss += v * v;
+    }
+    scratch[tid] = lss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = tpg / 2; stride > 0; stride /= 2) {
+        if (tid < stride) {
+            scratch[tid] += scratch[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv_rms = 1.0 / sqrt(scratch[0] / float(dim) + eps);
+
+    for (uint i = tid; i < dim; i += tpg) {
+        x[row_off + i] = x[row_off + i] * inv_rms * gamma[i];
+    }
+}
 "#;
 
 struct MetalBackend {
@@ -1164,11 +1296,14 @@ struct MetalBackend {
     eadd_pipe: ComputePipelineState,
     bcast_add_pipe: ComputePipelineState,
     flash_attn_pipe: ComputePipelineState,
+    flash_attn_causal_pipe: ComputePipelineState,
+    rms_norm_pipe: ComputePipelineState,
     // fp16 GPU-residence kernels.
     silu_f16_pipe: ComputePipelineState,
     gelu_f16_pipe: ComputePipelineState,
     quick_gelu_f16_pipe: ComputePipelineState,
     eadd_f16_pipe: ComputePipelineState,
+    eadd_scaled_f16_pipe: ComputePipelineState,
     layernorm_f16_pipe: ComputePipelineState,
     layernorm_f16_out_pipe: ComputePipelineState,
     groupnorm_f16_pipe: ComputePipelineState,
@@ -1222,10 +1357,13 @@ fn get_metal() -> &'static MetalBackend {
             eadd_pipe: make_pipe("elementwise_add"),
             bcast_add_pipe: make_pipe("broadcast_add_channel"),
             flash_attn_pipe: make_pipe("flash_attention"),
+            flash_attn_causal_pipe: make_pipe("flash_attention_causal"),
+            rms_norm_pipe: make_pipe("rms_norm"),
             silu_f16_pipe: make_pipe("silu_f16"),
             gelu_f16_pipe: make_pipe("gelu_f16"),
             quick_gelu_f16_pipe: make_pipe("quick_gelu_f16"),
             eadd_f16_pipe: make_pipe("elementwise_add_f16"),
+            eadd_scaled_f16_pipe: make_pipe("elementwise_add_scaled_f16"),
             layernorm_f16_pipe: make_pipe("layer_norm_f16"),
             layernorm_f16_out_pipe: make_pipe("layer_norm_f16_out"),
             groupnorm_f16_pipe: make_pipe("groupnorm_f16"),
@@ -1261,16 +1399,33 @@ thread_local! {
 
 /// Acquire a `[bytes]`-sized MTLBuffer (Shared storage). Pulled from a
 /// thread-local pool when one of the same size is available, else allocated.
+///
+/// Recycled buffers are zeroed via a blit `fill_buffer` before being handed
+/// out. Pool buffers can hold leftover Inf/NaN from prior ops; if a
+/// downstream consumer doesn't fully overwrite the buffer (MPS matmul with
+/// beta=0 reading C, partial-coverage dispatches, etc.), the stale data
+/// poisons the next op via `0 * Inf = NaN`. The blit is queued on the
+/// current command buffer so Metal hazard tracking serializes it after any
+/// prior in-flight op that might still be using the buffer.
 fn acquire_buffer(bytes: usize) -> Buffer {
-    BUF_POOL.with_borrow_mut(|pool| {
+    let recycled = BUF_POOL.with_borrow_mut(|pool| {
         if let Some(bufs) = pool.get_mut(&bytes) {
             if let Some(buf) = bufs.pop() {
-                return buf;
+                return Some(buf);
             }
         }
-        let backend = get_metal();
-        backend.device.new_buffer(bytes as u64, metal::MTLResourceOptions::StorageModeShared)
-    })
+        None
+    });
+    if let Some(buf) = recycled {
+        with_cmd(|cmd| {
+            let blit = cmd.new_blit_command_encoder();
+            blit.fill_buffer(&buf, metal::NSRange::new(0, bytes as u64), 0);
+            blit.end_encoding();
+        });
+        return buf;
+    }
+    let backend = get_metal();
+    backend.device.new_buffer(bytes as u64, metal::MTLResourceOptions::StorageModeShared)
 }
 
 // ---------- Async dispatch + lazy flush -----------------------------------
@@ -1466,23 +1621,56 @@ fn convert_or_get_cached_f16(slice: &[f32]) -> Buffer {
     F16_CACHE.with_borrow_mut(|cache| {
         if let Some(cached) = cache.get(&key) {
             if cached.fingerprint == fp {
+                // Diagnostic: when KLEARU_DEBUG_WEIGHT_CACHE is set, scan the
+                // cached buffer's contents for NaN/Inf before returning. If
+                // a previously-cached weight is now corrupted, something
+                // outside the cache wrote into its memory — that's the bug.
+                if std::env::var_os("KLEARU_DEBUG_WEIGHT_CACHE").is_some() {
+                    use half::bf16;
+                    let n = slice.len();
+                    let mut nan = 0_usize;
+                    let mut inf = 0_usize;
+                    unsafe {
+                        let p: *const bf16 = cached.buffer.contents() as *const bf16;
+                        for i in 0..n {
+                            let v = (*p.add(i)).to_f32();
+                            if v.is_nan() { nan += 1; }
+                            else if v.is_infinite() { inf += 1; }
+                        }
+                    }
+                    if nan > 0 || inf > 0 {
+                        eprintln!("[weight-cache-corrupt] key=({:#x}, {n}), NaN={nan}, Inf={inf} \
+                            — cached f16 weight has been overwritten between iterations. \
+                            First/last 8 elements still match fingerprint, but mid-buffer is bad.",
+                            key.0);
+                    }
+                }
                 // Hit. Clone bumps Objective-C retain; caller drops their copy
                 // after use, leaving the cache entry alive at refcount 1.
                 return cached.buffer.clone();
             }
-            // Stale entry. Replace below — return its buffer to the pool first
-            // so we don't leak GPU memory.
-            if let Some(stale) = cache.remove(&key) {
-                release_buffer(stale.buffer);
-            }
+            // Stale entry. We MUST NOT release this Buffer to BUF_POOL:
+            // callers' previous `clone()` of this Buffer may still be queued
+            // for GPU consumption (sgemm reading it from a yet-to-commit
+            // batch). If the buffer is recycled to the pool and a future
+            // `acquire_buffer` pops it for an `upload_f32_as_f16` write,
+            // the new write races against the in-flight sgemm read — Metal
+            // hazard tracking only covers committed cmd buffers, so a partial
+            // overwrite slips through and silently corrupts the weight,
+            // producing NaN in some output channels (sporadic across batch
+            // iterations; observed in VAE encode after a few REPL turns).
+            // Just drop the cached Buffer; Objective-C retain count handles
+            // teardown when the last caller clone goes away. Worst case is
+            // a small steady-state allocation of fresh GPU memory; far
+            // cheaper than a corrupted run.
+            cache.remove(&key);
         }
 
         // Bound cache size to prevent unbounded growth from activation pointers.
+        // Same reasoning as above — drop, don't recycle.
         if cache.len() >= F16_CACHE_MAX {
             if let Some(evict_key) = cache.keys().next().copied() {
-                if let Some(evicted) = cache.remove(&evict_key) {
-                    release_buffer(evicted.buffer);
-                }
+                cache.remove(&evict_key);
             }
         }
 
@@ -1737,6 +1925,8 @@ unsafe fn dispatch_mps_matmul_bf16_via_f32(
     let b_elems = b_rows * b_cols;
     let c_elems = m * n;
 
+    // acquire_buffer zero-initializes recycled buffers, so c_f32/c_f16 are
+    // safe inputs to MPS matmul's beta=0 path by construction.
     if use_f32 {
         let a_f32 = acquire_buffer(a_elems * 4);
         let b_f32 = acquire_buffer(b_elems * 4);
@@ -1787,8 +1977,37 @@ unsafe fn dispatch_mps_matmul_bf16_via_f32_with_offsets(
     let b_elems = b_rows * b_cols;
     let c_elems = m * n;
     let bytes = if use_f32 { 4 } else { 2 };
-    let a_buf = acquire_buffer(a_elems * bytes);
-    let b_buf = acquire_buffer(b_elems * bytes);
+
+    // K-alignment workaround: MPSMatrixMultiplication produces NaN in
+    // trailing output rows when K is small and not aligned to the
+    // simdgroup width (32). Specifically observed: m=128, n=1M, k=27
+    // → output rows 24..27 are NaN (4M elements). The trailing 5 K
+    // lanes within a 32-wide simdgroup reduce apparently aren't
+    // initialised, contaminating the dot-product sum.
+    //
+    // Workaround: pad K to a multiple of K_ALIGN with zeros. Zero
+    // contributes nothing to the dot product (`0 * a_ki = 0`), so the
+    // mathematical result is unchanged. We allocate larger A and B
+    // buffers, copy the original data into the leading K positions,
+    // and rely on `acquire_buffer`'s pool zero-init to leave the
+    // trailing K positions as zero.
+    //
+    // Only activates when transpose flags are false (the conv2d /
+    // im2col path); the linear/attention paths use larger K (≥128)
+    // which are already aligned and unaffected.
+    const K_ALIGN: usize = 32;
+    let needs_pad = k % K_ALIGN != 0 && !transpose_left && !transpose_right;
+    let k_padded = if needs_pad {
+        k.div_ceil(K_ALIGN) * K_ALIGN
+    } else { k };
+    let a_alloc_elems = m * k_padded;
+    let b_alloc_elems = if needs_pad { k_padded * b_cols } else { b_elems };
+
+    // acquire_buffer zero-initializes recycled buffers, so c_buf (matmul
+    // destination, beta=0 path) and the trailing K columns/rows of a_buf
+    // and b_buf are safe by construction.
+    let a_buf = acquire_buffer(a_alloc_elems * bytes);
+    let b_buf = acquire_buffer(b_alloc_elems * bytes);
     let c_buf = acquire_buffer(c_elems * bytes);
 
     let dispatch_cast = |pipe: &ComputePipelineState, src: &Buffer, src_off: usize,
@@ -1805,22 +2024,119 @@ unsafe fn dispatch_mps_matmul_bf16_via_f32_with_offsets(
         });
     };
 
+    // Cast inputs into the (possibly padded) buffers. Layouts for the
+    // non-transposed path:
+    //   A is [m, k_padded] row-major. Original A is [m, k]; the trailing
+    //     (k_padded - k) columns per row are zero from pool init. To get
+    //     this layout we need a row-by-row cast (each row's data lives at
+    //     a different stride in the destination).
+    //   B is [k_padded, b_cols] row-major. Original B is [k, b_cols] which
+    //     is contiguous from position 0. Padded rows (k..k_padded) at
+    //     positions [k * b_cols, k_padded * b_cols) stay zero.
+    let cast_a_padded = |pipe: &ComputePipelineState| {
+        if !needs_pad {
+            dispatch_cast(pipe, a_bf16, a_off_bytes_bf16, &a_buf, 0, a_elems);
+        } else {
+            // Per-row cast — m small dispatches. For the conv2d use case
+            // m ∈ {128, 256, 512}, well within reasonable dispatch overhead.
+            for mi in 0..m {
+                let src_off = a_off_bytes_bf16 + mi * k * 2;
+                let dst_off = mi * k_padded * bytes;
+                dispatch_cast(pipe, a_bf16, src_off, &a_buf, dst_off, k);
+            }
+        }
+    };
+    let cast_b_padded = |pipe: &ComputePipelineState| {
+        // Single contiguous cast either way; padded rows at the end stay zero.
+        dispatch_cast(pipe, b_bf16, b_off_bytes_bf16, &b_buf, 0, b_elems);
+    };
+
     if use_f32 {
-        dispatch_cast(&backend.cast_f16_to_f32_pipe, a_bf16, a_off_bytes_bf16, &a_buf, 0, a_elems);
-        dispatch_cast(&backend.cast_f16_to_f32_pipe, b_bf16, b_off_bytes_bf16, &b_buf, 0, b_elems);
+        cast_a_padded(&backend.cast_f16_to_f32_pipe);
+        cast_b_padded(&backend.cast_f16_to_f32_pipe);
         dispatch_mps_matmul_with_offsets(
             backend, &a_buf, 0, &b_buf, 0, &c_buf, 0,
-            m, n, k, MPS_DATA_TYPE_FLOAT32, 4,
-            transpose_left, transpose_right, b_rows, b_cols,
+            m, n, k_padded, MPS_DATA_TYPE_FLOAT32, 4,
+            transpose_left, transpose_right,
+            if needs_pad { k_padded } else { b_rows }, b_cols,
         );
+        // Diagnostic: snapshot f32 inputs / output of MPS matmul. If c_buf
+        // already has NaN here, MPS itself is producing it (independent of
+        // the f32→f16 cast or bias-add downstream).
+        if std::env::var_os("KLEARU_DEBUG_MPS_MATMUL").is_some() {
+            flush();
+            // Window-scan a buffer at start / mid / end so we can localise
+            // NaN to a specific row range (each row = `n` elements, so each
+            // 1M-element window covers 1M/n rows when c is row-major [m, n]).
+            let win = 1 << 20; // 1M elements per window.
+            let scan_full = |label: &str, buf: &Buffer, total: usize| {
+                let n_total_nan = {
+                    // Full scan (slow but definitive).
+                    let mut out = vec![0.0_f32; total];
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            buf.contents() as *const f32, out.as_mut_ptr(), total);
+                    }
+                    let mut nan = 0_usize; let mut inf = 0_usize;
+                    let mut mn = f32::INFINITY; let mut mx = f32::NEG_INFINITY;
+                    let mut sa = 0.0_f64;
+                    let mut first_nan_idx: Option<usize> = None;
+                    for (i, &x) in out.iter().enumerate() {
+                        if x.is_nan() {
+                            nan += 1;
+                            if first_nan_idx.is_none() { first_nan_idx = Some(i); }
+                        } else if x.is_infinite() { inf += 1; }
+                        else { mn = mn.min(x); mx = mx.max(x); sa += x.abs() as f64; }
+                    }
+                    eprintln!("[mps-matmul] {label:<24} m={m} n={n} k={k} total={total} \
+                        NaN={nan} Inf={inf} min={mn:.3} max={mx:.3} mean_abs={:.5} \
+                        first_nan_idx={first_nan_idx:?} (row={:?})",
+                        sa / total as f64,
+                        first_nan_idx.map(|i| i / n));
+                    nan
+                };
+                let _ = win;
+                n_total_nan
+            };
+            // a_f32 is small, scan in full.
+            scan_full("a_f32 (post-cast)", &a_buf, a_elems);
+            // b_f32 and c_f32 can be huge — full scan is slow but accurate.
+            // Set KLEARU_MPS_MATMUL_QUICK=1 to limit to 1M-element windows.
+            let quick = std::env::var_os("KLEARU_MPS_MATMUL_QUICK").is_some();
+            if quick {
+                let mut out = vec![0.0_f32; c_elems.min(win)];
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        c_buf.contents() as *const f32, out.as_mut_ptr(),
+                        out.len());
+                }
+                let nan = out.iter().filter(|x| x.is_nan()).count();
+                eprintln!("[mps-matmul] c_f32 first 1M  m={m} n={n} k={k} NaN={nan}");
+                // End window: last 1M elements.
+                let tail_off = c_elems.saturating_sub(win);
+                let tail_len = c_elems - tail_off;
+                let mut tail = vec![0.0_f32; tail_len];
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        (c_buf.contents() as *const f32).add(tail_off),
+                        tail.as_mut_ptr(), tail_len);
+                }
+                let nan_tail = tail.iter().filter(|x| x.is_nan()).count();
+                eprintln!("[mps-matmul] c_f32 last 1M   m={m} n={n} k={k} NaN={nan_tail} \
+                    (tail starts at row {})", tail_off / n);
+            } else {
+                scan_full("c_f32 (post-matmul)", &c_buf, c_elems);
+            }
+        }
         dispatch_cast(&backend.cast_f32_to_f16_pipe, &c_buf, 0, c_bf16, c_off_bytes_bf16, c_elems);
     } else {
-        dispatch_cast(&backend.cast_bf16_to_half_pipe, a_bf16, a_off_bytes_bf16, &a_buf, 0, a_elems);
-        dispatch_cast(&backend.cast_bf16_to_half_pipe, b_bf16, b_off_bytes_bf16, &b_buf, 0, b_elems);
+        cast_a_padded(&backend.cast_bf16_to_half_pipe);
+        cast_b_padded(&backend.cast_bf16_to_half_pipe);
         dispatch_mps_matmul_with_offsets(
             backend, &a_buf, 0, &b_buf, 0, &c_buf, 0,
-            m, n, k, MPS_DATA_TYPE_FLOAT16, 2,
-            transpose_left, transpose_right, b_rows, b_cols,
+            m, n, k_padded, MPS_DATA_TYPE_FLOAT16, 2,
+            transpose_left, transpose_right,
+            if needs_pad { k_padded } else { b_rows }, b_cols,
         );
         dispatch_cast(&backend.cast_half_to_bf16_pipe, &c_buf, 0, c_bf16, c_off_bytes_bf16, c_elems);
     }
@@ -2294,6 +2610,114 @@ pub fn flash_attention_metal(
     release_buffer(buf_o);
 }
 
+/// Causal flash attention (f32). Same shapes as `flash_attention_metal`:
+///   Q: `[n, h, l_q, d]`, K/V: `[n, h, l_kv, d]`, O: `[n, h, l_q, d]`.
+/// Each query at position `lq` only attends to keys at positions
+/// `lk ≤ lq` (causal mask). For decoder-only transformers (klearu-image,
+/// klearu-llm) this replaces the per-row scoring loop with a single GPU
+/// kernel call.
+pub fn flash_attention_causal_metal(
+    q: &[f32], k: &[f32], v: &[f32], o: &mut [f32],
+    n: usize, h: usize, l_q: usize, l_kv: usize, d: usize, scale: f32,
+) {
+    use metal::MTLSize;
+    debug_assert_eq!(q.len(), n * h * l_q * d);
+    debug_assert_eq!(k.len(), n * h * l_kv * d);
+    debug_assert_eq!(v.len(), n * h * l_kv * d);
+    debug_assert_eq!(o.len(), n * h * l_q * d);
+
+    let backend = get_metal();
+    let tpg = (d as u64).next_power_of_two().max(1);
+
+    let buf_q = acquire_buffer(q.len() * 4);
+    let buf_k = acquire_buffer(k.len() * 4);
+    let buf_v = acquire_buffer(v.len() * 4);
+    let buf_o = acquire_buffer(o.len() * 4);
+    flush();
+    unsafe {
+        std::ptr::copy_nonoverlapping(q.as_ptr(), buf_q.contents() as *mut f32, q.len());
+        std::ptr::copy_nonoverlapping(k.as_ptr(), buf_k.contents() as *mut f32, k.len());
+        std::ptr::copy_nonoverlapping(v.as_ptr(), buf_v.contents() as *mut f32, v.len());
+    }
+
+    with_cmd(|cmd| {
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&backend.flash_attn_causal_pipe);
+        enc.set_buffer(0, Some(&buf_q), 0);
+        enc.set_buffer(1, Some(&buf_k), 0);
+        enc.set_buffer(2, Some(&buf_v), 0);
+        enc.set_buffer(3, Some(&buf_o), 0);
+        let lq_u = l_q as u32;
+        let lkv_u = l_kv as u32;
+        let d_u = d as u32;
+        enc.set_bytes(4, 4, &lq_u as *const _ as *const _);
+        enc.set_bytes(5, 4, &lkv_u as *const _ as *const _);
+        enc.set_bytes(6, 4, &d_u as *const _ as *const _);
+        enc.set_bytes(7, 4, &scale as *const _ as *const _);
+
+        let smem_bytes = (3 * tpg * 4) as u64;
+        enc.set_threadgroup_memory_length(0, smem_bytes);
+
+        let groups = (n * h * l_q) as u64;
+        enc.dispatch_thread_groups(MTLSize::new(groups, 1, 1), MTLSize::new(tpg, 1, 1));
+        enc.end_encoding();
+    });
+
+    flush();
+    unsafe {
+        std::ptr::copy_nonoverlapping(buf_o.contents() as *const f32, o.as_mut_ptr(), o.len());
+    }
+    release_buffer(buf_q);
+    release_buffer(buf_k);
+    release_buffer(buf_v);
+    release_buffer(buf_o);
+}
+
+/// RMSNorm (f32) in place via Metal.
+///   `x`: row-major `[n_rows, dim]`. Each row is normalised by
+///        `1 / sqrt(mean(x²) + eps)` and scaled by `gamma`.
+///   `gamma`: `[dim]` per-channel scale.
+pub fn rms_norm_metal(x: &mut [f32], gamma: &[f32], dim: usize, eps: f32) {
+    use metal::MTLSize;
+    let backend = get_metal();
+    debug_assert_eq!(gamma.len(), dim);
+    let n_rows = x.len() / dim;
+    debug_assert_eq!(n_rows * dim, x.len());
+    let tpg = (dim as u64).next_power_of_two().min(1024).max(1);
+
+    let buf_x = acquire_buffer(x.len() * 4);
+    let buf_g = acquire_buffer(gamma.len() * 4);
+    flush();
+    unsafe {
+        std::ptr::copy_nonoverlapping(x.as_ptr(), buf_x.contents() as *mut f32, x.len());
+        std::ptr::copy_nonoverlapping(gamma.as_ptr(), buf_g.contents() as *mut f32, gamma.len());
+    }
+
+    with_cmd(|cmd| {
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&backend.rms_norm_pipe);
+        enc.set_buffer(0, Some(&buf_x), 0);
+        enc.set_buffer(1, Some(&buf_g), 0);
+        let dim_u = dim as u32;
+        enc.set_bytes(2, 4, &dim_u as *const _ as *const _);
+        enc.set_bytes(3, 4, &eps as *const _ as *const _);
+        // scratch buffer: tpg floats for the reduction.
+        enc.set_threadgroup_memory_length(0, (tpg * 4) as u64);
+        enc.dispatch_thread_groups(
+            MTLSize::new(n_rows as u64, 1, 1),
+            MTLSize::new(tpg, 1, 1),
+        );
+        enc.end_encoding();
+    });
+
+    flush();
+    unsafe {
+        std::ptr::copy_nonoverlapping(buf_x.contents() as *const f32, x.as_mut_ptr(), x.len());
+    }
+    release_buffer(buf_x);
+    release_buffer(buf_g);
+}
+
 // ---------- GpuTensor (GPU-resident pipeline) -----------------------------
 
 /// Element dtype of a `GpuTensor`. The GPU-resident pipeline stores
@@ -2445,6 +2869,30 @@ pub fn eadd_f16_gpu(a: &mut GpuTensor, b: &GpuTensor) {
         enc.set_compute_pipeline_state(&backend.eadd_f16_pipe);
         enc.set_buffer(0, Some(&a.buffer), 0);
         enc.set_buffer(1, Some(&b.buffer), 0);
+        let group = MTLSize::new(256, 1, 1);
+        let grid = MTLSize::new(a.elements() as u64, 1, 1);
+        enc.dispatch_threads(grid, group);
+        enc.end_encoding();
+    });
+}
+
+/// In-place `a += scale * b` for fp16 GPU tensors of equal length. Used
+/// by the ControlNet residual injection so non-default `controlnet_weight`
+/// values apply on the Metal residence path. When `scale == 1.0`, this
+/// produces identical output to `eadd_f16_gpu` (single extra mul per
+/// thread; negligible vs the cost of any matmul).
+pub fn eadd_scaled_f16_gpu(a: &mut GpuTensor, b: &GpuTensor, scale: f32) {
+    use metal::MTLSize;
+    debug_assert_eq!(a.dtype, GpuDtype::F16);
+    debug_assert_eq!(b.dtype, GpuDtype::F16);
+    debug_assert_eq!(a.elements(), b.elements());
+    let backend = get_metal();
+    with_cmd(|cmd| {
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&backend.eadd_scaled_f16_pipe);
+        enc.set_buffer(0, Some(&a.buffer), 0);
+        enc.set_buffer(1, Some(&b.buffer), 0);
+        enc.set_bytes(2, 4, &scale as *const _ as *const _);
         let group = MTLSize::new(256, 1, 1);
         let grid = MTLSize::new(a.elements() as u64, 1, 1);
         enc.dispatch_threads(grid, group);
@@ -4297,5 +4745,87 @@ mod tests {
         }
         assert!(max_diff < 5e-3,
             "layer_norm_f16_out at SDXL scale: max_diff={max_diff}");
+    }
+
+    #[test]
+    fn rms_norm_metal_matches_cpu() {
+        let dim = 128;
+        let n_rows = 32;
+        let mut x: Vec<f32> = (0..n_rows * dim)
+            .map(|i| ((i * 13) % 97) as f32 / 50.0 - 0.7)
+            .collect();
+        let gamma: Vec<f32> = (0..dim).map(|i| 1.0 + (i as f32 * 0.003)).collect();
+        let eps = 1e-5_f32;
+
+        // CPU reference.
+        let mut want = x.clone();
+        for r in 0..n_rows {
+            let row = &mut want[r * dim..(r + 1) * dim];
+            let mut s = 0.0_f64;
+            for &v in row.iter() { s += (v as f64) * (v as f64); }
+            let inv = ((s / dim as f64) + eps as f64).sqrt().recip() as f32;
+            for (xi, &g) in row.iter_mut().zip(gamma.iter()) {
+                *xi = *xi * inv * g;
+            }
+        }
+        // GPU.
+        rms_norm_metal(&mut x, &gamma, dim, eps);
+
+        let mut max_diff = 0.0_f32;
+        for (g, w) in x.iter().zip(want.iter()) {
+            let d = (g - w).abs();
+            if d > max_diff { max_diff = d; }
+        }
+        assert!(max_diff < 1e-4,
+            "rms_norm_metal vs CPU max_diff={max_diff}");
+    }
+
+    #[test]
+    fn flash_attention_causal_metal_matches_cpu() {
+        // Small problem: 1 batch, 2 heads, l_q = l_kv = 8, d = 16.
+        let n = 1; let h = 2; let l_q = 8; let l_kv = 8; let d = 16;
+        let total = n * h * l_q * d;
+        let q: Vec<f32> = (0..total).map(|i| ((i as i32 % 23) - 11) as f32 * 0.07).collect();
+        let k: Vec<f32> = (0..total).map(|i| ((i as i32 % 29) - 14) as f32 * 0.06).collect();
+        let v: Vec<f32> = (0..total).map(|i| ((i as i32 % 31) - 15) as f32 * 0.05).collect();
+        let scale = 1.0_f32 / (d as f32).sqrt();
+
+        // CPU causal reference.
+        let mut want = vec![0.0_f32; total];
+        for nh in 0..(n * h) {
+            let qkv_base = nh * l_q * d;
+            for qi in 0..l_q {
+                let q_row = &q[qkv_base + qi * d..qkv_base + (qi + 1) * d];
+                let mut scores = vec![0.0_f32; qi + 1];
+                for kj in 0..=qi {
+                    let k_row = &k[qkv_base + kj * d..qkv_base + (kj + 1) * d];
+                    let mut s = 0.0_f32;
+                    for di in 0..d { s += q_row[di] * k_row[di]; }
+                    scores[kj] = s * scale;
+                }
+                let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum = 0.0_f32;
+                for s in scores.iter_mut() { *s = (*s - max).exp(); sum += *s; }
+                let inv = 1.0 / sum;
+                for s in scores.iter_mut() { *s *= inv; }
+                for kj in 0..=qi {
+                    let v_row = &v[qkv_base + kj * d..qkv_base + (kj + 1) * d];
+                    let w = scores[kj];
+                    let out_row = &mut want[qkv_base + qi * d..qkv_base + (qi + 1) * d];
+                    for di in 0..d { out_row[di] += w * v_row[di]; }
+                }
+            }
+        }
+
+        let mut got = vec![0.0_f32; total];
+        flash_attention_causal_metal(&q, &k, &v, &mut got, n, h, l_q, l_kv, d, scale);
+
+        let mut max_diff = 0.0_f32;
+        for (g, w) in got.iter().zip(want.iter()) {
+            let d = (g - w).abs();
+            if d > max_diff { max_diff = d; }
+        }
+        assert!(max_diff < 1e-4,
+            "flash_attention_causal_metal vs CPU max_diff={max_diff}");
     }
 }

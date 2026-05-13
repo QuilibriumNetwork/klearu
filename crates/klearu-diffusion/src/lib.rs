@@ -25,6 +25,7 @@
 
 pub mod blas;
 pub mod config;
+pub mod controlnet;
 #[cfg(feature = "metal")]
 pub mod metal_backend;
 pub mod error;
