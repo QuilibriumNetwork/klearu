@@ -9,7 +9,8 @@ autobins = false
 
 [features]
 default = []
-cli = ["dep:image"]
+image-io = ["dep:image"]
+cli = ["image-io", "dep:rustyline", "dep:crossterm"]
 # Use Apple Accelerate.framework (cblas_sgemm + AMX coprocessor) on macOS for
 # the absolute best M1/M2/M3 performance. Default `matrixmultiply` path also
 # works on M-series via NEON; this feature buys roughly an extra 2-3× on AMX.
@@ -33,6 +34,8 @@ safetensors = "0.4"
 memmap2 = "0.9"
 half = { workspace = true }
 image = { version = "0.25", optional = true }
+rustyline = { version = "14", optional = true, default-features = false, features = ["with-file-history", "derive"] }
+crossterm = { version = "0.27", optional = true }
 tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
 matrixmultiply = "0.3"
 rayon = "1"
@@ -54,3 +57,8 @@ required-features = ["cli"]
 name = "flux_generate"
 path = "src/bin/flux_generate.rs"
 required-features = ["cli"]
+
+[[bin]]
+name = "hidream_generate"
+path = "src/bin/hidream_generate.rs"
+required-features = ["cli", "metal"]

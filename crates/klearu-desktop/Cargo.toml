@@ -1,0 +1,55 @@
+[package]
+name = "klearu-desktop"
+description = "Tauri desktop backend: command surface, engine state, memory store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "klearu_desktop"
+path = "src/lib.rs"
+
+[dependencies]
+tauri = { workspace = true }
+tauri-plugin-dialog = { workspace = true }
+tauri-plugin-fs = { workspace = true }
+tauri-plugin-shell = { workspace = true }
+
+# Engines (lazy-loaded — large but optional at runtime via feature flags later).
+klearu-llm = { workspace = true }
+klearu-vision = { workspace = true }
+klearu-diffusion = { workspace = true, features = ["image-io"] }
+image = "0.25"
+# base64 for embedding generated PNGs as `data:` URIs when incognito is
+# active (no disk path available).
+base64 = "0.22"
+
+# Metal GPU residence is macOS-only — pulled in via a target-specific
+# feature override on klearu-diffusion. Cargo merges this with the
+# `klearu-diffusion = { workspace = true }` entry above, so non-macOS
+# builds still get the lib (without the Metal backend).
+[target.'cfg(target_os = "macos")'.dependencies]
+klearu-diffusion = { workspace = true, features = ["metal", "image-io"] }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+# Embedded LAN server — shares the desktop's Workspace over HTTP so
+# browsers on the local network can drive chat + image gen without
+# installing anything.
+axum = { workspace = true }
+axum-server = { workspace = true }
+tower-http = { workspace = true }
+tokio-stream = "0.1"
+rcgen = "0.13"
+ring = "0.17"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "2"
+parking_lot = { workspace = true }
+rusqlite = { workspace = true }
+rand = { workspace = true }

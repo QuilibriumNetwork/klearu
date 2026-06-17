@@ -9,7 +9,7 @@ use crate::error::{DiffusionError, Result};
 
 /// Save a single-image VAE output [3, H, W] as a PNG.
 /// Pixel values are clamped from [-1, 1] (VAE convention) into [0, 255].
-#[cfg(feature = "cli")]
+#[cfg(feature = "image-io")]
 pub fn save_png(image_chw: &[f32], h: usize, w: usize, path: &Path) -> Result<()> {
     if image_chw.len() != 3 * h * w {
         return Err(DiffusionError::ShapeMismatch {
@@ -35,7 +35,7 @@ pub fn save_png(image_chw: &[f32], h: usize, w: usize, path: &Path) -> Result<()
     Ok(())
 }
 
-#[cfg(not(feature = "cli"))]
+#[cfg(not(feature = "image-io"))]
 pub fn save_png(_image_chw: &[f32], _h: usize, _w: usize, _path: &Path) -> Result<()> {
     Err(DiffusionError::Unsupported(
         "PNG output requires the 'cli' feature (build with --features cli)".into(),
@@ -49,7 +49,7 @@ pub fn save_png(_image_chw: &[f32], _h: usize, _w: usize, _path: &Path) -> Resul
 ///
 /// Grayscale inputs are broadcast to all three channels. RGBA discards
 /// alpha. RGB is taken as-is.
-#[cfg(feature = "cli")]
+#[cfg(feature = "image-io")]
 pub fn load_image_as_chw_f32(
     path: &Path,
     expected_h: usize,
@@ -78,9 +78,49 @@ pub fn load_image_as_chw_f32(
     Ok(out)
 }
 
-#[cfg(not(feature = "cli"))]
+#[cfg(not(feature = "image-io"))]
 pub fn load_image_as_chw_f32(
     _path: &Path, _expected_h: usize, _expected_w: usize,
+) -> Result<Vec<f32>> {
+    Err(DiffusionError::Unsupported(
+        "image input requires the 'cli' feature (build with --features cli)".into(),
+    ))
+}
+
+/// In-memory variant of [`load_image_as_chw_f32`]. Used by the library
+/// pipeline when bytes come from a UI / network / decoded buffer rather
+/// than a file on disk — incognito-mode image generation depends on this.
+#[cfg(feature = "image-io")]
+pub fn load_image_bytes_as_chw_f32(
+    bytes: &[u8],
+    expected_h: usize,
+    expected_w: usize,
+) -> Result<Vec<f32>> {
+    let img = image::load_from_memory(bytes)
+        .map_err(|e| DiffusionError::Unsupported(format!("decode image bytes: {e}")))?;
+    let rgb = img.to_rgb8();
+    let (w, h) = (rgb.width() as usize, rgb.height() as usize);
+    if h != expected_h || w != expected_w {
+        return Err(DiffusionError::ShapeMismatch {
+            expected: format!("{expected_h}×{expected_w} (resize before passing bytes)"),
+            got: format!("{h}×{w}"),
+        });
+    }
+    let mut out = vec![0.0_f32; 3 * h * w];
+    for hi in 0..h {
+        for wi in 0..w {
+            let p = rgb.get_pixel(wi as u32, hi as u32);
+            for c in 0..3 {
+                out[c * h * w + hi * w + wi] = (p[c] as f32) / 127.5 - 1.0;
+            }
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(not(feature = "image-io"))]
+pub fn load_image_bytes_as_chw_f32(
+    _bytes: &[u8], _expected_h: usize, _expected_w: usize,
 ) -> Result<Vec<f32>> {
     Err(DiffusionError::Unsupported(
         "image input requires the 'cli' feature (build with --features cli)".into(),
@@ -91,7 +131,7 @@ pub fn load_image_as_chw_f32(
 /// (255) maps to 1.0 (= "regenerate this pixel"), black (0) maps to 0.0
 /// (= "preserve original"). Soft greys interpolate. RGB inputs are
 /// averaged across channels; alpha is ignored.
-#[cfg(feature = "cli")]
+#[cfg(feature = "image-io")]
 pub fn load_mask(
     path: &Path,
     expected_h: usize,
@@ -116,8 +156,41 @@ pub fn load_mask(
     Ok(out)
 }
 
-#[cfg(not(feature = "cli"))]
+#[cfg(not(feature = "image-io"))]
 pub fn load_mask(_path: &Path, _expected_h: usize, _expected_w: usize) -> Result<Vec<f32>> {
+    Err(DiffusionError::Unsupported(
+        "mask input requires the 'cli' feature (build with --features cli)".into(),
+    ))
+}
+
+/// In-memory variant of [`load_mask`].
+#[cfg(feature = "image-io")]
+pub fn load_mask_bytes(
+    bytes: &[u8],
+    expected_h: usize,
+    expected_w: usize,
+) -> Result<Vec<f32>> {
+    let img = image::load_from_memory(bytes)
+        .map_err(|e| DiffusionError::Unsupported(format!("decode mask bytes: {e}")))?;
+    let gray = img.to_luma8();
+    let (w, h) = (gray.width() as usize, gray.height() as usize);
+    if h != expected_h || w != expected_w {
+        return Err(DiffusionError::ShapeMismatch {
+            expected: format!("{expected_h}×{expected_w} (resize mask before passing bytes)"),
+            got: format!("{h}×{w}"),
+        });
+    }
+    let mut out = vec![0.0_f32; h * w];
+    for hi in 0..h {
+        for wi in 0..w {
+            out[hi * w + wi] = gray.get_pixel(wi as u32, hi as u32)[0] as f32 / 255.0;
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(not(feature = "image-io"))]
+pub fn load_mask_bytes(_bytes: &[u8], _expected_h: usize, _expected_w: usize) -> Result<Vec<f32>> {
     Err(DiffusionError::Unsupported(
         "mask input requires the 'cli' feature (build with --features cli)".into(),
     ))

@@ -1,5 +1,24 @@
 # Build artifacts
+# Rust (root + any nested crate/example target dirs)
 /target/
+target/
+
+# JS / web build artifacts (any depth — web/, web/src-tauri/, experiments, …)
+node_modules/
+dist/
+build/
+.vite/
+*.tsbuildinfo
+
+# WASM build output (generated; sources live in crates)
+web/pkg/*.wasm
+web/pkg/klearu_wasm*.js
+
+# Python / tooling caches
+__pycache__/
+*.pyc
+.venv/
+venv/
 
 # Model weights (large files, download separately)
 SmolLM-135M-Instruct/

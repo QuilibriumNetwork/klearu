@@ -1,0 +1,7 @@
+node_modules/
+dist/
+pkg/klearu_wasm_bg.wasm
+pkg/klearu_wasm.js
+pkg/klearu_wasm_bg.js
+pkg/package.json
+pkg/README.md

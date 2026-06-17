@@ -720,6 +720,26 @@ impl UNet2DConditionModel {
     ///
     /// `text_seq` is the sequence length of `text_embedding` (typically 77
     /// for CLIP-L; SDXL: same 77 with 2048-d concatenated channels).
+    /// Clear all cross-attention KV caches (CPU + GPU). Use before
+    /// the video forward to avoid stale GPU buffer references across
+    /// per-frame dispatches.
+    pub fn clear_all_kv_caches(&self) {
+        let clear = |t2d: &Transformer2DModel| {
+            for tb in &t2d.blocks { tb.cross_attn.clear_kv_cache(); }
+        };
+        for db in &self.down_blocks {
+            if let Some(attns) = &db.attentions {
+                for t2d in attns { clear(t2d); }
+            }
+        }
+        clear(&self.mid_block.attn);
+        for ub in &self.up_blocks {
+            if let Some(attns) = &ub.attentions {
+                for t2d in attns { clear(t2d); }
+            }
+        }
+    }
+
     pub fn precompute_text_kv(&self, text_embedding: &[f32], text_seq: usize) {
         // Derive batch from buffer: text_embedding is [N, text_seq, cross_attn_dim].
         let n = (text_embedding.len() / (text_seq * self.config.cross_attention_dim)).max(1);
@@ -883,6 +903,287 @@ fn inject_residuals_gpu(
     }
     Ok(())
 }
+
+// ---- AnimateDiff video forward --------------------------------------------
+
+impl UNet2DConditionModel {
+    /// Forward pass with AnimateDiff temporal attention injected.
+    ///
+    /// The latent has shape `[batch * num_frames, in_channels, H, W]`.
+    /// Spatial blocks (resnet + spatial attention) process each frame
+    /// independently; temporal blocks (from `motion`) attend across
+    /// frames at each spatial position.
+    ///
+    /// This is the CPU path. The spatial attention and convolutions run
+    /// on CPU; temporal attention runs on CPU. For Metal-accelerated
+    /// spatial + CPU temporal, use `forward_video_sdxl_gpu` (TBD).
+    pub fn forward_video_sdxl(
+        &self,
+        latent: &[f32],
+        timestep: f32,
+        text_embedding: &[f32],
+        pooled_text_embedding: &[f32],
+        additional_cond: SDXLAdditionalConditioning,
+        motion: &crate::animatediff::MotionModules,
+        num_frames: usize,
+    ) -> Result<Vec<f32>> {
+        let h = self.config.sample_size;
+        let w = self.config.sample_size;
+        let bf = (latent.len() / (self.config.in_channels * h * w)).max(1);
+        let batch = bf / num_frames;
+        let n = bf; // UNet sees bf samples
+        let text_seq = text_embedding.len() / (n * self.config.cross_attention_dim);
+
+        // Time embedding (same timestep for all frames in the batch).
+        let mut time_emb = self.time_embedding.forward(timestep);
+        if n > 1 {
+            let single = time_emb.clone();
+            time_emb.clear();
+            for _ in 0..n { time_emb.extend_from_slice(&single); }
+        }
+
+        // SDXL additional conditioning.
+        if let Some(tte) = &self.text_time_embedding {
+            let time_ids = [
+                additional_cond.original_size.1 as f32,
+                additional_cond.original_size.0 as f32,
+                additional_cond.crops_coords_top_left.1 as f32,
+                additional_cond.crops_coords_top_left.0 as f32,
+                additional_cond.target_size.1 as f32,
+                additional_cond.target_size.0 as f32,
+            ];
+            let add_emb = tte.forward(pooled_text_embedding, &time_ids);
+            let single = add_emb.clone();
+            let mut full = Vec::with_capacity(single.len() * n);
+            for _ in 0..n { full.extend_from_slice(&single); }
+            for (t, a) in time_emb.iter_mut().zip(full.iter()) { *t += a; }
+        }
+
+        // conv_in
+        let mut x = Vec::new();
+        let (mut h_cur, mut w_cur) = self.conv_in.forward(latent, n, h, w, &mut x);
+
+        // ---- Down blocks with temporal injection ---
+        let mut all_skips: Vec<Vec<f32>> = Vec::new();
+        let mut all_skip_channels: Vec<usize> = Vec::new();
+        let conv_in_c = x.len() / (n * h_cur * w_cur).max(1);
+        all_skip_channels.push(conv_in_c);
+        all_skips.push(x.clone());
+
+        for (db_idx, db) in self.down_blocks.iter().enumerate() {
+            for (layer_idx, resnet) in db.resnets.iter().enumerate() {
+                x = resnet.forward(&x, n, h_cur, w_cur, &time_emb);
+                if let Some(attns) = &db.attentions {
+                    x = attns[layer_idx].forward(&x, n, h_cur, w_cur, text_embedding, text_seq);
+                }
+                // Temporal attention — injected after each resnet (+
+                // optional spatial attention). The adapter has modules at
+                // ALL blocks, not just the ones with spatial attention.
+                if db_idx < motion.down.len() && layer_idx < motion.down[db_idx].len() {
+                    motion.down[db_idx][layer_idx].forward(
+                        &mut x, batch, num_frames, h_cur, w_cur,
+                    );
+                }
+                all_skips.push(x.clone());
+                all_skip_channels.push(db.channels_out);
+            }
+            if let Some(down) = &db.downsample {
+                let (next, hn, wn) = down.forward(&x, n, h_cur, w_cur);
+                x = next; h_cur = hn; w_cur = wn;
+                all_skips.push(x.clone());
+                all_skip_channels.push(db.channels_out);
+            }
+        }
+
+        // ---- Mid block with temporal injection ---
+        x = self.mid_block.resnet_1.forward(&x, n, h_cur, w_cur, &time_emb);
+        x = self.mid_block.attn.forward(&x, n, h_cur, w_cur, text_embedding, text_seq);
+        if !motion.mid.is_empty() {
+            motion.mid[0].forward(&mut x, batch, num_frames, h_cur, w_cur);
+        }
+        x = self.mid_block.resnet_2.forward(&x, n, h_cur, w_cur, &time_emb);
+
+        // ---- Up blocks with temporal injection ---
+        for (ub_idx, ub) in self.up_blocks.iter().enumerate() {
+            for (layer_idx, resnet) in ub.resnets.iter().enumerate() {
+                // Pop skip connection and concatenate.
+                let skip = all_skips.pop().unwrap_or_default();
+                let skip_c = all_skip_channels.pop().unwrap_or(0);
+                let x_c = x.len() / (n * h_cur * w_cur).max(1);
+                let cat_c = x_c + skip_c;
+                let mut cat = vec![0.0f32; n * cat_c * h_cur * w_cur];
+                for s in 0..n {
+                    for hi in 0..h_cur {
+                        for wi in 0..w_cur {
+                            for ci in 0..x_c {
+                                cat[s * cat_c * h_cur * w_cur + ci * h_cur * w_cur + hi * w_cur + wi] =
+                                    x[s * x_c * h_cur * w_cur + ci * h_cur * w_cur + hi * w_cur + wi];
+                            }
+                            for ci in 0..skip_c {
+                                cat[s * cat_c * h_cur * w_cur + (x_c + ci) * h_cur * w_cur + hi * w_cur + wi] =
+                                    skip[s * skip_c * h_cur * w_cur + ci * h_cur * w_cur + hi * w_cur + wi];
+                            }
+                        }
+                    }
+                }
+                x = resnet.forward(&cat, n, h_cur, w_cur, &time_emb);
+                if let Some(attns) = &ub.attentions {
+                    x = attns[layer_idx].forward(&x, n, h_cur, w_cur, text_embedding, text_seq);
+                }
+                // Temporal attention — all blocks, not just those with spatial attn.
+                if ub_idx < motion.up.len() && layer_idx < motion.up[ub_idx].len() {
+                    motion.up[ub_idx][layer_idx].forward(
+                        &mut x, batch, num_frames, h_cur, w_cur,
+                    );
+                }
+            }
+            if let Some(up) = &ub.upsample {
+                let (next, hn, wn) = up.forward(&x, n, h_cur, w_cur);
+                x = next; h_cur = hn; w_cur = wn;
+            }
+        }
+
+        // conv_norm_out + SiLU + conv_out
+        self.conv_norm_out.forward_inplace(&mut x, n, h_cur, w_cur);
+        silu_inplace(&mut x);
+        let mut out = Vec::new();
+        self.conv_out.forward(&x, n, h_cur, w_cur, &mut out);
+        Ok(out)
+    }
+
+    /// GPU-accelerated video forward with AnimateDiff temporal attention.
+    ///
+    /// Strategy: run each frame through the EXISTING proven-working
+    /// `forward_sdxl_gpu_with_controlnet` (identical code path to image
+    /// gen — no new GPU code). Then apply temporal attention on CPU to
+    /// the collected per-frame noise predictions. This is a per-step
+    /// temporal mix (coarser than the per-block injection AnimateDiff
+    /// originally uses) but it avoids all Metal command-buffer management
+    /// issues and reuses the battle-tested GPU forward.
+    /// GPU video forward: all frames processed simultaneously in ONE
+    /// command buffer with GPU temporal attention injected after each
+    /// spatial block. Avoids the Apple Silicon Metal bug where per-block
+    /// command buffers produce NaN.
+    ///
+    /// n = cfg_batch * num_frames samples go through the spatial UNet
+    /// as a single batch. After each resnet+attn, temporal attention
+    /// runs on GPU (reshaping [B*F, C, H, W] ↔ [B*H*W, F, C]).
+    #[cfg(feature = "metal")]
+    pub fn forward_video_sdxl_gpu(
+        &self,
+        latent: &[f32],
+        timestep: f32,
+        text_embedding: &[f32],       // [cfg_batch * num_frames, text_seq, cad]
+        pooled_text_embedding: &[f32], // [cfg_batch, pooled_dim]
+        additional_cond: SDXLAdditionalConditioning,
+        motion: &crate::animatediff::MotionModules,
+        num_frames: usize,
+    ) -> Result<Vec<f32>> {
+        use crate::metal_backend::*;
+
+        let h = self.config.sample_size;
+        let w = self.config.sample_size;
+        let n = latent.len() / (self.config.in_channels * h * w);
+        let cfg_batch = n / num_frames;
+        let text_seq = text_embedding.len() / (n * self.config.cross_attention_dim);
+
+        begin_batch();
+
+        // Time embedding (CPU, small). Replicate for all n samples,
+        // then add per-sample TextTimeEmbedding (same order as
+        // forward_sdxl_gpu_with_controlnet).
+        let mut time_emb = self.time_embedding.forward(timestep);
+        if n > 1 {
+            let single = time_emb.clone();
+            time_emb.clear();
+            for _ in 0..n { time_emb.extend_from_slice(&single); }
+        }
+        if let Some(tte) = &self.text_time_embedding {
+            let tids = additional_cond.as_floats();
+            let pooled_dim = pooled_text_embedding.len() / n.max(1);
+            let mut add = Vec::with_capacity(n * tte.time_embed_dim);
+            for ni in 0..n {
+                let pb = &pooled_text_embedding[ni * pooled_dim..(ni + 1) * pooled_dim];
+                add.extend(tte.forward(pb, &tids));
+            }
+            for (a, b) in time_emb.iter_mut().zip(add.iter()) { *a += b; }
+        }
+
+        // Upload latent — all frames at once.
+        let x_in = GpuTensor::upload_f32_as_f16(
+            vec![n, self.config.in_channels, h, w], latent);
+        let (mut x, mut h_cur, mut w_cur) = self.conv_in.forward_gpu(&x_in, n, h, w);
+        drop(x_in);
+
+        // Down path.
+        let mut all_skips: Vec<GpuTensor> = Vec::new();
+        let mut all_skip_channels: Vec<usize> = Vec::new();
+        all_skip_channels.push(x.shape[1]);
+        all_skips.push(x.clone_data());
+
+        for (di, db) in self.down_blocks.iter().enumerate() {
+            for (li, resnet) in db.resnets.iter().enumerate() {
+                x = resnet.forward_gpu(&x, n, h_cur, w_cur, &time_emb);
+                if let Some(attns) = &db.attentions {
+                    x = attns[li].forward_gpu(&x, n, h_cur, w_cur, text_embedding, text_seq);
+                }
+                if di < motion.down.len() && li < motion.down[di].len() {
+                    motion.down[di][li].forward_gpu(&mut x, cfg_batch, num_frames, h_cur, w_cur);
+                }
+                all_skips.push(x.clone_data());
+                all_skip_channels.push(db.channels_out);
+            }
+            if let Some(down) = &db.downsample {
+                let (next, hn, wn) = down.forward_gpu(&x, n, h_cur, w_cur);
+                x = next; h_cur = hn; w_cur = wn;
+                all_skips.push(x.clone_data());
+                all_skip_channels.push(db.channels_out);
+            }
+        }
+
+        // Mid block.
+        x = self.mid_block.resnet_1.forward_gpu(&x, n, h_cur, w_cur, &time_emb);
+        x = self.mid_block.attn.forward_gpu(&x, n, h_cur, w_cur, text_embedding, text_seq);
+        if !motion.mid.is_empty() {
+            motion.mid[0].forward_gpu(&mut x, cfg_batch, num_frames, h_cur, w_cur);
+        }
+        x = self.mid_block.resnet_2.forward_gpu(&x, n, h_cur, w_cur, &time_emb);
+
+        // Up path.
+        for (ui, ub) in self.up_blocks.iter().enumerate() {
+            for (li, resnet) in ub.resnets.iter().enumerate() {
+                let skip = all_skips.pop().unwrap();
+                let skip_c = all_skip_channels.pop().unwrap();
+                let xc = x.shape[1];
+                let cat = cat_channels_f16_gpu(&x, xc, &skip, skip_c, n, h_cur, w_cur);
+                drop(skip);
+                x = resnet.forward_gpu(&cat, n, h_cur, w_cur, &time_emb);
+                drop(cat);
+                if let Some(attns) = &ub.attentions {
+                    x = attns[li].forward_gpu(&x, n, h_cur, w_cur, text_embedding, text_seq);
+                }
+                if ui < motion.up.len() && li < motion.up[ui].len() {
+                    motion.up[ui][li].forward_gpu(&mut x, cfg_batch, num_frames, h_cur, w_cur);
+                }
+            }
+            if let Some(up) = &ub.upsample {
+                let (next, hn, wn) = up.forward_gpu(&x, n, h_cur, w_cur);
+                x = next; h_cur = hn; w_cur = wn;
+            }
+        }
+
+        // Final norm + conv_out.
+        let no_g = weight_f16_buffer(&self.conv_norm_out.gamma);
+        let no_b = weight_f16_buffer(&self.conv_norm_out.beta);
+        let c_now = x.shape[1];
+        groupnorm_silu_f16_gpu_inplace(&mut x, &no_g, &no_b,
+            n, c_now, h_cur, w_cur,
+            self.conv_norm_out.num_groups, self.conv_norm_out.eps);
+        let (out_gpu, _, _) = self.conv_out.forward_gpu(&x, n, h_cur, w_cur);
+
+        Ok(out_gpu.download_to_f32())
+    }
+} // end AnimateDiff video impl
 
 pub fn expand_attention_head_dim(d: &AttentionHeadDim, n_blocks: usize) -> Vec<usize> {
     match d {

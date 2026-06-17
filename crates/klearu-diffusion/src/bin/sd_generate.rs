@@ -81,42 +81,107 @@
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use klearu_diffusion::config::{CheckpointConfig, SDVariant};
+use rustyline::DefaultEditor;
+use rustyline::error::ReadlineError;
+
+use klearu_diffusion::config::SDVariant;
 use klearu_diffusion::image_io::{downsample_mask, load_image_as_chw_f32, load_mask, save_png};
-use klearu_diffusion::scheduler::{DDIMScheduler, Scheduler};
-use klearu_diffusion::text_encoder::{CLIPTextModel, SDXLDualTextEncoder};
-use klearu_diffusion::tokenizer::CLIPTokenizer;
+use klearu_diffusion::pipeline::{LoadOptions, SdResidents};
+use klearu_diffusion::scheduler::Scheduler;
 use klearu_diffusion::unet::{SDXLAdditionalConditioning, UNet2DConditionModel};
-use klearu_diffusion::vae::AutoencoderKL;
-use klearu_diffusion::weight::{ComponentTensors, SDFormat, SingleFileLoader};
+// CLIPTextModel etc. are referenced only inside pipeline.rs now; the binary
+// just receives them via the destructure of SdResidents.
+
+/// Background Esc-key watcher for batch generation. Puts the terminal in
+/// raw mode and spawns a thread that polls `crossterm` events. When the
+/// user presses Esc, `aborted()` returns true on subsequent reads — the
+/// batch loop polls this and breaks out cleanly. Ctrl-C in raw mode is
+/// NOT translated to SIGINT by the kernel, so the watcher forwards it as
+/// `quit_requested()` (the main loop sees it after restoring the
+/// terminal and exits the app).
+///
+/// RAII: on drop, the thread is signalled to stop, joined, and raw mode
+/// is restored. Safe to drop on panic.
+struct EscAbort {
+    aborted: Arc<AtomicBool>,
+    quit:    Arc<AtomicBool>,
+    stop:    Arc<AtomicBool>,
+    thread:  Option<std::thread::JoinHandle<()>>,
+    raw_on:  bool,
+}
+
+impl EscAbort {
+    fn start() -> Self {
+        let aborted = Arc::new(AtomicBool::new(false));
+        let quit = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        let raw_on = crossterm::terminal::enable_raw_mode().is_ok();
+        let af = aborted.clone();
+        let qf = quit.clone();
+        let sf = stop.clone();
+        let thread = std::thread::spawn(move || {
+            use crossterm::event::{poll, read, Event, KeyCode, KeyModifiers};
+            use std::time::Duration;
+            while !sf.load(Ordering::SeqCst) {
+                match poll(Duration::from_millis(80)) {
+                    Ok(true) => {
+                        if let Ok(Event::Key(k)) = read() {
+                            match (k.code, k.modifiers) {
+                                (KeyCode::Esc, _) => {
+                                    af.store(true, Ordering::SeqCst);
+                                    // Don't break: keep reading so further
+                                    // keystrokes don't queue up for the next
+                                    // rustyline session.
+                                }
+                                (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                                    // Raw-mode Ctrl-C: not a SIGINT. Forward
+                                    // via quit + abort so the main loop
+                                    // tears down and exits.
+                                    af.store(true, Ordering::SeqCst);
+                                    qf.store(true, Ordering::SeqCst);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    Ok(false) => {} // timeout — loop and recheck stop flag
+                    Err(_) => break,
+                }
+            }
+        });
+        Self { aborted, quit, stop, thread: Some(thread), raw_on }
+    }
+
+    fn aborted(&self) -> bool { self.aborted.load(Ordering::SeqCst) }
+    fn quit_requested(&self) -> bool { self.quit.load(Ordering::SeqCst) }
+}
+
+impl Drop for EscAbort {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(t) = self.thread.take() { let _ = t.join(); }
+        if self.raw_on { let _ = crossterm::terminal::disable_raw_mode(); }
+    }
+}
+
+/// Println for raw-mode stderr: translates `\n` to `\r\n` so the cursor
+/// returns to column 0 instead of stair-stepping. Use this only while an
+/// `EscAbort` is alive; otherwise plain `eprintln!` is correct.
+macro_rules! eraw_println {
+    ($($t:tt)*) => {{
+        let s = format!($($t)*);
+        eprint!("{}\r\n", s);
+    }};
+}
 
 /// Shallow-clone a CLIPTextModel by re-constructing from config and copying
 /// loaded weights. We can't `derive(Clone)` because the underlying Linear
 /// has Vec data. Allocates ~hidden_size² × num_layers floats.
-fn text_l_clone(src: &CLIPTextModel) -> CLIPTextModel {
-    let mut copy = CLIPTextModel::from_config(src.config.clone());
-    copy.token_embedding.clone_from(&src.token_embedding);
-    copy.position_embedding.clone_from(&src.position_embedding);
-    copy.final_layer_norm.gamma.clone_from(&src.final_layer_norm.gamma);
-    copy.final_layer_norm.beta.clone_from(&src.final_layer_norm.beta);
-    for (dst, s) in copy.layers.iter_mut().zip(src.layers.iter()) {
-        dst.layer_norm1.gamma.clone_from(&s.layer_norm1.gamma);
-        dst.layer_norm1.beta.clone_from(&s.layer_norm1.beta);
-        dst.self_attn.to_q.weight.clone_from(&s.self_attn.to_q.weight);
-        dst.self_attn.to_k.weight.clone_from(&s.self_attn.to_k.weight);
-        dst.self_attn.to_v.weight.clone_from(&s.self_attn.to_v.weight);
-        dst.self_attn.to_out.weight.clone_from(&s.self_attn.to_out.weight);
-        dst.self_attn.to_out.bias.clone_from(&s.self_attn.to_out.bias);
-        dst.layer_norm2.gamma.clone_from(&s.layer_norm2.gamma);
-        dst.layer_norm2.beta.clone_from(&s.layer_norm2.beta);
-        dst.mlp.fc1.weight.clone_from(&s.mlp.fc1.weight);
-        dst.mlp.fc1.bias.clone_from(&s.mlp.fc1.bias);
-        dst.mlp.fc2.weight.clone_from(&s.mlp.fc2.weight);
-        dst.mlp.fc2.bias.clone_from(&s.mlp.fc2.bias);
-    }
-    copy
-}
+// `text_l_clone` previously lived here; the canonical implementation now
+// sits beside `SdResidents::load` in `klearu_diffusion::pipeline`.
 
 fn count_cross_attn_blocks(unet: &UNet2DConditionModel) -> usize {
     let mut n = 0usize;
@@ -267,6 +332,29 @@ struct PromptOverrides {
 
 /// Parse a REPL line of the form `"prompt text :: --steps 30 --seed 7"`.
 /// Lines without `::` produce `(line, default-overrides)`.
+/// Read a raw little-endian f32 array from disk. Used for the optional
+/// `--cond-bias` sidecar produced by the desktop shell's CLIP-space user
+/// steering vector.
+fn read_f32_bin(path: &std::path::Path) -> std::io::Result<Vec<f32>> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path)?;
+    let mut bytes = Vec::new();
+    f.read_to_end(&mut bytes)?;
+    if bytes.len() % 4 != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("file size {} not a multiple of 4", bytes.len()),
+        ));
+    }
+    let n = bytes.len() / 4;
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let off = i * 4;
+        out.push(f32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]]));
+    }
+    Ok(out)
+}
+
 fn parse_prompt_line(line: &str) -> Result<(String, PromptOverrides), String> {
     let mut overrides = PromptOverrides::default();
     let (prompt, tail) = match line.split_once("::") {
@@ -334,12 +422,24 @@ fn main() -> ExitCode {
     // residuals into the UNet. ControlNet-Inpaint is the typical use case
     // for SDXL where dedicated 9-channel inpaint UNets are scarce.
     let mut controlnet_path: Option<PathBuf> = None;
+    let mut save_history_path: Option<PathBuf> = None;
     let mut control_image_path: Option<PathBuf> = None;
     let mut controlnet_weight: f32 = 1.0;
     // Step-fraction window over which residuals get injected. Outside
     // [start, end), the UNet runs without ControlNet (vanilla generation).
     let mut controlnet_start: f32 = 0.0;
     let mut controlnet_end: f32 = 1.0;
+    // Optional sidecar bias added uniformly to every position of the
+    // (cond) text embedding before cross-attention. File format: raw
+    // little-endian f32 array of length `cross_attention_dim`. The desktop
+    // shell uses this to apply its CLIP-space user steering vector — the
+    // image-domain analogue of the LLM steering vector — without re-
+    // encoding feedback prompts here. Applied to cond only (so CFG keeps
+    // the signal).
+    let mut cond_bias_path: Option<PathBuf> = None;
+    let mut motion_adapter_path: Option<PathBuf> = None;
+    let mut num_frames: usize = 16;
+    let mut fps: usize = 8;
 
     let mut i = 1;
     while i < args.len() {
@@ -364,10 +464,15 @@ fn main() -> ExitCode {
             "--mask"  => { i += 1; input_mask  = Some(PathBuf::from(&args[i])); }
             "--strength" => { i += 1; strength = args[i].parse().expect("f32"); }
             "--controlnet" => { i += 1; controlnet_path = Some(PathBuf::from(&args[i])); }
+            "--save-history" => { i += 1; save_history_path = Some(PathBuf::from(&args[i])); }
             "--control-image" => { i += 1; control_image_path = Some(PathBuf::from(&args[i])); }
             "--controlnet-weight" => { i += 1; controlnet_weight = args[i].parse().expect("f32"); }
             "--controlnet-start" => { i += 1; controlnet_start = args[i].parse().expect("f32"); }
             "--controlnet-end" => { i += 1; controlnet_end = args[i].parse().expect("f32"); }
+            "--cond-bias" => { i += 1; cond_bias_path = Some(PathBuf::from(&args[i])); }
+            "--motion-adapter" => { i += 1; motion_adapter_path = Some(PathBuf::from(&args[i])); }
+            "--num-frames" => { i += 1; num_frames = args[i].parse().expect("usize"); }
+            "--fps" => { i += 1; fps = args[i].parse().expect("usize"); }
             "--help" | "-h" => {
                 eprintln!("usage:");
                 eprintln!("  sd_generate --checkpoint DIR --prompt \"...\" --out OUT.png");
@@ -389,7 +494,10 @@ fn main() -> ExitCode {
                 eprintln!("                          Empty line repeats the previous prompt.");
                 eprintln!("  --batch N               Generate N images per prompt (default 1). Filenames");
                 eprintln!("                          get a `_<i>` suffix when N > 1; seeds increment by 1");
-                eprintln!("                          across the batch.");
+                eprintln!("                          across the batch. Press Esc during generation to");
+                eprintln!("                          abort the current batch (Ctrl-C still quits the app).");
+                eprintln!("  --save-history FILE     Persist REPL prompt history to FILE across sessions.");
+                eprintln!("                          History is in-memory only (lost on exit) without this.");
                 eprintln!();
                 eprintln!("Inpainting / img2img:");
                 eprintln!("  --input PNG             VAE-encode this image as the starting latent");
@@ -401,6 +509,12 @@ fn main() -> ExitCode {
                 eprintln!("                          (full-image img2img).");
                 eprintln!("  --strength F            How much to denoise the input (0..=1, default 0.85).");
                 eprintln!("                          0 = no change; 1 = full regen as if from pure noise.");
+                eprintln!();
+                eprintln!("Video (AnimateDiff):");
+                eprintln!("  --motion-adapter FILE   Motion adapter .safetensors (enables video mode).");
+                eprintln!("  --num-frames N          Number of frames to generate (default 16).");
+                eprintln!("  --fps N                 Output video frame rate (default 8).");
+                eprintln!("                          Output is saved as .mp4 (requires ffmpeg).");
                 return ExitCode::SUCCESS;
             }
             other => { eprintln!("unknown flag: {other}"); return ExitCode::FAILURE; }
@@ -437,93 +551,11 @@ fn main() -> ExitCode {
         None => None,
     };
 
-    // Resolve config and weight source. Two paths:
-    //   (A) --checkpoint DIR  (Diffusers folder format with per-component subdirs)
-    //   (B) --single-file FILE.safetensors  (CompVis/A1111 all-in-one)
-    enum WeightSrc {
-        Folder(PathBuf),
-        Single(SingleFileLoader),
-    }
-    let (cfg, weight_src, fake_root) = match (checkpoint.clone(), single_file.clone()) {
-        (Some(p), None) => {
-            let cfg = match CheckpointConfig::from_dir(&p) {
-                Ok(c) => c,
-                Err(e) => { eprintln!("config: {e}"); return ExitCode::FAILURE; }
-            };
-            (cfg, WeightSrc::Folder(p.clone()), p)
-        }
-        (None, Some(sf)) => {
-            eprintln!("opening single-file checkpoint {}", sf.display());
-            let loader = match SingleFileLoader::open(&sf) {
-                Ok(l) => l,
-                Err(e) => { eprintln!("single-file: {e}"); return ExitCode::FAILURE; }
-            };
-            // Surface modelspec metadata if the publisher (Civitai / A1111) included it.
-            if let Some(t) = &loader.metadata.title {
-                eprintln!("modelspec title: {t:?}");
-            }
-            if let Some(a) = &loader.metadata.architecture {
-                eprintln!("modelspec architecture: {a:?}");
-            }
-            if let Some(p) = &loader.metadata.prediction_type {
-                eprintln!("modelspec prediction_type: {p:?}");
-            }
-            if let Some(r) = &loader.metadata.resolution {
-                eprintln!("modelspec resolution: {r:?}");
-            }
-            if let Some(l) = &loader.metadata.license {
-                eprintln!("modelspec license: {l:?}");
-            }
-            eprintln!("detected variant: {:?}", loader.variant);
-            // Pick config defaults based on detected (or forced) variant.
-            let variant = match force_variant.as_deref() {
-                Some("sd15") => SDFormat::Sd15,
-                Some("sdxl") => SDFormat::Sdxl,
-                _ => loader.variant,
-            };
-            let fake_root = sf.parent().unwrap_or(std::path::Path::new(".")).to_path_buf();
-            let mut cfg = match variant {
-                SDFormat::Sd15 => CheckpointConfig::sd15_default(fake_root.clone()),
-                SDFormat::Sdxl => CheckpointConfig::sdxl_default(fake_root.clone()),
-                SDFormat::Flux => {
-                    eprintln!("Flux checkpoint detected — sd_generate handles SD 1.5 / SDXL only.");
-                    eprintln!("Use the `flux_generate` binary for Flux models.");
-                    return ExitCode::FAILURE;
-                }
-                SDFormat::Unknown => {
-                    eprintln!("could not detect SD variant; pass --variant sd15 or --variant sdxl");
-                    return ExitCode::FAILURE;
-                }
-            };
-            // Inpaint detection: if the conv_in weight has 9 input channels
-            // instead of 4, this is a RunwayML / Stability inpaint UNet
-            // (4 noisy latent + 4 masked init latent + 1 mask). Override
-            // the in_channels default so the UNet's first conv is allocated
-            // wide enough to consume the augmented input.
-            if let Some(in_c) = loader.unet_in_channels() {
-                if in_c != cfg.unet.in_channels {
-                    eprintln!("(unet.in_channels {} → {in_c} from conv_in weight shape — \
-                        inpaint UNet detected)", cfg.unet.in_channels);
-                    cfg.unet.in_channels = in_c;
-                }
-            }
-            // Override defaults from modelspec when the publisher specified them.
-            if let Some(p) = &loader.metadata.prediction_type {
-                cfg.scheduler.prediction_type = p.clone();
-                eprintln!("(scheduler.prediction_type overridden to {:?} from modelspec)", p);
-            }
-            if let Some((w, h)) = loader.metadata.resolution_pixels() {
-                // SD's UNet sample_size is the latent side (image / 8).
-                let new_sample = (w.max(h) / 8) as usize;
-                if new_sample != cfg.unet.sample_size {
-                    eprintln!("(unet.sample_size {} → {} from modelspec resolution {}x{})",
-                        cfg.unet.sample_size, new_sample, w, h);
-                    cfg.unet.sample_size = new_sample;
-                    cfg.vae.sample_size = (w.max(h)) as usize;
-                }
-            }
-            (cfg, WeightSrc::Single(loader), fake_root)
-        }
+    // Resolve checkpoint path. Folder vs single-file is auto-detected
+    // inside `SdResidents::load` based on whether the path is a dir.
+    let checkpoint_path = match (checkpoint.clone(), single_file.clone()) {
+        (Some(p), None) => p,
+        (None, Some(p)) => p,
         (Some(_), Some(_)) => {
             eprintln!("--checkpoint and --single-file are mutually exclusive");
             return ExitCode::FAILURE;
@@ -533,17 +565,84 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let variant = cfg.variant();
+    let load_opts = LoadOptions {
+        checkpoint: checkpoint_path,
+        tokenizer_l: tokenizer_path.clone(),
+        tokenizer_g: tokenizer_2_path.clone(),
+        controlnet: controlnet_path.clone(),
+        force_variant: force_variant.clone(),
+        gpu_residence,
+    };
+    let SdResidents {
+        variant,
+        cfg,
+        weight_src: weight_src_,
+        mut text_l,
+        mut dual,
+        mut unet,
+        mut vae,
+        controlnet,
+        tok_l,
+        tok_g,
+        mut scheduler,
+        gpu_residence: _, // shadowed by the CLI binding above
+    } = match SdResidents::load(&load_opts) {
+        Ok(r) => r,
+        Err(e) => { eprintln!("{e}"); return ExitCode::FAILURE; }
+    };
     eprintln!("variant: {:?}", variant);
+
+    // ===== Video mode (AnimateDiff) =====
+    if let Some(adapter_path) = &motion_adapter_path {
+        eprintln!("video mode: loading motion adapter from {}", adapter_path.display());
+        let mut motion = klearu_diffusion::animatediff::MotionModules::sdxl_default(num_frames);
+        if let Err(e) = klearu_diffusion::animatediff::weight::load_motion_adapter(&mut motion, adapter_path) {
+            eprintln!("motion adapter: {e}");
+            return ExitCode::FAILURE;
+        }
+        let seed = explicit_seed.unwrap_or_else(random_seed);
+        let req = klearu_diffusion::pipeline::VideoRequest {
+            prompt: initial_prompt.clone(),
+            negative_prompt: negative_prompt.clone(),
+            steps,
+            cfg_scale,
+            seed,
+            num_frames,
+            fps,
+            cond_bias: None,
+        };
+        eprintln!("generating video: {} frames, {} fps, {} steps, seed={seed}", num_frames, fps, steps);
+        let abort = std::sync::atomic::AtomicBool::new(false);
+        // Re-pack into SdResidents (generate_video takes &mut SdResidents).
+        let mut residents = SdResidents {
+            variant, cfg, weight_src: weight_src_,
+            text_l, dual, unet, vae, controlnet,
+            tok_l, tok_g, scheduler, gpu_residence,
+        };
+        match klearu_diffusion::pipeline::generate_video(
+            &mut residents, &motion, &req,
+            |p| eprintln!("  video progress: step {}/{}", p.step, p.total),
+            &abort,
+        ) {
+            Ok(video) => {
+                let out = initial_out_path.with_extension("mp4");
+                eprintln!("encoding {} frames to {}", video.frames.len(), out.display());
+                match klearu_diffusion::video_io::encode_mp4(&video.frames, video.fps, Some(&out)) {
+                    Ok(_) => eprintln!("saved {}", out.display()),
+                    Err(e) => { eprintln!("encode_mp4: {e}"); return ExitCode::FAILURE; }
+                }
+            }
+            Err(e) => { eprintln!("generate_video: {e}"); return ExitCode::FAILURE; }
+        }
+        return ExitCode::SUCCESS;
+    }
+
     eprintln!("prompt: {initial_prompt:?}{}", if repl { " (and stdin in REPL mode)" } else { "" });
     let seed_label: String = match explicit_seed {
         Some(s) => format!("{s} (pinned)"),
         None => "random per-generation".into(),
     };
     eprintln!("steps: {steps}, seed: {seed_label}");
-    // Time-derived RNG seed source. Per-iteration we derive a unique 64-bit
-    // seed: nanosecond clock XOR'd with iteration counter so back-to-back
-    // generations don't collide.
     fn random_seed() -> u64 {
         use std::time::{SystemTime, UNIX_EPOCH};
         SystemTime::now().duration_since(UNIX_EPOCH)
@@ -551,99 +650,6 @@ fn main() -> ExitCode {
             .unwrap_or(42)
     }
 
-    // Construct components and load weights — folder or single-file source.
-    let load_component = |name: &str| -> Option<ComponentTensors> {
-        match &weight_src {
-            WeightSrc::Folder(root) => {
-                ComponentTensors::open_dir(&root.join(name)).ok()
-            }
-            WeightSrc::Single(loader) => loader.component(name).ok(),
-        }
-    };
-
-    let mut text_l = CLIPTextModel::from_config(cfg.text_encoder.clone());
-    eprintln!("loading text_encoder weights...");
-    if let Some(c) = load_component("text_encoder") {
-        match text_l.load_from(&c) {
-            Ok(()) => eprintln!("  ✓ text_encoder loaded"),
-            Err(e) => eprintln!("  ⚠ text_encoder: {e} (continuing with zero weights)"),
-        }
-    } else {
-        eprintln!("  ⚠ text_encoder unavailable (continuing with zero weights)");
-    }
-
-    let mut dual = cfg.text_encoder_2.as_ref().map(|t2| {
-        SDXLDualTextEncoder::from_configs(cfg.text_encoder.clone(), t2.clone())
-    });
-    if let Some(d) = &mut dual {
-        d.clip_l = text_l_clone(&text_l);
-        eprintln!("loading text_encoder_2 (CLIP-G) weights...");
-        if let Some(c) = load_component("text_encoder_2") {
-            match d.clip_g.load_from(&c) {
-                Ok(()) => eprintln!("  ✓ text_encoder_2 loaded"),
-                Err(e) => eprintln!("  ⚠ text_encoder_2: {e}"),
-            }
-        } else {
-            eprintln!("  ⚠ text_encoder_2 unavailable");
-        }
-    }
-
-    let mut unet = UNet2DConditionModel::from_config(cfg.unet.clone());
-    eprintln!("loading unet weights (largest, may take a moment)...");
-    if let Some(c) = load_component("unet") {
-        match unet.load_from(&c) {
-            Ok(()) => eprintln!("  ✓ unet loaded"),
-            Err(e) => eprintln!("  ⚠ unet: {e}"),
-        }
-    } else {
-        eprintln!("  ⚠ unet unavailable");
-    }
-
-    // Optional ControlNet load. Mirrors UNet's encoder; receives the
-    // same conditioning each step and produces residuals injected into
-    // UNet's skip connections.
-    let controlnet: Option<klearu_diffusion::controlnet::ControlNet2DModel> =
-        if let Some(p) = &controlnet_path {
-            eprintln!("[controlnet] loading {} …", p.display());
-            let comp = match SingleFileLoader::open(p) {
-                Ok(loader) => {
-                    // ControlNet single-file safetensors stores the model
-                    // under root keys (no `controlnet.` prefix). Convert
-                    // raw tensors directly to a ComponentTensors.
-                    use std::collections::HashMap;
-                    use klearu_diffusion::weight::TensorRef;
-                    let translated: HashMap<String, TensorRef> = loader.raw_tensors
-                        .iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-                    Some(ComponentTensors::from_single_mmap_borrow(&loader, translated))
-                }
-                Err(e) => { eprintln!("  ⚠ open controlnet: {e}"); None }
-            };
-            if let Some(comp) = comp {
-                let cn_cfg = klearu_diffusion::controlnet::ControlNetConfig::from_unet(cfg.unet.clone());
-                let mut cn = klearu_diffusion::controlnet::ControlNet2DModel::from_config(cn_cfg);
-                match cn.load_from(&comp) {
-                    Ok(()) => {
-                        eprintln!("  ✓ controlnet loaded ({} down residuals + 1 mid residual)",
-                            cn.num_down_residuals());
-                        Some(cn)
-                    }
-                    Err(e) => { eprintln!("  ⚠ controlnet load: {e}"); None }
-                }
-            } else { None }
-        } else { None };
-
-    let mut vae = AutoencoderKL::from_config(cfg.vae.clone());
-    eprintln!("loading vae weights...");
-    if let Some(c) = load_component("vae") {
-        match vae.load_from(&c) {
-            Ok(()) => eprintln!("  ✓ vae loaded"),
-            Err(e) => eprintln!("  ⚠ vae: {e}"),
-        }
-    } else {
-        eprintln!("  ⚠ vae unavailable");
-    }
-    let _ = fake_root; // suppress unused
-    let mut scheduler = DDIMScheduler::new(&cfg.scheduler);
     // Snapshot run-level defaults so per-prompt inline overrides can shadow
     // them without permanently mutating the run-level settings.
     let initial_steps = steps;
@@ -654,22 +660,7 @@ fn main() -> ExitCode {
     let initial_mask = input_mask.clone();
     let initial_strength = strength;
 
-    // Tokenize prompt with the CLIP BPE tokenizer (real, BOS+EOS padded to 77).
-    // For folder mode, tokenizer.json is auto-discovered under <checkpoint>/tokenizer/.
-    // For single-file mode, the user must pass --tokenizer.
-    let tok_l_path = match (&weight_src, &tokenizer_path) {
-        (_, Some(p)) => p.clone(),
-        (WeightSrc::Folder(root), None) => root.join("tokenizer").join("tokenizer.json"),
-        (WeightSrc::Single(_), None) => {
-            eprintln!("--single-file requires --tokenizer FILE.json (the CLIP tokenizer.json)");
-            eprintln!("(typically downloaded alongside the checkpoint, or from any matching SD repo)");
-            return ExitCode::FAILURE;
-        }
-    };
-    let tok_l = match CLIPTokenizer::from_file(&tok_l_path) {
-        Ok(t) => t,
-        Err(e) => { eprintln!("CLIP-L tokenizer load: {e}"); return ExitCode::FAILURE; }
-    };
+    // Loading + tokenizer construction is fully owned by SdResidents above.
 
     // Per-prompt loop. Single-shot mode runs once and exits; --repl loops
     // reading prompts from stdin and auto-naming outputs `img_NNN.png`.
@@ -678,7 +669,26 @@ fn main() -> ExitCode {
     if repl {
         eprintln!("\nREPL mode: type a prompt and press Enter. Empty line, 'exit', 'quit', or Ctrl-D to stop.");
         eprintln!("Inline overrides: `your prompt :: --steps 30 --cfg-scale 5 --seed 7 --batch 4 --out img.png`");
+        eprintln!("Esc during generation aborts the current batch. Ctrl-C exits the app.");
     }
+    // rustyline editor — gives arrow-key in-line editing, ctrl-a/e, history
+    // recall (up/down). History stays in-memory unless --save-history was
+    // passed; on early errors the editor is simply not used.
+    let mut rl: Option<DefaultEditor> = if repl {
+        match DefaultEditor::new() {
+            Ok(mut ed) => {
+                if let Some(p) = &save_history_path {
+                    // Best-effort load; missing file is fine on first run.
+                    let _ = ed.load_history(p);
+                }
+                Some(ed)
+            }
+            Err(e) => {
+                eprintln!("(rustyline init failed: {e}; falling back to stdin read_line)");
+                None
+            }
+        }
+    } else { None };
     // `last_repl_line` lets a blank REPL line repeat the previous prompt.
     let mut last_repl_line: Option<String> = None;
     let exit_code: ExitCode = 'main: loop {
@@ -693,16 +703,47 @@ fn main() -> ExitCode {
         } else if !repl {
             break 'main ExitCode::SUCCESS;
         } else {
-            use std::io::Write;
-            eprint!("\nprompt> ");
-            std::io::stderr().flush().ok();
-            let mut line = String::new();
-            match std::io::stdin().read_line(&mut line) {
-                Ok(0) | Err(_) => break 'main ExitCode::SUCCESS,
-                Ok(_) => {}
-            }
-            let raw = line.trim().to_string();
+            // Read one prompt line. Prefer rustyline (arrow keys, history,
+            // ctrl-a/e); fall back to plain stdin if the editor failed to
+            // initialise (e.g. non-TTY, exotic terminal).
+            let raw: String = if let Some(ed) = rl.as_mut() {
+                match ed.readline("\nprompt> ") {
+                    Ok(line) => {
+                        let trimmed = line.trim().to_string();
+                        if !trimmed.is_empty() {
+                            // Add to history (in-memory; persisted only if
+                            // --save-history is set, at exit).
+                            let _ = ed.add_history_entry(trimmed.as_str());
+                        }
+                        trimmed
+                    }
+                    Err(ReadlineError::Eof) | Err(ReadlineError::Interrupted) => {
+                        // Ctrl-D or Ctrl-C at the prompt → exit cleanly.
+                        if let (Some(ed), Some(p)) = (rl.as_mut(), save_history_path.as_ref()) {
+                            let _ = ed.save_history(p);
+                        }
+                        break 'main ExitCode::SUCCESS;
+                    }
+                    Err(e) => {
+                        eprintln!("(readline error: {e})");
+                        break 'main ExitCode::FAILURE;
+                    }
+                }
+            } else {
+                use std::io::Write;
+                eprint!("\nprompt> ");
+                std::io::stderr().flush().ok();
+                let mut line = String::new();
+                match std::io::stdin().read_line(&mut line) {
+                    Ok(0) | Err(_) => break 'main ExitCode::SUCCESS,
+                    Ok(_) => {}
+                }
+                line.trim().to_string()
+            };
             if matches!(raw.as_str(), "exit" | "quit" | ":q") {
+                if let (Some(ed), Some(p)) = (rl.as_mut(), save_history_path.as_ref()) {
+                    let _ = ed.save_history(p);
+                }
                 break 'main ExitCode::SUCCESS;
             }
             // Empty line repeats the previous prompt (overrides and all).
@@ -758,58 +799,50 @@ fn main() -> ExitCode {
                 neg={:?}, seed={:?})", negative_prompt, iter_seed_pin);
         }
 
-        let ids_l = match tok_l.encode_padded(&prompt) {
-        Ok(v) => v,
-        Err(e) => { eprintln!("CLIP-L encode: {e}"); if repl { continue 'main; } break 'main ExitCode::FAILURE; }
-    };
-    eprintln!("CLIP-L tokens: {} (first 12: {:?})", ids_l.len(), &ids_l[..12.min(ids_l.len())]);
-    // Find the position of the first 49407 (EOS terminator) — everything
-    // after it is pad. If padding starts at position 1, CLIP-L tokenizer
-    // produced no content tokens (suspicious unless prompt is empty).
-    let l_eos = ids_l.iter().position(|&t| t == 49407).unwrap_or(ids_l.len());
-    eprintln!("  CLIP-L content length: {l_eos} tokens (excl. BOS, before pad)");
-    let ids_g: Vec<u32> = if matches!(variant, SDVariant::Sdxl) {
-        let tok_g_path: Option<PathBuf> = match (&weight_src, &tokenizer_2_path) {
-            (_, Some(p)) => Some(p.clone()),
-            (WeightSrc::Folder(root), None) => Some(root.join("tokenizer_2").join("tokenizer.json")),
-            (WeightSrc::Single(_), None) => {
-                eprintln!("(SDXL detected but no --tokenizer-2; reusing CLIP-L ids for CLIP-G)");
-                None
-            }
+        // Long-prompt chunked tokenization. CLIP can only consume 77 tokens
+        // per forward (architectural — position_embedding has 77 rows).
+        // For prompts that tokenize to >75 content tokens we split into
+        // chunks of 77 (BOS + ≤75 content + EOS + pad) and concat the
+        // resulting hidden states along the sequence axis. Both encoders
+        // must produce the same number of chunks so cross-attention sees
+        // a single coherent sequence.
+        let chunks_l: Vec<Vec<u32>> = match tok_l.encode_chunks(&prompt) {
+            Ok(v) => v,
+            Err(e) => { eprintln!("CLIP-L encode: {e}"); if repl { continue 'main; } break 'main ExitCode::FAILURE; }
         };
-        match tok_g_path {
-            Some(p) => match CLIPTokenizer::from_file(&p) {
-                Ok(t) => {
-                    // SDXL CLIP-G pads with token id 0, NOT 49407 (EOS) — see
-                    // ComfyUI sdxl_clip.py SDXLClipGTokenizer(pad_with_end=False).
-                    let pad_g = if matches!(variant, SDVariant::Sdxl) { 0u32 } else { 49407u32 };
-                    t.encode_padded_with(&prompt, pad_g).unwrap_or_else(|_| ids_l.clone())
+        let n_chunks = chunks_l.len();
+        eprintln!("CLIP-L: {n_chunks} chunk(s) × 77 tokens (first chunk preview: {:?})",
+            &chunks_l[0][..12.min(chunks_l[0].len())]);
+        let chunks_g: Vec<Vec<u32>> = if matches!(variant, SDVariant::Sdxl) {
+            match tok_g.as_ref() {
+                Some(t) => {
+                    // CLIP-G pads with id 0 (ComfyUI sdxl_clip.py).
+                    match t.encode_chunks_with(&prompt, 0) {
+                        Ok(c) => {
+                            if c.len() != n_chunks {
+                                eprintln!("(⚠ CLIP-G produced {} chunks, CLIP-L {} — falling back \
+                                    to CLIP-L chunks)", c.len(), n_chunks);
+                                chunks_l.clone()
+                            } else { c }
+                        }
+                        Err(_) => chunks_l.clone(),
+                    }
                 }
-                Err(_) => {
-                    eprintln!("(no tokenizer_2 found; reusing CLIP-L ids for CLIP-G)");
-                    ids_l.clone()
+                None => {
+                    eprintln!("(no tokenizer_2 found; reusing CLIP-L chunks for CLIP-G)");
+                    chunks_l.clone()
                 }
-            },
-            None => ids_l.clone(),
-        }
-    } else {
-        ids_l.clone()
-    };
-    // CLIP-G is SDXL-only — skip the diagnostic for SD 1.5.
-    if matches!(variant, SDVariant::Sdxl) {
-        eprintln!("CLIP-G tokens: {} (first 12: {:?})", ids_g.len(), &ids_g[..12.min(ids_g.len())]);
-        if ids_g == ids_l {
-            eprintln!("  ⚠ CLIP-G ids identical to CLIP-L (no separate tokenizer_2). For SDXL,");
-            eprintln!("    CLIP-G should pad with id=0; CLIP-L pads with id=49407. Without a");
-            eprintln!("    proper tokenizer_2, CLIP-G is fed CLIP-L's EOS-padded ids and produces");
-            eprintln!("    out-of-distribution hidden states → cross-attention is degenerate.");
+            }
         } else {
-            let g_pad_count = ids_g.iter().rev().take_while(|&&t| t == 0).count();
-            let l_pad_count = ids_l.iter().rev().take_while(|&&t| t == 49407).count();
-            eprintln!("  CLIP-G uses pad=0 ({g_pad_count} pads); CLIP-L uses pad=49407 ({l_pad_count} pads)");
+            chunks_l.clone()
+        };
+        if matches!(variant, SDVariant::Sdxl) {
+            eprintln!("CLIP-G: {} chunk(s) × 77 tokens", chunks_g.len());
+            if n_chunks > 1 {
+                eprintln!("  (long prompt — embedding sequence axis will be {}×77 = {})",
+                    n_chunks, n_chunks * 77);
+            }
         }
-    }
-    let placeholder_ids = ids_l;
 
     // Helper: print min/max/mean-abs/finite-count for a tensor.
     fn stats(name: &str, x: &[f32]) {
@@ -825,27 +858,53 @@ fn main() -> ExitCode {
                   x.len());
     }
 
-    // Encode the conditional (positive) prompt.
-    let (text_emb, pooled_g) = match variant {
+    // Encode the conditional (positive) prompt via chunked forward.
+    // For ≤75-content-token prompts this is identical to the old single-
+    // chunk path. For longer prompts the result is a longer sequence
+    // axis ([n_chunks × 77, hidden]) that the UNet cross-attention
+    // consumes natively (no length cap on the attention side).
+    let (mut text_emb, pooled_g) = match variant {
         SDVariant::Sdxl => {
             match &dual {
-                Some(d) => {
-                    let r = d.forward(&placeholder_ids, &ids_g);
-                    match r {
-                        Ok((emb, p)) => (emb, Some(p)),
-                        Err(e) => { eprintln!("text encode: {e}"); if repl { continue 'main; } break 'main ExitCode::FAILURE; }
-                    }
-                }
+                Some(d) => match d.forward_chunked(&chunks_l, &chunks_g) {
+                    Ok((emb, p)) => (emb, Some(p)),
+                    Err(e) => { eprintln!("text encode: {e}"); if repl { continue 'main; } break 'main ExitCode::FAILURE; }
+                },
                 None => { eprintln!("SDXL detected but no dual encoder"); if repl { continue 'main; } break 'main ExitCode::FAILURE; }
             }
         }
         _ => {
-            match text_l.forward(&placeholder_ids) {
+            // SD 1.5: CLIP-L final hidden (matches the original `forward()`
+            // which calls `forward_layers(ids, None)`).
+            match text_l.forward_chunked(&chunks_l, None) {
                 Ok(emb) => (emb, None),
                 Err(e) => { eprintln!("text encode: {e}"); if repl { continue 'main; } break 'main ExitCode::FAILURE; }
             }
         }
     };
+
+    // ===== Per-user CLIP-space steering bias =====
+    // Read once, broadcast-add to every position of the cond embedding.
+    // Uncond stays unbiased on purpose — biasing both makes CFG cancel
+    // the contribution and the user's feedback signal vanishes.
+    if let Some(p) = &cond_bias_path {
+        let cad = cfg.unet.cross_attention_dim;
+        match read_f32_bin(p) {
+            Ok(bias) if bias.len() == cad => {
+                let positions = text_emb.len() / cad;
+                for i in 0..positions {
+                    let row = &mut text_emb[i * cad .. (i + 1) * cad];
+                    for (h, b) in row.iter_mut().zip(bias.iter()) { *h += *b; }
+                }
+                eprintln!("[cond-bias] applied {}-d bias to {} positions", cad, positions);
+            }
+            Ok(bias) => {
+                eprintln!("[cond-bias] WARNING: file has {} floats, expected {} (cross_attention_dim) — skipping",
+                          bias.len(), cad);
+            }
+            Err(e) => eprintln!("[cond-bias] WARNING: read {}: {e} — skipping", p.display()),
+        }
+    }
 
     eprintln!("text encode complete:");
     stats("  text_emb (cond)", &text_emb);
@@ -857,41 +916,49 @@ fn main() -> ExitCode {
     // essentially noise.
     let do_cfg = cfg_scale > 1.0 + 1e-6;
     let (text_emb_uncond, pooled_g_uncond) = if do_cfg {
-        let neg_ids_l = match tok_l.encode_padded(&negative_prompt) {
+        // Chunk the negative prompt, then pad to the positive's chunk
+        // count so cross-attention sees identical sequence lengths for
+        // cond vs uncond (CFG requires matched shapes). Padding chunks
+        // are EOS-stuffed empty chunks — what an empty prompt encodes to.
+        let mut neg_chunks_l = match tok_l.encode_chunks(&negative_prompt) {
             Ok(v) => v,
             Err(e) => { eprintln!("CLIP-L encode (neg): {e}"); if repl { continue 'main; } break 'main ExitCode::FAILURE; }
         };
-        let neg_ids_g: Vec<u32> = if matches!(variant, SDVariant::Sdxl) {
-            // Reuse same tokenizer-2 path resolution as the positive branch.
-            let tok_g_path: Option<PathBuf> = match (&weight_src, &tokenizer_2_path) {
-                (_, Some(p)) => Some(p.clone()),
-                (WeightSrc::Folder(root), None) => Some(root.join("tokenizer_2").join("tokenizer.json")),
-                (WeightSrc::Single(_), None) => None,
-            };
-            match tok_g_path {
-                Some(p) => match CLIPTokenizer::from_file(&p) {
-                    Ok(t) => {
-                        let pad_g = if matches!(variant, SDVariant::Sdxl) { 0u32 } else { 49407u32 };
-                        t.encode_padded_with(&negative_prompt, pad_g).unwrap_or_else(|_| neg_ids_l.clone())
+        let empty_l = tok_l.encode_chunks("").unwrap_or_else(|_| vec![]);
+        while neg_chunks_l.len() < n_chunks {
+            neg_chunks_l.push(empty_l[0].clone());
+        }
+        neg_chunks_l.truncate(n_chunks);
+
+        let neg_chunks_g: Vec<Vec<u32>> = if matches!(variant, SDVariant::Sdxl) {
+            match tok_g.as_ref() {
+                Some(t) => {
+                    let mut c = t.encode_chunks_with(&negative_prompt, 0)
+                        .unwrap_or_else(|_| neg_chunks_l.clone());
+                    let empty_g = t.encode_chunks_with("", 0).unwrap_or_else(|_| vec![]);
+                    while c.len() < n_chunks && !empty_g.is_empty() {
+                        c.push(empty_g[0].clone());
                     }
-                    Err(_) => neg_ids_l.clone(),
-                },
-                None => neg_ids_l.clone(),
+                    c.truncate(n_chunks);
+                    if c.len() != n_chunks { neg_chunks_l.clone() } else { c }
+                }
+                None => neg_chunks_l.clone(),
             }
         } else {
-            neg_ids_l.clone()
+            neg_chunks_l.clone()
         };
+
         match variant {
             SDVariant::Sdxl => {
                 match &dual {
-                    Some(d) => match d.forward(&neg_ids_l, &neg_ids_g) {
+                    Some(d) => match d.forward_chunked(&neg_chunks_l, &neg_chunks_g) {
                         Ok((e, p)) => (Some(e), Some(p)),
                         Err(e) => { eprintln!("uncond text encode: {e}"); if repl { continue 'main; } break 'main ExitCode::FAILURE; }
                     },
                     None => { eprintln!("SDXL but no dual encoder"); if repl { continue 'main; } break 'main ExitCode::FAILURE; }
                 }
             }
-            _ => match text_l.forward(&neg_ids_l) {
+            _ => match text_l.forward_chunked(&neg_chunks_l, None) {
                 Ok(emb) => (Some(emb), None),
                 Err(e) => { eprintln!("uncond text encode: {e}"); if repl { continue 'main; } break 'main ExitCode::FAILURE; }
             },
@@ -960,7 +1027,18 @@ fn main() -> ExitCode {
     // Batch loop: same prompt, varied seed → distinct images. When
     // `iter_batch == 1` this runs exactly once and the original
     // `iter_out_path` is used as-is.
+    //
+    // EscAbort watches stdin in raw mode for the entire batch. Press Esc
+    // to break out between (or during) images; Ctrl-C also exits the app.
+    // Lifetime spans only the batch — rustyline regains the terminal at
+    // the next prompt iteration.
+    let abort = EscAbort::start();
     for batch_i in 0..iter_batch {
+        if abort.aborted() {
+            eraw_println!("(esc) aborted after {} of {} images",
+                batch_i, iter_batch);
+            break;
+        }
         let seed = base_seed.wrapping_add(batch_i as u64);
         let out_path = if iter_batch <= 1 {
             iter_out_path.clone()
@@ -972,10 +1050,10 @@ fn main() -> ExitCode {
             parent.join(format!("{stem}_{batch_i}.{ext}"))
         };
         if iter_batch > 1 {
-            eprintln!("\n--- batch {}/{iter_batch} (seed={seed}) → {} ---",
+            eraw_println!("--- batch {}/{iter_batch} (seed={seed}) → {} ---",
                 batch_i + 1, out_path.display());
         } else {
-            eprintln!("seed for this iteration: {seed}");
+            eraw_println!("seed for this iteration: {seed}");
         }
     // ===== Inpainting / img2img setup =====
     // When --input is set, VAE-encode it as the starting x_0, downscale
@@ -1232,6 +1310,13 @@ fn main() -> ExitCode {
     for (step_idx, &t) in scheduler.timesteps().to_vec().iter().enumerate() {
         // Inpainting / img2img: skip the high-noise steps (sigma > start σ).
         if step_idx < effective_start_step { continue; }
+        // Cooperative cancellation: drop the rest of this image if the
+        // user pressed Esc. The batch loop's check above will then exit
+        // before starting the next image.
+        if abort.aborted() {
+            eraw_println!("(esc) abort mid-image at step {step_idx}/{total_steps}");
+            break;
+        }
         let step_start = std::time::Instant::now();
         let t_f = t as f32;
 
@@ -1511,13 +1596,25 @@ fn main() -> ExitCode {
     eprintln!("  (vae_output is the f32 image in [-1,1] convention; PNG conversion clips:");
     eprintln!("   black = vae output ≤ -1.0, white = vae output ≥ +1.0)");
 
-    if let Err(e) = save_png(&img, img_h, img_w, &out_path) {
-        eprintln!("save PNG: {e}");
+    if abort.aborted() {
+        // Don't save a partial result if the denoise loop broke early.
+        eraw_println!("(esc) skipping save of partial image");
+    } else if let Err(e) = save_png(&img, img_h, img_w, &out_path) {
+        eraw_println!("save PNG: {e}");
         if repl { continue 'main; } break 'main ExitCode::FAILURE;
+    } else {
+        eraw_println!("wrote {}", out_path.display());
     }
-    eprintln!("wrote {}", out_path.display());
     let _ = batch_i; // satisfy borrow-checker for the rare unused-warning case
     } // end 'batch loop
+    let quit_now = abort.quit_requested();
+    drop(abort); // restore terminal mode BEFORE we either exit or re-enter rustyline
+    if quit_now {
+        if let (Some(ed), Some(p)) = (rl.as_mut(), save_history_path.as_ref()) {
+            let _ = ed.save_history(p);
+        }
+        break 'main ExitCode::from(130);
+    }
     // End of per-prompt iteration. The 'main loop continues — in single-shot
     // mode it'll exit on next iteration; in --repl it reads next prompt.
     }; // close 'main: loop

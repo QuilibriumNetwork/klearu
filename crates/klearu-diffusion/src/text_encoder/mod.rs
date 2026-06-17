@@ -255,6 +255,39 @@ impl CLIPTextModel {
     }
 }
 
+impl CLIPTextModel {
+    /// Long-prompt chunked forward. Runs each chunk independently through
+    /// the model and concatenates the resulting hidden states along the
+    /// sequence axis. Each chunk must be `max_position_embeddings` long
+    /// (typically 77). Returns `[chunks.len() * max_position, hidden]`.
+    pub fn forward_chunked(
+        &self,
+        chunks: &[Vec<u32>],
+        return_layer_index: Option<usize>,
+    ) -> Result<Vec<f32>> {
+        if chunks.is_empty() {
+            return Err(DiffusionError::ShapeMismatch {
+                expected: "≥1 chunk".into(),
+                got: "0".into(),
+            });
+        }
+        let h = self.config.hidden_size;
+        let seq = self.config.max_position_embeddings;
+        let mut out = Vec::with_capacity(chunks.len() * seq * h);
+        for chunk in chunks {
+            let part = self.forward_layers(chunk, return_layer_index)?;
+            if part.len() != seq * h {
+                return Err(DiffusionError::ShapeMismatch {
+                    expected: format!("{seq}*{h} = {} f32 per chunk", seq * h),
+                    got: format!("{}", part.len()),
+                });
+            }
+            out.extend_from_slice(&part);
+        }
+        Ok(out)
+    }
+}
+
 /// SDXL dual encoder: CLIP-L (text_encoder) + CLIP-G (text_encoder_2).
 /// Returns concatenated hidden states + CLIP-G pooled embedding.
 pub struct SDXLDualTextEncoder {
@@ -301,6 +334,64 @@ impl SDXLDualTextEncoder {
         for i in 0..nl {
             out[i * total..i * total + dl].copy_from_slice(&h_l[i * dl..(i + 1) * dl]);
             out[i * total + dl..i * total + total].copy_from_slice(&h_g[i * dg..(i + 1) * dg]);
+        }
+        Ok((out, pooled_g))
+    }
+
+    /// Chunked dual forward for long prompts.
+    ///
+    /// Both encoders share the same BPE tokenizer (vocab 49408), so the
+    /// caller passes one chunk list per encoder — typically `chunks_l`
+    /// padded with EOS=49407, `chunks_g` padded with id=0 per SDXL
+    /// convention. The two lists MUST have the same length; the caller
+    /// is responsible for matching them (chunk both prompts through the
+    /// same tokenizer with identical chunk boundaries).
+    ///
+    /// Returns:
+    ///   - concat_hidden: `[chunks * 77, 2048]` (CLIP-L 768 + CLIP-G 1280)
+    ///   - pooled_g: `[1280]` from the **first chunk only** (Comfy convention —
+    ///     the most semantically important content is at the front).
+    pub fn forward_chunked(
+        &self,
+        chunks_l: &[Vec<u32>],
+        chunks_g: &[Vec<u32>],
+    ) -> Result<(Vec<f32>, Vec<f32>)> {
+        if chunks_l.len() != chunks_g.len() {
+            return Err(DiffusionError::ShapeMismatch {
+                expected: "chunks_l.len() == chunks_g.len()".into(),
+                got: format!("L={}, G={}", chunks_l.len(), chunks_g.len()),
+            });
+        }
+        if chunks_l.is_empty() {
+            return Err(DiffusionError::ShapeMismatch {
+                expected: "≥1 chunk".into(),
+                got: "0".into(),
+            });
+        }
+        let penult_l = self.clip_l.config.num_hidden_layers.saturating_sub(2);
+        let penult_g = self.clip_g.config.num_hidden_layers.saturating_sub(2);
+
+        let h_l = self.clip_l.forward_chunked(chunks_l, Some(penult_l))?;
+        let h_g = self.clip_g.forward_chunked(chunks_g, Some(penult_g))?;
+        // Pooled CLIP-G from the first chunk only.
+        let pooled_g = self.clip_g.pooled_forward(&chunks_g[0])?;
+
+        let dl = self.clip_l.config.hidden_size;
+        let dg = self.clip_g.config.hidden_size;
+        let n = h_l.len() / dl;
+        let ng = h_g.len() / dg;
+        if n != ng {
+            return Err(DiffusionError::ShapeMismatch {
+                expected: "CLIP-L and CLIP-G sequence lengths".into(),
+                got: format!("L={n}, G={ng}"),
+            });
+        }
+        let total = dl + dg;
+        let mut out = vec![0.0f32; n * total];
+        for i in 0..n {
+            out[i * total..i * total + dl].copy_from_slice(&h_l[i * dl..(i + 1) * dl]);
+            out[i * total + dl..i * total + total]
+                .copy_from_slice(&h_g[i * dg..(i + 1) * dg]);
         }
         Ok((out, pooled_g))
     }

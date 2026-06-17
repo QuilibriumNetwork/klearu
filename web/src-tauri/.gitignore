@@ -1,0 +1,7 @@
+# Tauri build artifacts
+/target/
+/gen/schemas/
+WixTools/
+
+# Generated icons can be regenerated with `cargo tauri icon`
+# (committed icon.png is the source of truth)

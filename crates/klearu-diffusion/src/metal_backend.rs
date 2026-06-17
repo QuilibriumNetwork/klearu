@@ -432,6 +432,75 @@ kernel void elementwise_add_f16(
     a[gid] = bfloat(float(a[gid]) + float(b[gid]));
 }
 
+// In-place element-wise multiply: a[i] *= b[i] (used for SwiGLU silu(g)*up).
+kernel void elementwise_mul_f16(
+    device bfloat*       a [[buffer(0)]],
+    device const bfloat* b [[buffer(1)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    a[gid] = bfloat(float(a[gid]) * float(b[gid]));
+}
+
+// RMSNorm over the last `dim` of each row, scaled by `weight[dim]`. One thread
+// per row; fp32 accumulation. Handles per-token (dim=hidden) and per-head
+// q/k-norm (dim=head_dim, n_rows = n*heads). In place.
+kernel void rms_norm_f16(
+    device bfloat*       x      [[buffer(0)]],   // [n_rows, dim]
+    device const bfloat* weight [[buffer(1)]],   // [dim]
+    constant uint&       dim    [[buffer(2)]],
+    constant float&      eps    [[buffer(3)]],
+    uint row [[thread_position_in_grid]]
+) {
+    uint base = row * dim;
+    float ss = 0.0;
+    for (uint i = 0; i < dim; ++i) { float v = float(x[base + i]); ss += v * v; }
+    float inv = rsqrt(ss / float(dim) + eps);
+    for (uint i = 0; i < dim; ++i) {
+        x[base + i] = bfloat(float(x[base + i]) * inv * float(weight[i]));
+    }
+}
+
+// Apply rotary position embedding to x[n, num_heads, head_dim] using cos/sin
+// tables [n, head_dim] (rotate_half convention). One thread per (token, head).
+kernel void rope_apply_f16(
+    device bfloat*       x   [[buffer(0)]],   // [n, num_heads, head_dim]
+    device const bfloat* cosb [[buffer(1)]],  // [n, head_dim]
+    device const bfloat* sinb [[buffer(2)]],  // [n, head_dim]
+    constant uint&       num_heads [[buffer(3)]],
+    constant uint&       head_dim  [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]      // in [0, n*num_heads)
+) {
+    uint t = gid / num_heads;
+    uint hd2 = head_dim / 2;
+    uint base = gid * head_dim;
+    uint cbase = t * head_dim;
+    for (uint i = 0; i < hd2; ++i) {
+        float a = float(x[base + i]);
+        float b = float(x[base + hd2 + i]);
+        float ci = float(cosb[cbase + i]);
+        float si = float(sinb[cbase + i]);
+        float ch = float(cosb[cbase + hd2 + i]);
+        float sh = float(sinb[cbase + hd2 + i]);
+        x[base + i]       = bfloat(a * ci - b * si);
+        x[base + hd2 + i] = bfloat(b * ch + a * sh);
+    }
+}
+
+// Grouped-query repeat: in[nkv, block] -> out[nh, block], out[h] = in[h/nrep].
+// `block` = n*head_dim. One thread per output element.
+kernel void gqa_repeat_f16(
+    device const bfloat* inp [[buffer(0)]],   // [nkv, block]
+    device bfloat*       out [[buffer(1)]],   // [nh,  block]
+    constant uint&       nrep  [[buffer(2)]],
+    constant uint&       block [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint h = gid / block;
+    uint rest = gid % block;
+    uint kv_h = h / nrep;
+    out[gid] = inp[kv_h * block + rest];
+}
+
 // Scaled element-wise add: a[i] += scale * b[i]. Used by the ControlNet
 // residual injection so a non-1.0 controlnet_weight applies on the Metal
 // residence path. With scale=1.0 it's equivalent to elementwise_add_f16
@@ -1282,6 +1351,75 @@ kernel void rms_norm(
         x[row_off + i] = x[row_off + i] * inv_rms * gamma[i];
     }
 }
+
+// Temporal reshape: [B*F, C, H, W] (NCHW) -> [B*H*W, F, C].
+// One thread per output element.
+kernel void temporal_reshape_to_f16(
+    device bfloat*     src     [[buffer(0)]],
+    device bfloat*     dst     [[buffer(1)]],
+    constant uint&     batch   [[buffer(2)]],
+    constant uint&     frames  [[buffer(3)]],
+    constant uint&     c       [[buffer(4)]],
+    constant uint&     h       [[buffer(5)]],
+    constant uint&     w       [[buffer(6)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint hw = h * w;
+    uint fc = frames * c;
+    uint bhw_idx = gid / fc;
+    uint pos_fc = gid % fc;
+    uint fi = pos_fc / c;
+    uint ci = pos_fc % c;
+    uint bi = bhw_idx / hw;
+    uint pos_hw = bhw_idx % hw;
+    uint hi = pos_hw / w;
+    uint wi = pos_hw % w;
+    uint src_n = bi * frames + fi;
+    dst[gid] = src[src_n * c * hw + ci * hw + hi * w + wi];
+}
+
+// Inverse temporal reshape: [B*H*W, F, C] -> [B*F, C, H, W].
+kernel void temporal_reshape_from_f16(
+    device bfloat*     src     [[buffer(0)]],
+    device bfloat*     dst     [[buffer(1)]],
+    constant uint&     batch   [[buffer(2)]],
+    constant uint&     frames  [[buffer(3)]],
+    constant uint&     c       [[buffer(4)]],
+    constant uint&     h       [[buffer(5)]],
+    constant uint&     w       [[buffer(6)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint hw = h * w;
+    uint chw = c * hw;
+    uint bf_idx = gid / chw;
+    uint pos_chw = gid % chw;
+    uint ci = pos_chw / hw;
+    uint pos_hw = pos_chw % hw;
+    uint hi = pos_hw / w;
+    uint wi = pos_hw % w;
+    uint bi = bf_idx / frames;
+    uint fi = bf_idx % frames;
+    uint bhw_idx = bi * hw + hi * w + wi;
+    uint fc = frames * c;
+    dst[gid] = src[bhw_idx * fc + fi * c + ci];
+}
+
+// Add positional embedding: x[n_seq * f * d] += pe[f * d], broadcast across n_seq.
+kernel void pos_embed_add_f16(
+    device bfloat*       x       [[buffer(0)]],
+    device bfloat*       pe      [[buffer(1)]],
+    constant uint&       frames  [[buffer(2)]],
+    constant uint&       max_f   [[buffer(3)]],
+    constant uint&       d       [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint fd = frames * d;
+    uint fi = (gid % fd) / d;
+    uint di = gid % d;
+    if (fi < max_f) {
+        x[gid] = bfloat(float(x[gid]) + float(pe[fi * d + di]));
+    }
+}
 "#;
 
 struct MetalBackend {
@@ -1303,6 +1441,10 @@ struct MetalBackend {
     gelu_f16_pipe: ComputePipelineState,
     quick_gelu_f16_pipe: ComputePipelineState,
     eadd_f16_pipe: ComputePipelineState,
+    emul_f16_pipe: ComputePipelineState,
+    rms_norm_f16_pipe: ComputePipelineState,
+    rope_apply_f16_pipe: ComputePipelineState,
+    gqa_repeat_f16_pipe: ComputePipelineState,
     eadd_scaled_f16_pipe: ComputePipelineState,
     layernorm_f16_pipe: ComputePipelineState,
     layernorm_f16_out_pipe: ComputePipelineState,
@@ -1325,6 +1467,9 @@ struct MetalBackend {
     geglu_split_pipe: ComputePipelineState,
     nchw_to_nhwc_pipe: ComputePipelineState,
     nhwc_to_nchw_pipe: ComputePipelineState,
+    temporal_reshape_to_pipe: ComputePipelineState,
+    temporal_reshape_from_pipe: ComputePipelineState,
+    pos_embed_add_pipe: ComputePipelineState,
 }
 
 unsafe impl Send for MetalBackend {}
@@ -1363,6 +1508,10 @@ fn get_metal() -> &'static MetalBackend {
             gelu_f16_pipe: make_pipe("gelu_f16"),
             quick_gelu_f16_pipe: make_pipe("quick_gelu_f16"),
             eadd_f16_pipe: make_pipe("elementwise_add_f16"),
+            emul_f16_pipe: make_pipe("elementwise_mul_f16"),
+            rms_norm_f16_pipe: make_pipe("rms_norm_f16"),
+            rope_apply_f16_pipe: make_pipe("rope_apply_f16"),
+            gqa_repeat_f16_pipe: make_pipe("gqa_repeat_f16"),
             eadd_scaled_f16_pipe: make_pipe("elementwise_add_scaled_f16"),
             layernorm_f16_pipe: make_pipe("layer_norm_f16"),
             layernorm_f16_out_pipe: make_pipe("layer_norm_f16_out"),
@@ -1385,6 +1534,9 @@ fn get_metal() -> &'static MetalBackend {
             geglu_split_pipe: make_pipe("geglu_split_f16"),
             nchw_to_nhwc_pipe: make_pipe("nchw_to_nhwc_f16"),
             nhwc_to_nchw_pipe: make_pipe("nhwc_to_nchw_f16"),
+            temporal_reshape_to_pipe: make_pipe("temporal_reshape_to_f16"),
+            temporal_reshape_from_pipe: make_pipe("temporal_reshape_from_f16"),
+            pos_embed_add_pipe: make_pipe("pos_embed_add_f16"),
             device,
             queue,
         }
@@ -1468,6 +1620,7 @@ thread_local! {
     /// where some activations grow to ~23K and MPS-f16-output overflow
     /// produces Inf → NaN in the final image.
     static USE_F32_SGEMM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FORCE_FLASH_ATTN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Switch the MPS sgemm wrapper to the f32-precision path. Call before
@@ -1477,15 +1630,33 @@ pub fn set_use_f32_sgemm(v: bool) {
     USE_F32_SGEMM.with(|c| c.set(v));
 }
 
+/// Force all SDPA to use flash attention (bypass MPSGraph). MPSGraph's
+/// SDPA calls `flush()` internally to create its own command buffer,
+/// which disrupts the caller's open batch and causes NaN in the
+/// per-block video forward path. Flash attention dispatches via
+/// `with_cmd` and stays within the caller's batch.
+pub fn set_force_flash_attn(v: bool) {
+    FORCE_FLASH_ATTN.with(|c| c.set(v));
+}
+
+pub fn force_flash_attn() -> bool {
+    FORCE_FLASH_ATTN.with(|c| c.get())
+}
+
 /// Open a "batch" — subsequent kernel dispatches and MPS sgemms append to
 /// a single shared command buffer, committed at the next `flush()`.
 /// Idempotent if a batch is already open.
+/// Counter for labeling command buffers (diagnostic).
+pub static CMD_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub fn begin_batch() {
     CURRENT_CMD.with(|c| {
         let mut bw = c.borrow_mut();
         if bw.is_none() {
             let backend = get_metal();
             let cmd = backend.queue.new_command_buffer().to_owned();
+            let id = CMD_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            cmd.set_label(&format!("klearu-batch-{id}"));
             *bw = Some(cmd);
         }
     });
@@ -1534,7 +1705,6 @@ fn commit_async(cmd: &metal::CommandBufferRef) {
 /// may have been touched by an async-committed kernel. If a batch is open,
 /// commits and clears it first.
 pub fn flush() {
-    // Commit and clear any open batch.
     CURRENT_CMD.with(|c| {
         if let Some(cmd) = c.borrow_mut().take() {
             cmd.commit();
@@ -1550,6 +1720,65 @@ pub fn flush() {
             c.set(0);
         }
     });
+}
+
+/// Start a GPU trace capture to a `.gputrace` file. Requires
+/// `METAL_CAPTURE_ENABLED=1` in the environment. The trace can be
+/// opened in Xcode → Open Developer Tool → Metal System Trace, or
+/// just double-click the `.gputrace` bundle.
+pub fn gpu_capture_start(path: &str) {
+    unsafe {
+        let mgr_cls = AnyClass::get("MTLCaptureManager").expect("MTLCaptureManager");
+        let mgr: *mut AnyObject = msg_send![mgr_cls, sharedCaptureManager];
+        let desc_cls = AnyClass::get("MTLCaptureDescriptor").expect("MTLCaptureDescriptor");
+        let desc: *mut AnyObject = msg_send![desc_cls, alloc];
+        let desc: *mut AnyObject = msg_send![desc, init];
+        let backend = get_metal();
+        use metal::foreign_types::ForeignType;
+        let dev_ptr: *mut AnyObject = ForeignType::as_ptr(&backend.device) as *mut AnyObject;
+        let _: () = msg_send![desc, setCaptureObject: dev_ptr];
+        // destination = 2 = MTLCaptureDestinationGPUTraceDocument
+        let _: () = msg_send![desc, setDestination: 2usize];
+        let nsstring_cls = AnyClass::get("NSString").unwrap();
+        let path_ns: *mut AnyObject = msg_send![nsstring_cls,
+            stringWithUTF8String: std::ffi::CString::new(path).unwrap().as_ptr()];
+        let url_cls = AnyClass::get("NSURL").unwrap();
+        let url: *mut AnyObject = msg_send![url_cls, fileURLWithPath: path_ns];
+        let _: () = msg_send![desc, setOutputURL: url];
+        let mut err: *mut AnyObject = std::ptr::null_mut();
+        let ok: bool = msg_send![mgr, startCaptureWithDescriptor: desc error: &mut err];
+        if !ok {
+            if !err.is_null() {
+                let reason: *mut AnyObject = msg_send![err, localizedDescription];
+                let utf8: *const u8 = msg_send![reason, UTF8String];
+                if !utf8.is_null() {
+                    let s = std::ffi::CStr::from_ptr(utf8 as *const _).to_string_lossy();
+                    eprintln!("[GPU CAPTURE] failed to start: {s}");
+                }
+            } else {
+                eprintln!("[GPU CAPTURE] failed to start (no error)");
+            }
+        } else {
+            eprintln!("[GPU CAPTURE] started → {path}");
+        }
+    }
+}
+
+/// Stop an active GPU trace capture.
+pub fn gpu_capture_stop() {
+    unsafe {
+        let mgr_cls = AnyClass::get("MTLCaptureManager").expect("MTLCaptureManager");
+        let mgr: *mut AnyObject = msg_send![mgr_cls, sharedCaptureManager];
+        let _: () = msg_send![mgr, stopCapture];
+        eprintln!("[GPU CAPTURE] stopped");
+    }
+}
+
+/// Drain the buffer pool, releasing all cached Metal buffers.
+/// Call between per-frame GPU dispatches in the video forward to
+/// prevent cross-frame buffer reuse within the pool.
+pub fn drain_pool() {
+    BUF_POOL.with_borrow_mut(|pool| pool.clear());
 }
 
 /// Return a buffer to the pool for reuse.
@@ -2775,6 +3004,30 @@ impl GpuTensor {
         Self { buffer, shape, dtype: GpuDtype::F16 }
     }
 
+    /// Upload f32 data as f16 using a FRESH Metal buffer allocation
+    /// (bypasses pool). Does NOT call `flush()` — safe to use within an
+    /// open `begin_batch()` window without breaking the batch. The
+    /// tradeoff: ~1µs allocation per call instead of pool reuse. Use
+    /// this when batching multiple frames' uploads + dispatches within
+    /// a single command buffer (the video forward path).
+    pub fn upload_f32_as_f16_fresh(shape: Vec<usize>, data: &[f32]) -> Self {
+        use half::bf16;
+        use half::slice::HalfFloatSliceExt;
+        let elements: usize = shape.iter().product();
+        debug_assert_eq!(elements, data.len());
+        let backend = get_metal();
+        let buffer = backend.device.new_buffer(
+            (elements * 2) as u64,
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+        unsafe {
+            let dst: *mut bf16 = buffer.contents() as *mut bf16;
+            let dst_slice: &mut [bf16] = std::slice::from_raw_parts_mut(dst, elements);
+            dst_slice.convert_from_f32_slice(data);
+        }
+        Self { buffer, shape, dtype: GpuDtype::F16 }
+    }
+
     /// Upload via the f16 weight cache. Use for inputs that are **stable
     /// across calls** (same pointer + same contents) like SD's text-embedding
     /// conditioning — uploaded once, reused for every step and every
@@ -2871,6 +3124,88 @@ pub fn eadd_f16_gpu(a: &mut GpuTensor, b: &GpuTensor) {
         enc.set_buffer(1, Some(&b.buffer), 0);
         let group = MTLSize::new(256, 1, 1);
         let grid = MTLSize::new(a.elements() as u64, 1, 1);
+        enc.dispatch_threads(grid, group);
+        enc.end_encoding();
+    });
+}
+
+/// In-place element-wise multiply `a[i] *= b[i]` (fp16 tensors, equal length).
+pub fn emul_f16_gpu(a: &mut GpuTensor, b: &GpuTensor) {
+    use metal::MTLSize;
+    debug_assert_eq!(a.elements(), b.elements());
+    let backend = get_metal();
+    with_cmd(|cmd| {
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&backend.emul_f16_pipe);
+        enc.set_buffer(0, Some(&a.buffer), 0);
+        enc.set_buffer(1, Some(&b.buffer), 0);
+        let group = MTLSize::new(256, 1, 1);
+        let grid = MTLSize::new(a.elements() as u64, 1, 1);
+        enc.dispatch_threads(grid, group);
+        enc.end_encoding();
+    });
+}
+
+/// In-place RMSNorm over the last `dim` of each of `n_rows` rows, scaled by
+/// the fp16 `weight` buffer `[dim]`. fp32 internal accumulation.
+pub fn rms_norm_f16_gpu(x: &mut GpuTensor, weight: &Buffer, n_rows: usize, dim: usize, eps: f32) {
+    use metal::MTLSize;
+    let backend = get_metal();
+    with_cmd(|cmd| {
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&backend.rms_norm_f16_pipe);
+        enc.set_buffer(0, Some(&x.buffer), 0);
+        enc.set_buffer(1, Some(weight), 0);
+        let d = dim as u32;
+        enc.set_bytes(2, 4, &d as *const _ as *const _);
+        enc.set_bytes(3, 4, &eps as *const _ as *const _);
+        let group = MTLSize::new(64, 1, 1);
+        let grid = MTLSize::new(n_rows as u64, 1, 1);
+        enc.dispatch_threads(grid, group);
+        enc.end_encoding();
+    });
+}
+
+/// In-place RoPE on `x[n, num_heads, head_dim]` using fp16 cos/sin buffers
+/// `[n, head_dim]` (rotate_half convention).
+pub fn rope_apply_f16_gpu(
+    x: &mut GpuTensor, cos: &Buffer, sin: &Buffer, n: usize, num_heads: usize, head_dim: usize,
+) {
+    use metal::MTLSize;
+    let backend = get_metal();
+    with_cmd(|cmd| {
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&backend.rope_apply_f16_pipe);
+        enc.set_buffer(0, Some(&x.buffer), 0);
+        enc.set_buffer(1, Some(cos), 0);
+        enc.set_buffer(2, Some(sin), 0);
+        let nh = num_heads as u32;
+        let hd = head_dim as u32;
+        enc.set_bytes(3, 4, &nh as *const _ as *const _);
+        enc.set_bytes(4, 4, &hd as *const _ as *const _);
+        let group = MTLSize::new(64, 1, 1);
+        let grid = MTLSize::new((n * num_heads) as u64, 1, 1);
+        enc.dispatch_threads(grid, group);
+        enc.end_encoding();
+    });
+}
+
+/// Grouped-query repeat: `inp[nkv, block]` → `out[nh, block]`, `out[h] =
+/// inp[h/nrep]`. `block = n*head_dim`.
+pub fn gqa_repeat_f16_gpu(inp: &GpuTensor, out: &mut GpuTensor, nrep: usize, block: usize) {
+    use metal::MTLSize;
+    let backend = get_metal();
+    with_cmd(|cmd| {
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&backend.gqa_repeat_f16_pipe);
+        enc.set_buffer(0, Some(&inp.buffer), 0);
+        enc.set_buffer(1, Some(&out.buffer), 0);
+        let r = nrep as u32;
+        let b = block as u32;
+        enc.set_bytes(2, 4, &r as *const _ as *const _);
+        enc.set_bytes(3, 4, &b as *const _ as *const _);
+        let group = MTLSize::new(256, 1, 1);
+        let grid = MTLSize::new(out.elements() as u64, 1, 1);
         enc.dispatch_threads(grid, group);
         enc.end_encoding();
     });
@@ -3540,10 +3875,10 @@ pub fn mpsgraph_sdpa_bf16_gpu(
     q: &GpuTensor, k: &GpuTensor, v: &GpuTensor, o: &mut GpuTensor,
     n: usize, h: usize, l_q: usize, l_kv: usize, d: usize, scale: f32,
 ) {
-    // Drain MPSGraph's transient Cocoa allocations (NSNumber shapes,
-    // NSArray feeds, MPSGraphTensorData wrappers, graph compilation
-    // intermediates) on each dispatch. Without this, ~1750 attention
-    // calls per generation accumulate GBs of autoreleased state.
+    if force_flash_attn() {
+        flash_attention_f16_gpu(q, k, v, o, n, h, l_q, l_kv, d, scale);
+        return;
+    }
     objc2::rc::autoreleasepool(|_| {
         mpsgraph_sdpa_bf16_gpu_inner(q, k, v, o, n, h, l_q, l_kv, d, scale)
     });
@@ -4420,6 +4755,84 @@ pub fn nhwc_to_nchw_f16_gpu(src: &GpuTensor, n: usize, c: usize, hw: usize) -> G
         enc.end_encoding();
     });
     dst
+}
+
+/// Temporal reshape: [B*F, C, H, W] → [B*H*W, F, C]. bf16.
+pub fn temporal_reshape_to_f16_gpu(
+    src: &GpuTensor, batch: usize, frames: usize, c: usize, h: usize, w: usize,
+) -> GpuTensor {
+    use metal::MTLSize;
+    debug_assert_eq!(src.dtype, GpuDtype::F16);
+    let dst = GpuTensor::new_f16(vec![batch * h * w, frames, c]);
+    let backend = get_metal();
+    with_cmd(|cmd| {
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&backend.temporal_reshape_to_pipe);
+        enc.set_buffer(0, Some(&src.buffer), 0);
+        enc.set_buffer(1, Some(&dst.buffer), 0);
+        let b = batch as u32; let f = frames as u32;
+        let cu = c as u32; let hu = h as u32; let wu = w as u32;
+        enc.set_bytes(2, 4, &b as *const _ as *const _);
+        enc.set_bytes(3, 4, &f as *const _ as *const _);
+        enc.set_bytes(4, 4, &cu as *const _ as *const _);
+        enc.set_bytes(5, 4, &hu as *const _ as *const _);
+        enc.set_bytes(6, 4, &wu as *const _ as *const _);
+        let grid = MTLSize::new(dst.elements() as u64, 1, 1);
+        let group = MTLSize::new(256, 1, 1);
+        enc.dispatch_threads(grid, group);
+        enc.end_encoding();
+    });
+    dst
+}
+
+/// Inverse temporal reshape: [B*H*W, F, C] → [B*F, C, H, W]. bf16.
+pub fn temporal_reshape_from_f16_gpu(
+    src: &GpuTensor, batch: usize, frames: usize, c: usize, h: usize, w: usize,
+) -> GpuTensor {
+    use metal::MTLSize;
+    debug_assert_eq!(src.dtype, GpuDtype::F16);
+    let dst = GpuTensor::new_f16(vec![batch * frames, c, h, w]);
+    let backend = get_metal();
+    with_cmd(|cmd| {
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&backend.temporal_reshape_from_pipe);
+        enc.set_buffer(0, Some(&src.buffer), 0);
+        enc.set_buffer(1, Some(&dst.buffer), 0);
+        let b = batch as u32; let f = frames as u32;
+        let cu = c as u32; let hu = h as u32; let wu = w as u32;
+        enc.set_bytes(2, 4, &b as *const _ as *const _);
+        enc.set_bytes(3, 4, &f as *const _ as *const _);
+        enc.set_bytes(4, 4, &cu as *const _ as *const _);
+        enc.set_bytes(5, 4, &hu as *const _ as *const _);
+        enc.set_bytes(6, 4, &wu as *const _ as *const _);
+        let grid = MTLSize::new(dst.elements() as u64, 1, 1);
+        let group = MTLSize::new(256, 1, 1);
+        enc.dispatch_threads(grid, group);
+        enc.end_encoding();
+    });
+    dst
+}
+
+/// Add learned positional embedding in-place. x: [n_seq, frames, d], pe: [max_f, d].
+pub fn pos_embed_add_f16_gpu(
+    x: &mut GpuTensor, pe_buf: &metal::Buffer, frames: usize, max_frames: usize, d: usize,
+) {
+    use metal::MTLSize;
+    let backend = get_metal();
+    with_cmd(|cmd| {
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&backend.pos_embed_add_pipe);
+        enc.set_buffer(0, Some(&x.buffer), 0);
+        enc.set_buffer(1, Some(pe_buf), 0);
+        let f = frames as u32; let mf = max_frames as u32; let du = d as u32;
+        enc.set_bytes(2, 4, &f as *const _ as *const _);
+        enc.set_bytes(3, 4, &mf as *const _ as *const _);
+        enc.set_bytes(4, 4, &du as *const _ as *const _);
+        let grid = MTLSize::new(x.elements() as u64, 1, 1);
+        let group = MTLSize::new(256, 1, 1);
+        enc.dispatch_threads(grid, group);
+        enc.end_encoding();
+    });
 }
 
 /// Channel-wise concat: `[N, Ca, HW]` and `[N, Cb, HW]` → `[N, Ca+Cb, HW]`,

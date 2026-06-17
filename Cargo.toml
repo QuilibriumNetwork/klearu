@@ -16,6 +16,8 @@ members = [
     "crates/klearu-server",
     "crates/klearu-diffusion",
     "crates/klearu-image",
+    "crates/klearu-desktop",
+    "web/src-tauri",
 ]
 
 [workspace.package]
@@ -40,6 +42,7 @@ klearu-wasm = { path = "crates/klearu-wasm" }
 klearu-server = { path = "crates/klearu-server" }
 klearu-diffusion = { path = "crates/klearu-diffusion" }
 klearu-image = { path = "crates/klearu-image" }
+klearu-desktop = { path = "crates/klearu-desktop" }
 
 # Core dependencies
 ndarray = { version = "0.16", features = ["rayon"] }
@@ -61,6 +64,15 @@ crossbeam = "0.8"
 criterion = { version = "0.5", features = ["html_reports"] }
 aes = "0.8"
 curve25519-dalek = { version = "4", features = ["serde"] }
+anyhow = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Desktop (Tauri 2.x)
+tauri = { version = "2", features = ["protocol-asset"] }
+tauri-build = { version = "2" }
+tauri-plugin-dialog = "2"
+tauri-plugin-fs = "2"
+tauri-plugin-shell = "2"
 
 # Server dependencies
 axum = { version = "0.8", features = ["ws"] }

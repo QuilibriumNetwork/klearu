@@ -144,6 +144,52 @@ impl CLIPTokenizer {
         Ok(encoding.get_ids().to_vec())
     }
 
+    /// Long-prompt chunked encoding. CLIP's position-embedding table has
+    /// only 77 entries (architectural limit — the model never saw longer
+    /// inputs during training). The Automatic1111 / ComfyUI workaround:
+    /// chunk the content tokens into groups of ≤75 (leaving room for BOS
+    /// and EOS), encode each chunk independently through CLIP, then
+    /// concatenate the resulting hidden states along the sequence axis.
+    ///
+    /// Returns `Vec<Vec<u32>>` — each inner vec is exactly 77 tokens
+    /// (BOS + ≤75 content + EOS + pad). Caller runs `forward` per chunk
+    /// and concatenates hidden states. Always yields ≥ 1 chunk.
+    pub fn encode_chunks_with(&self, text: &str, pad_token: u32) -> Result<Vec<Vec<u32>>> {
+        let encoding = self.inner.encode(text, false)
+            .map_err(|e| DiffusionError::Unsupported(format!("encode: {e}")))?;
+        let ids = encoding.get_ids();
+        let content_per_chunk = self.max_length - 2; // 75 with BOS+EOS
+
+        if ids.is_empty() {
+            // Always emit at least one chunk so chunk counts stay aligned
+            // between empty negative prompts and longer positive prompts.
+            let mut chunk = Vec::with_capacity(self.max_length);
+            chunk.push(CLIP_BOS_ID);
+            chunk.push(CLIP_EOS_ID);
+            while chunk.len() < self.max_length { chunk.push(pad_token); }
+            return Ok(vec![chunk]);
+        }
+
+        let mut chunks = Vec::new();
+        let mut i = 0;
+        while i < ids.len() {
+            let end = (i + content_per_chunk).min(ids.len());
+            let mut chunk = Vec::with_capacity(self.max_length);
+            chunk.push(CLIP_BOS_ID);
+            chunk.extend_from_slice(&ids[i..end]);
+            chunk.push(CLIP_EOS_ID);
+            while chunk.len() < self.max_length { chunk.push(pad_token); }
+            chunks.push(chunk);
+            i = end;
+        }
+        Ok(chunks)
+    }
+
+    /// EOS-padded chunked encoding — correct for CLIP-L on SD 1.5 and SDXL.
+    pub fn encode_chunks(&self, text: &str) -> Result<Vec<Vec<u32>>> {
+        self.encode_chunks_with(text, CLIP_EOS_ID)
+    }
+
     pub fn vocab_size(&self) -> usize {
         self.inner.get_vocab_size(true)
     }

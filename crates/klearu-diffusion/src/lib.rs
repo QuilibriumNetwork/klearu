@@ -23,19 +23,23 @@
 //! encoder-only models decoupled from the generative pipeline. VAE-encoder
 //! activations are consumable by other klearu crates for cross-modal work.
 
+pub mod animatediff;
 pub mod blas;
 pub mod config;
 pub mod controlnet;
+pub mod hidream;
 #[cfg(feature = "metal")]
 pub mod metal_backend;
 pub mod error;
 pub mod image_io;
 pub mod layers;
+pub mod pipeline;
 pub mod scheduler;
 pub mod text_encoder;
 pub mod tokenizer;
 pub mod unet;
 pub mod vae;
+pub mod video_io;
 pub mod weight;
 
 pub use tokenizer::{CLIPTokenizer, CLIP_BOS_ID, CLIP_EOS_ID, CLIP_MAX_LENGTH};
