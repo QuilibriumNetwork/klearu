@@ -26,41 +26,41 @@ Klearu is organized as a Cargo workspace with 11 crates:
 
 ## Building
 
-The core crates build standalone. The `klearu-private` crate depends on the `ferret` crate from the [Quilibrium monorepo](https://github.com/quilibriumnetwork/monorepo) via a relative path. To build the full workspace including private inference, clone both repositories as siblings:
+The core crates build standalone and only require this repo to be cloned.
+
+### Building klearu-private
+The `klearu-private` crate depends on the `ferret` crate from the [Quilibrium monorepo](https://github.com/quilibriumnetwork/monorepo) via a relative path.
+
+To build the full workspace including private inference, clone both repositories as siblings:
 
 ```
 your-workspace/
   klearu/       # this repository
   monorepo/     # git clone https://github.com/quilibriumnetwork/monorepo
 ```
-
-Then build from inside `klearu/`:
+#### Installing Ferret Dependencies
+To be able to build `ferret`, the EMP tools in the `monorepo/` directory must be installed:
 
 ```bash
-# Full workspace (requires monorepo sibling for klearu-private)
-cargo build --release
-
-# With specific features via the facade crate
-cargo build --release -p klearu --features full
-
-# LLM inference only (no monorepo needed)
-cargo build --release -p klearu-llm
-
-# LLM with sparse inference (no monorepo needed)
-cargo build --release -p klearu-llm --features sparse
-
-# Vision models (no monorepo needed)
-cargo build --release -p klearu-vision
-
-# Vision with sparse inference
-cargo build --release -p klearu-vision --features sparse
-
-# Vision CLI (image classification)
-cargo build --release -p klearu-vision --features cli
-
-# Private inference (requires monorepo sibling)
-cargo build --release -p klearu-private
+# Inside the monorepo dir/
+sudo ./install-emp.sh
 ```
+
+At this point, `ferret` can be built, but will be built via the cargo commands in `klearu/`.
+
+### Building KLEARU
+Navigate to the `klearu/` directory:
+
+| Feature                  | Description                              | Build Command                                              | Is `monorepo` Required? |
+|--------------------------|------------------------------------------|------------------------------------------------------------|--------------------------|
+| Full                     | Build all features                       | `cargo build --release`                                    | `true`                   |
+| Full (facade)            | Build all features via facade crate      | `cargo build --release -p klearu --features full`         | `true`                   |
+| LLM Inference            | LLM inference only                       | `cargo build --release -p klearu-llm`                      | `false`                  |
+| LLM + Sparse             | LLM with sparse inference support        | `cargo build --release -p klearu-llm --features sparse`   | `false`                  |
+| Vision models            | Vision model inference                   | `cargo build --release -p klearu-vision`                   | `false`                  |
+| Vision + Sparse          | Vision models with sparse inference      | `cargo build --release -p klearu-vision --features sparse`| `false`                  |
+| Vision CLI               | Vision CLI (image classification)        | `cargo build --release -p klearu-vision --features cli`   | `false`                  |
+| Private inference        | Private / proprietary inference features | `cargo build --release -p klearu-private`                  | `true`                   |
 
 ## Testing
 
