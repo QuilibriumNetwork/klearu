@@ -21,6 +21,7 @@ const SETTING_KEYS = [
   'image.checkpoint',
   'image.tokenizer_l',
   'image.tokenizer_g',
+  'image.flux_t5_tokenizer',
   'image.output_dir',
   'image.motion_adapter',
 ] as const;
@@ -32,6 +33,7 @@ interface ImageSettings {
   'image.checkpoint'?: string;
   'image.tokenizer_l'?: string;
   'image.tokenizer_g'?: string;
+  'image.flux_t5_tokenizer'?: string;
   'image.output_dir'?: string;
   'image.motion_adapter'?: string;
 }
@@ -191,9 +193,10 @@ function SettingsBlock({ settings, onSet, onClose }: {
         <button onClick={onClose} className="ml-auto text-xs text-gray-400 hover:text-gray-200">close</button>
       </div>
       <SettingField label="sd_generate binary" placeholder="auto-detect — env or target/debug" k="image.sd_generate_path" value={settings['image.sd_generate_path']} onSet={onSet} pickFile />
-      <SettingField label="checkpoint / HiDream dir"       k="image.checkpoint"         value={settings['image.checkpoint']}         onSet={onSet} pickFile pickDir />
+      <SettingField label="checkpoint / HiDream·Flux dir"  k="image.checkpoint"         value={settings['image.checkpoint']}         onSet={onSet} pickFile pickDir />
       <SettingField label="CLIP-L tokenizer.json"          k="image.tokenizer_l"        value={settings['image.tokenizer_l']}        onSet={onSet} pickFile />
       <SettingField label="CLIP-G tokenizer.json (SDXL)"   k="image.tokenizer_g"        value={settings['image.tokenizer_g']}        onSet={onSet} pickFile />
+      <SettingField label="T5 tokenizer.json (Flux)"       k="image.flux_t5_tokenizer"  value={settings['image.flux_t5_tokenizer']}  onSet={onSet} pickFile />
       <SettingField label="output dir"                     k="image.output_dir"         value={settings['image.output_dir']}         onSet={onSet} pickDir />
       <SettingField label="motion adapter (AnimateDiff)"  k="image.motion_adapter"     value={settings['image.motion_adapter']}     onSet={onSet} pickFile />
     </div>

@@ -103,6 +103,7 @@ impl FluxConfig {
 // Primitives
 // ============================================================================
 
+#[derive(Clone)]
 pub struct Linear {
     pub weight: Vec<f32>, // [out, in]
     pub bias: Option<Vec<f32>>,
@@ -297,6 +298,7 @@ pub fn timestep_embedding(t: f32, dim: usize, max_period: f32) -> Vec<f32> {
 
 /// MLP embedder used for time / pooled-vector / guidance inputs.
 /// `silu(in_layer(x)) → out_layer`.
+#[derive(Clone)]
 pub struct MLPEmbedder {
     pub in_layer: Linear,
     pub out_layer: Linear,

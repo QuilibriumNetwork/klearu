@@ -24,6 +24,8 @@
 
 pub mod blocks;
 pub mod flux;
+#[cfg(feature = "metal")]
+pub mod flux_gpu;
 pub mod resnet_block;
 pub mod text_time_embedding;
 pub mod time_embedding;

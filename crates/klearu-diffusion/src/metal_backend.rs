@@ -1420,6 +1420,92 @@ kernel void pos_embed_add_f16(
         x[gid] = bfloat(float(x[gid]) + float(pe[fi * d + di]));
     }
 }
+
+// ---- Flux MMDiT kernels ---------------------------------------------------
+
+// Exact (erf-based) GELU: 0.5*v*(1+erf(v/sqrt2)). Flux uses the exact GELU,
+// not the tanh approximation in `gelu_f16`. erf via Abramowitz-Stegun 7.1.26
+// (matches the CPU `erf_approx` coefficients exactly for GPU/CPU parity).
+kernel void gelu_erf_f16(
+    device bfloat* x [[buffer(0)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    float v = float(x[gid]);
+    float xin = v * 0.7071067811865476f; // v / sqrt(2)
+    float sign = xin < 0.0f ? -1.0f : 1.0f;
+    float xa = fabs(xin);
+    float t = 1.0f / (1.0f + 0.3275911f * xa);
+    float y = 1.0f - (((((1.061405429f * t - 1.453152027f) * t) + 1.421413741f) * t
+                       - 0.284496736f) * t + 0.254829592f) * t * exp(-xa * xa);
+    float erf = sign * y;
+    x[gid] = bfloat(0.5f * v * (1.0f + erf));
+}
+
+// Interleaved-pair RoPE (Flux convention): rotates pairs (2k, 2k+1) using
+// cos/sin indexed at 2k (build_rope_2d duplicates cos[2k]==cos[2k+1]). This
+// differs from `rope_apply_f16` which uses the cat-half (NeoX) pairing.
+kernel void rope_pairs_f16(
+    device bfloat*       x    [[buffer(0)]],  // [n, num_heads, head_dim]
+    device const bfloat* cosb [[buffer(1)]],  // [n, head_dim]
+    device const bfloat* sinb [[buffer(2)]],
+    constant uint&       num_heads [[buffer(3)]],
+    constant uint&       head_dim  [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]       // in [0, n*num_heads)
+) {
+    uint t = gid / num_heads;
+    uint hd2 = head_dim / 2;
+    uint base = gid * head_dim;
+    uint cbase = t * head_dim;
+    for (uint k = 0; k < hd2; ++k) {
+        float a = float(x[base + 2 * k]);
+        float b = float(x[base + 2 * k + 1]);
+        float c = float(cosb[cbase + 2 * k]);
+        float s = float(sinb[cbase + 2 * k]);
+        x[base + 2 * k]     = bfloat(a * c - b * s);
+        x[base + 2 * k + 1] = bfloat(a * s + b * c);
+    }
+}
+
+// AdaLN modulate: x[t,di] = x[t,di] * (1 + scale[di]) + shift[di], broadcasting
+// scale/shift [d] across the n token rows.
+kernel void modulate_f16(
+    device bfloat*       x     [[buffer(0)]],  // [n, d]
+    device const bfloat* scale [[buffer(1)]],  // [d]
+    device const bfloat* shift [[buffer(2)]],  // [d]
+    constant uint&       d     [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]        // in [0, n*d)
+) {
+    uint di = gid % d;
+    float v = float(x[gid]);
+    x[gid] = bfloat(v * (1.0f + float(scale[di])) + float(shift[di]));
+}
+
+// Column slice: out[t, j] = in[t, off + j], i.e. extract a contiguous
+// `blk`-wide column block from a row-major `[n, stride]` tensor. Used to split
+// fused QKV(/MLP) projections into separate q/k/v tensors.
+kernel void slice_cols_f16(
+    device const bfloat* inp [[buffer(0)]],  // [n, stride]
+    device bfloat*       out [[buffer(1)]],  // [n, blk]
+    constant uint&       stride [[buffer(2)]],
+    constant uint&       off    [[buffer(3)]],
+    constant uint&       blk    [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]       // [0, n*blk)
+) {
+    uint t = gid / blk;
+    uint j = gid % blk;
+    out[gid] = inp[t * stride + off + j];
+}
+
+// Gate: x[t,di] *= gate[di], broadcasting gate [d] across n token rows.
+kernel void gate_mul_f16(
+    device bfloat*       x    [[buffer(0)]],  // [n, d]
+    device const bfloat* gate [[buffer(1)]],  // [d]
+    constant uint&       d    [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint di = gid % d;
+    x[gid] = bfloat(float(x[gid]) * float(gate[di]));
+}
 "#;
 
 struct MetalBackend {
@@ -1470,6 +1556,12 @@ struct MetalBackend {
     temporal_reshape_to_pipe: ComputePipelineState,
     temporal_reshape_from_pipe: ComputePipelineState,
     pos_embed_add_pipe: ComputePipelineState,
+    // Flux MMDiT kernels.
+    gelu_erf_f16_pipe: ComputePipelineState,
+    rope_pairs_f16_pipe: ComputePipelineState,
+    modulate_f16_pipe: ComputePipelineState,
+    gate_mul_f16_pipe: ComputePipelineState,
+    slice_cols_f16_pipe: ComputePipelineState,
 }
 
 unsafe impl Send for MetalBackend {}
@@ -1537,6 +1629,11 @@ fn get_metal() -> &'static MetalBackend {
             temporal_reshape_to_pipe: make_pipe("temporal_reshape_to_f16"),
             temporal_reshape_from_pipe: make_pipe("temporal_reshape_from_f16"),
             pos_embed_add_pipe: make_pipe("pos_embed_add_f16"),
+            gelu_erf_f16_pipe: make_pipe("gelu_erf_f16"),
+            rope_pairs_f16_pipe: make_pipe("rope_pairs_f16"),
+            modulate_f16_pipe: make_pipe("modulate_f16"),
+            gate_mul_f16_pipe: make_pipe("gate_mul_f16"),
+            slice_cols_f16_pipe: make_pipe("slice_cols_f16"),
             device,
             queue,
         }
@@ -3185,6 +3282,120 @@ pub fn rope_apply_f16_gpu(
         enc.set_bytes(4, 4, &hd as *const _ as *const _);
         let group = MTLSize::new(64, 1, 1);
         let grid = MTLSize::new((n * num_heads) as u64, 1, 1);
+        enc.dispatch_threads(grid, group);
+        enc.end_encoding();
+    });
+}
+
+/// Exact (erf) GELU in place on an fp16 buffer — Flux's GELU. (`gelu_f16_gpu`
+/// is the tanh approximation; this matches the CPU `gelu_exact`.)
+pub fn gelu_erf_f16_gpu(x: &mut GpuTensor) {
+    debug_assert_eq!(x.dtype, GpuDtype::F16);
+    dispatch_elementwise_buf_inplace(&get_metal().gelu_erf_f16_pipe, &x.buffer, x.elements());
+}
+
+/// Interleaved-pair RoPE (Flux): rotate pairs `(2k, 2k+1)` of `x [n, nh, dh]`
+/// using `cos`/`sin` `[n, dh]`. (`rope_apply_f16_gpu` is the cat-half variant.)
+pub fn rope_pairs_f16_gpu(
+    x: &mut GpuTensor, cos: &Buffer, sin: &Buffer, n: usize, num_heads: usize, head_dim: usize,
+) {
+    use metal::MTLSize;
+    let backend = get_metal();
+    with_cmd(|cmd| {
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&backend.rope_pairs_f16_pipe);
+        enc.set_buffer(0, Some(&x.buffer), 0);
+        enc.set_buffer(1, Some(cos), 0);
+        enc.set_buffer(2, Some(sin), 0);
+        let nh = num_heads as u32;
+        let hd = head_dim as u32;
+        enc.set_bytes(3, 4, &nh as *const _ as *const _);
+        enc.set_bytes(4, 4, &hd as *const _ as *const _);
+        let group = MTLSize::new(64, 1, 1);
+        let grid = MTLSize::new((n * num_heads) as u64, 1, 1);
+        enc.dispatch_threads(grid, group);
+        enc.end_encoding();
+    });
+}
+
+/// AdaLN modulate in place: `x[t,di] = x[t,di]·(1 + scale[di]) + shift[di]`,
+/// broadcasting `scale`/`shift` `[d]` across `n` token rows. `scale_off` /
+/// `shift_off` are element offsets into their buffers (for binding chunks of a
+/// fused modulation output without copying). bf16 → 2 bytes/element.
+#[allow(clippy::too_many_arguments)]
+pub fn modulate_f16_gpu(
+    x: &mut GpuTensor, scale: &Buffer, scale_off: usize, shift: &Buffer, shift_off: usize,
+    n: usize, d: usize,
+) {
+    use metal::MTLSize;
+    let backend = get_metal();
+    with_cmd(|cmd| {
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&backend.modulate_f16_pipe);
+        enc.set_buffer(0, Some(&x.buffer), 0);
+        enc.set_buffer(1, Some(scale), (scale_off * 2) as u64);
+        enc.set_buffer(2, Some(shift), (shift_off * 2) as u64);
+        let dd = d as u32;
+        enc.set_bytes(3, 4, &dd as *const _ as *const _);
+        let group = MTLSize::new(256, 1, 1);
+        let grid = MTLSize::new((n * d) as u64, 1, 1);
+        enc.dispatch_threads(grid, group);
+        enc.end_encoding();
+    });
+}
+
+/// Extract a contiguous `blk`-wide column block at column `off` from a
+/// row-major `[n, stride]` fp16 tensor → `[n, blk]`.
+pub fn slice_cols_f16_gpu(inp: &GpuTensor, n: usize, stride: usize, off: usize, blk: usize) -> GpuTensor {
+    use metal::MTLSize;
+    let backend = get_metal();
+    let out = GpuTensor::new_f16(vec![n, blk]);
+    with_cmd(|cmd| {
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&backend.slice_cols_f16_pipe);
+        enc.set_buffer(0, Some(&inp.buffer), 0);
+        enc.set_buffer(1, Some(&out.buffer), 0);
+        let (s, o, b) = (stride as u32, off as u32, blk as u32);
+        enc.set_bytes(2, 4, &s as *const _ as *const _);
+        enc.set_bytes(3, 4, &o as *const _ as *const _);
+        enc.set_bytes(4, 4, &b as *const _ as *const _);
+        let group = MTLSize::new(256, 1, 1);
+        let grid = MTLSize::new((n * blk) as u64, 1, 1);
+        enc.dispatch_threads(grid, group);
+        enc.end_encoding();
+    });
+    out
+}
+
+/// Blit-copy `len` bf16 elements from `src[src_off..]` to `dst[dst_off..]`
+/// (offsets and length in elements). Used to concatenate tensors along the
+/// token axis (contiguous in `[n, h]` row-major layout).
+pub fn blit_copy_f16(src: &Buffer, src_off: usize, dst: &Buffer, dst_off: usize, len: usize) {
+    with_cmd(|cmd| {
+        let blit = cmd.new_blit_command_encoder();
+        blit.copy_from_buffer(
+            src, (src_off * 2) as u64,
+            dst, (dst_off * 2) as u64,
+            (len * 2) as u64,
+        );
+        blit.end_encoding();
+    });
+}
+
+/// Gate in place: `x[t,di] *= gate[di]`, broadcasting `gate` `[d]` across `n`.
+/// `gate_off` is an element offset into `gate` (bf16, 2 bytes/element).
+pub fn gate_mul_f16_gpu(x: &mut GpuTensor, gate: &Buffer, gate_off: usize, n: usize, d: usize) {
+    use metal::MTLSize;
+    let backend = get_metal();
+    with_cmd(|cmd| {
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&backend.gate_mul_f16_pipe);
+        enc.set_buffer(0, Some(&x.buffer), 0);
+        enc.set_buffer(1, Some(gate), (gate_off * 2) as u64);
+        let dd = d as u32;
+        enc.set_bytes(2, 4, &dd as *const _ as *const _);
+        let group = MTLSize::new(256, 1, 1);
+        let grid = MTLSize::new((n * d) as u64, 1, 1);
         enc.dispatch_threads(grid, group);
         enc.end_encoding();
     });
@@ -4964,6 +5175,98 @@ mod tests {
             // f16 worst-case for ±25-magnitude values is ~25 * 2^-7 ≈ 0.2.
             assert!((g - want).abs() < 0.25,
                 "silu_f16_gpu diverged: x={x}, got={g}, want={want}");
+        }
+    }
+
+    #[test]
+    fn flux_kernels_match_cpu() {
+        // ---- gelu_erf (exact GELU) ----
+        let v: Vec<f32> = (0..256).map(|i| (i as f32) * 0.05 - 6.0).collect();
+        let mut t = GpuTensor::upload_f32_as_f16(vec![v.len()], &v);
+        gelu_erf_f16_gpu(&mut t);
+        let got = t.download_to_f32();
+        let erf = |x: f32| {
+            let s = if x < 0.0 { -1.0 } else { 1.0 };
+            let xa = x.abs();
+            let tt = 1.0 / (1.0 + 0.3275911 * xa);
+            let y = 1.0
+                - (((((1.061405429 * tt - 1.453152027) * tt) + 1.421413741) * tt - 0.284496736) * tt
+                    + 0.254829592)
+                    * tt
+                    * (-xa * xa).exp();
+            s * y
+        };
+        for (g, &x) in got.iter().zip(v.iter()) {
+            let want = 0.5 * x * (1.0 + erf(x / std::f32::consts::SQRT_2));
+            assert!((g - want).abs() < 0.05, "gelu_erf x={x} got={g} want={want}");
+        }
+
+        // ---- modulate: x*(1+scale)+shift ----
+        let (n, d) = (5usize, 16usize);
+        let x: Vec<f32> = (0..n * d).map(|i| (i as f32 * 0.03).sin()).collect();
+        let scale: Vec<f32> = (0..d).map(|i| (i as f32 * 0.1).cos() * 0.5).collect();
+        let shift: Vec<f32> = (0..d).map(|i| (i as f32 * 0.2).sin() * 0.3).collect();
+        let mut xt = GpuTensor::upload_f32_as_f16(vec![n, d], &x);
+        let sc_buf = upload_f32_as_f16_buffer(&scale);
+        let sh_buf = upload_f32_as_f16_buffer(&shift);
+        modulate_f16_gpu(&mut xt, &sc_buf, 0, &sh_buf, 0, n, d);
+        let got = xt.download_to_f32();
+        for t in 0..n {
+            for di in 0..d {
+                let want = x[t * d + di] * (1.0 + scale[di]) + shift[di];
+                assert!((got[t * d + di] - want).abs() < 0.02, "modulate diverged");
+            }
+        }
+
+        // ---- gate_mul: x*gate ----
+        let gate: Vec<f32> = (0..d).map(|i| (i as f32 * 0.15).sin()).collect();
+        let mut xt2 = GpuTensor::upload_f32_as_f16(vec![n, d], &x);
+        let g_buf = upload_f32_as_f16_buffer(&gate);
+        gate_mul_f16_gpu(&mut xt2, &g_buf, 0, n, d);
+        let got2 = xt2.download_to_f32();
+        for t in 0..n {
+            for di in 0..d {
+                let want = x[t * d + di] * gate[di];
+                assert!((got2[t * d + di] - want).abs() < 0.02, "gate_mul diverged");
+            }
+        }
+
+        // ---- rope_pairs (interleaved 2k/2k+1) ----
+        let (nt, nh, dh) = (4usize, 2usize, 8usize);
+        let xq: Vec<f32> = (0..nt * nh * dh).map(|i| (i as f32 * 0.07).cos()).collect();
+        // cos/sin [nt, dh] with cos[2k]==cos[2k+1] (build_rope_2d convention).
+        let mut cos = vec![0.0f32; nt * dh];
+        let mut sin = vec![0.0f32; nt * dh];
+        for tk in 0..nt {
+            for k in 0..dh / 2 {
+                let ang = (tk as f32 + 1.0) * 0.3 * (k as f32 + 1.0);
+                cos[tk * dh + 2 * k] = ang.cos();
+                cos[tk * dh + 2 * k + 1] = ang.cos();
+                sin[tk * dh + 2 * k] = ang.sin();
+                sin[tk * dh + 2 * k + 1] = ang.sin();
+            }
+        }
+        let mut qt = GpuTensor::upload_f32_as_f16(vec![nt * nh * dh], &xq);
+        let cos_buf = upload_f32_as_f16_buffer(&cos);
+        let sin_buf = upload_f32_as_f16_buffer(&sin);
+        rope_pairs_f16_gpu(&mut qt, &cos_buf, &sin_buf, nt, nh, dh);
+        let gotq = qt.download_to_f32();
+        let mut want = xq.clone();
+        for tk in 0..nt {
+            for h in 0..nh {
+                let off = (tk * nh + h) * dh;
+                for k in 0..dh / 2 {
+                    let a = xq[off + 2 * k];
+                    let b = xq[off + 2 * k + 1];
+                    let c = cos[tk * dh + 2 * k];
+                    let s = sin[tk * dh + 2 * k];
+                    want[off + 2 * k] = a * c - b * s;
+                    want[off + 2 * k + 1] = a * s + b * c;
+                }
+            }
+        }
+        for (g, w) in gotq.iter().zip(want.iter()) {
+            assert!((g - w).abs() < 0.02, "rope_pairs diverged got={g} want={w}");
         }
     }
 

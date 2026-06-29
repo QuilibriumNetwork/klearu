@@ -52,6 +52,7 @@ fn build_diffusion_config(workspace: &Workspace) -> DiffusionConfig {
         checkpoint: get("image.checkpoint").map(PathBuf::from),
         tokenizer_l: get("image.tokenizer_l").map(PathBuf::from),
         tokenizer_g: get("image.tokenizer_g").map(PathBuf::from),
+        flux_t5_tokenizer: get("image.flux_t5_tokenizer").map(PathBuf::from),
         output_dir: get("image.output_dir").map(PathBuf::from),
         motion_adapter: get("image.motion_adapter").map(PathBuf::from),
     }

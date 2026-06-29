@@ -50,6 +50,9 @@ pub struct DiffusionConfig {
     pub tokenizer_l: Option<PathBuf>,
     /// `--tokenizer-2 FILE.json` (CLIP-G; SDXL only).
     pub tokenizer_g: Option<PathBuf>,
+    /// T5-XXL tokenizer (`tokenizer.json`) — required for Flux checkpoints
+    /// (Flux uses CLIP-L [= `tokenizer_l`] + T5).
+    pub flux_t5_tokenizer: Option<PathBuf>,
     /// Output directory. Defaults to `~/.klearu/images/`.
     pub output_dir: Option<PathBuf>,
     /// Path to an AnimateDiff motion adapter `.safetensors` for video
@@ -162,12 +165,22 @@ pub struct DiffusionEngine {
     /// `residents` because it's a distinct model family (Qwen3-VL, no VAE).
     #[cfg(target_os = "macos")]
     hidream: Arc<Mutex<Option<LoadedHiDream>>>,
+    /// Resident Flux runner (macOS/Metal only): GPU MMDiT + T5 + CLIP-L + VAE.
+    #[cfg(target_os = "macos")]
+    flux: Arc<Mutex<Option<LoadedFlux>>>,
 }
 
 /// A loaded HiDream-O1 runner paired with its checkpoint signature.
 #[cfg(target_os = "macos")]
 struct LoadedHiDream {
     runner: klearu_diffusion::hidream::runner::HiDreamRunner,
+    signature: String,
+}
+
+/// A loaded Flux runner paired with its checkpoint+tokenizer signature.
+#[cfg(target_os = "macos")]
+struct LoadedFlux {
+    runner: klearu_diffusion::flux_runner::FluxRunner,
     signature: String,
 }
 
@@ -455,6 +468,21 @@ impl DiffusionEngine {
                 .await;
         }
 
+        // Flux (single-file bundle or directory): GPU MMDiT + T5 + CLIP-L + VAE.
+        #[cfg(target_os = "macos")]
+        if klearu_diffusion::flux_runner::is_flux_checkpoint(&checkpoint) {
+            let clip_tok = cfg.tokenizer_l.clone().ok_or_else(|| {
+                DesktopError::bad_input("Flux needs image.tokenizer_l (CLIP-L tokenizer)")
+            })?;
+            let t5_tok = cfg.flux_t5_tokenizer.clone().ok_or_else(|| {
+                DesktopError::bad_input("Flux needs image.flux_t5_tokenizer (T5 tokenizer.json)")
+            })?;
+            let signature = format!("flux|{}|{}|{}", checkpoint.display(), clip_tok.display(), t5_tok.display());
+            return self
+                .generate_flux_in_process(checkpoint, clip_tok, t5_tok, signature, req, job_id, events)
+                .await;
+        }
+
         let tokenizer_l = cfg
             .tokenizer_l
             .clone()
@@ -616,6 +644,90 @@ impl DiffusionEngine {
                     &abort,
                 )
                 .map_err(|e| DesktopError::engine(format!("hidream generate: {e}")))?;
+            Ok(InProcessResult { rgb_chw: img.chw, height: img.height, width: img.width, job_id })
+        })
+        .await
+        .map_err(|e| DesktopError::engine(format!("join: {e}")))??;
+
+        let _ = events.send(GenEvent::Done { job_id, path: String::new() });
+        Ok(result)
+    }
+
+    /// In-process generation for a Flux checkpoint (single-file bundle or
+    /// directory). Loads (and caches) a GPU `FluxRunner`, runs the denoise loop
+    /// with progress + abort, returns planar `[3,H,W]` in `[-1,1]`.
+    #[cfg(target_os = "macos")]
+    #[allow(clippy::too_many_arguments)]
+    async fn generate_flux_in_process(
+        &self,
+        checkpoint: PathBuf,
+        clip_tok: PathBuf,
+        t5_tok: PathBuf,
+        signature: String,
+        req: InProcessRequest,
+        job_id: u64,
+        events: mpsc::UnboundedSender<GenEvent>,
+    ) -> Result<InProcessResult> {
+        use klearu_diffusion::flux_runner::{FluxGenOpts, FluxLoadSpec, FluxRunner};
+
+        let handle = self.flux.clone();
+        let residents_handle = self.residents.clone();
+        let hidream_handle = self.hidream.clone();
+        let abort = self.in_proc_abort.clone();
+        let events_tx = events.clone();
+        let result = tokio::task::spawn_blocking(move || -> Result<InProcessResult> {
+            let mut guard = handle.lock();
+            let needs_load = match guard.as_ref() {
+                Some(l) => l.signature != signature,
+                None => true,
+            };
+            if needs_load {
+                *guard = None; // free old Flux weights first
+                *residents_handle.lock() = None; // free SD residents to make room
+                *hidream_handle.lock() = None; // free HiDream too (these are big)
+                let spec = FluxLoadSpec {
+                    checkpoint,
+                    clip_tokenizer: clip_tok,
+                    t5_tokenizer: t5_tok,
+                    vae: None,
+                    clip_l: None,
+                    t5: None,
+                    variant: None,
+                };
+                let runner = FluxRunner::load(&spec)
+                    .map_err(|e| DesktopError::engine(format!("load flux: {e}")))?;
+                *guard = Some(LoadedFlux { runner, signature });
+            }
+            let runner = &guard.as_ref().unwrap().runner;
+
+            let opts = FluxGenOpts {
+                prompt: req.prompt,
+                // The desktop request has no resolution field yet; 1024² is a
+                // sensible default for Flux.
+                width: 1024,
+                height: 1024,
+                steps: req.steps,
+                guidance: req.cfg_scale,
+                seed: req.seed,
+                input_image_bytes: req.input_image_bytes,
+                mask_bytes: req.mask_bytes,
+                strength: req.strength,
+            };
+            let t0 = std::time::Instant::now();
+            let img = runner
+                .generate(
+                    &opts,
+                    |step, total| {
+                        let _ = events_tx.send(GenEvent::Step {
+                            job_id,
+                            step: step as u32,
+                            total: total as u32,
+                            elapsed_s: t0.elapsed().as_secs_f32(),
+                        });
+                    },
+                    &abort,
+                )
+                .map_err(|e| DesktopError::engine(format!("flux generate: {e}")))?;
             Ok(InProcessResult { rgb_chw: img.chw, height: img.height, width: img.width, job_id })
         })
         .await

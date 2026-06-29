@@ -31,6 +31,8 @@ pub mod hidream;
 #[cfg(feature = "metal")]
 pub mod metal_backend;
 pub mod error;
+#[cfg(feature = "metal")]
+pub mod flux_runner;
 pub mod image_io;
 pub mod layers;
 pub mod pipeline;

@@ -385,6 +385,7 @@ async fn dispatch_command(
                     checkpoint: get("image.checkpoint").map(std::path::PathBuf::from),
                     tokenizer_l: get("image.tokenizer_l").map(std::path::PathBuf::from),
                     tokenizer_g: get("image.tokenizer_g").map(std::path::PathBuf::from),
+                    flux_t5_tokenizer: get("image.flux_t5_tokenizer").map(std::path::PathBuf::from),
                     output_dir: get("image.output_dir").map(std::path::PathBuf::from),
                     motion_adapter: get("image.motion_adapter").map(std::path::PathBuf::from),
                 };
