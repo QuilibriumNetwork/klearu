@@ -112,6 +112,9 @@ fn diffusion_config_from_settings(memory: &MemoryStore) -> crate::engine::diffus
         tokenizer_l: get("image.tokenizer_l").map(PathBuf::from),
         tokenizer_g: get("image.tokenizer_g").map(PathBuf::from),
         flux_t5_tokenizer: get("image.flux_t5_tokenizer").map(PathBuf::from),
+        flux_vae: get("image.flux_vae").map(PathBuf::from),
+        flux_clip_l: get("image.flux_clip_l").map(PathBuf::from),
+        flux_t5: get("image.flux_t5").map(PathBuf::from),
         output_dir: get("image.output_dir").map(PathBuf::from),
         motion_adapter: get("image.motion_adapter").map(PathBuf::from),
     }

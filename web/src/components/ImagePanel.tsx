@@ -22,6 +22,9 @@ const SETTING_KEYS = [
   'image.tokenizer_l',
   'image.tokenizer_g',
   'image.flux_t5_tokenizer',
+  'image.flux_vae',
+  'image.flux_clip_l',
+  'image.flux_t5',
   'image.output_dir',
   'image.motion_adapter',
 ] as const;
@@ -34,6 +37,9 @@ interface ImageSettings {
   'image.tokenizer_l'?: string;
   'image.tokenizer_g'?: string;
   'image.flux_t5_tokenizer'?: string;
+  'image.flux_vae'?: string;
+  'image.flux_clip_l'?: string;
+  'image.flux_t5'?: string;
   'image.output_dir'?: string;
   'image.motion_adapter'?: string;
 }
@@ -197,6 +203,9 @@ function SettingsBlock({ settings, onSet, onClose }: {
       <SettingField label="CLIP-L tokenizer.json"          k="image.tokenizer_l"        value={settings['image.tokenizer_l']}        onSet={onSet} pickFile />
       <SettingField label="CLIP-G tokenizer.json (SDXL)"   k="image.tokenizer_g"        value={settings['image.tokenizer_g']}        onSet={onSet} pickFile />
       <SettingField label="T5 tokenizer.json (Flux)"       k="image.flux_t5_tokenizer"  value={settings['image.flux_t5_tokenizer']}  onSet={onSet} pickFile />
+      <SettingField label="Flux VAE (ae.safetensors)"      k="image.flux_vae"           value={settings['image.flux_vae']}           onSet={onSet} pickFile />
+      <SettingField label="Flux CLIP-L (.safetensors)"     k="image.flux_clip_l"        value={settings['image.flux_clip_l']}        onSet={onSet} pickFile />
+      <SettingField label="Flux T5-XXL (.safetensors)"     k="image.flux_t5"            value={settings['image.flux_t5']}            onSet={onSet} pickFile />
       <SettingField label="output dir"                     k="image.output_dir"         value={settings['image.output_dir']}         onSet={onSet} pickDir />
       <SettingField label="motion adapter (AnimateDiff)"  k="image.motion_adapter"     value={settings['image.motion_adapter']}     onSet={onSet} pickFile />
     </div>

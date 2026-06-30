@@ -124,7 +124,10 @@ impl FluxRunner {
                 component_with_prefix(&l, prefix).map_err(|e| unsup(format!("{}: {e}", p.display())))
             };
             let comp_v = match &spec.vae {
-                Some(p) => from_override(p, "")?,
+                Some(p) => {
+                    let l = SingleFileLoader::open(p).map_err(|e| unsup(format!("open vae {}: {e}", p.display())))?;
+                    vae_component_from_loader(&l).map_err(|e| unsup(format!("vae {}: {e}", p.display())))?
+                }
                 None => vae_component_from_loader(&loader)
                     .map_err(|e| unsup(format!("vae (pass a separate VAE if the bundle lacks one): {e}")))?,
             };

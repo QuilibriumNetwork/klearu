@@ -53,6 +53,12 @@ pub struct DiffusionConfig {
     /// T5-XXL tokenizer (`tokenizer.json`) — required for Flux checkpoints
     /// (Flux uses CLIP-L [= `tokenizer_l`] + T5).
     pub flux_t5_tokenizer: Option<PathBuf>,
+    /// Separate Flux component files, used when the checkpoint is a
+    /// transformer-only `.safetensors` (the standard BFL distribution) rather
+    /// than an all-in-one bundle. Each is `None` if the bundle already has it.
+    pub flux_vae: Option<PathBuf>,
+    pub flux_clip_l: Option<PathBuf>,
+    pub flux_t5: Option<PathBuf>,
     /// Output directory. Defaults to `~/.klearu/images/`.
     pub output_dir: Option<PathBuf>,
     /// Path to an AnimateDiff motion adapter `.safetensors` for video
@@ -182,6 +188,14 @@ struct LoadedHiDream {
 struct LoadedFlux {
     runner: klearu_diffusion::flux_runner::FluxRunner,
     signature: String,
+}
+
+/// Separate Flux component files (used when the checkpoint is transformer-only).
+#[cfg(target_os = "macos")]
+struct FluxComponentPaths {
+    vae: Option<PathBuf>,
+    clip_l: Option<PathBuf>,
+    t5: Option<PathBuf>,
 }
 
 /// `SdResidents` paired with the config signature it was loaded with —
@@ -477,9 +491,19 @@ impl DiffusionEngine {
             let t5_tok = cfg.flux_t5_tokenizer.clone().ok_or_else(|| {
                 DesktopError::bad_input("Flux needs image.flux_t5_tokenizer (T5 tokenizer.json)")
             })?;
-            let signature = format!("flux|{}|{}|{}", checkpoint.display(), clip_tok.display(), t5_tok.display());
+            let comps = FluxComponentPaths {
+                vae: cfg.flux_vae.clone(),
+                clip_l: cfg.flux_clip_l.clone(),
+                t5: cfg.flux_t5.clone(),
+            };
+            let pd = |p: &Option<PathBuf>| p.as_ref().map(|x| x.display().to_string()).unwrap_or_default();
+            let signature = format!(
+                "flux|{}|{}|{}|{}|{}|{}",
+                checkpoint.display(), clip_tok.display(), t5_tok.display(),
+                pd(&comps.vae), pd(&comps.clip_l), pd(&comps.t5),
+            );
             return self
-                .generate_flux_in_process(checkpoint, clip_tok, t5_tok, signature, req, job_id, events)
+                .generate_flux_in_process(checkpoint, clip_tok, t5_tok, comps, signature, req, job_id, events)
                 .await;
         }
 
@@ -663,6 +687,7 @@ impl DiffusionEngine {
         checkpoint: PathBuf,
         clip_tok: PathBuf,
         t5_tok: PathBuf,
+        comps: FluxComponentPaths,
         signature: String,
         req: InProcessRequest,
         job_id: u64,
@@ -689,9 +714,9 @@ impl DiffusionEngine {
                     checkpoint,
                     clip_tokenizer: clip_tok,
                     t5_tokenizer: t5_tok,
-                    vae: None,
-                    clip_l: None,
-                    t5: None,
+                    vae: comps.vae,
+                    clip_l: comps.clip_l,
+                    t5: comps.t5,
                     variant: None,
                 };
                 let runner = FluxRunner::load(&spec)
