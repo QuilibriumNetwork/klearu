@@ -30,7 +30,11 @@ base64 = "0.22"
 # `klearu-diffusion = { workspace = true }` entry above, so non-macOS
 # builds still get the lib (without the Metal backend).
 [target.'cfg(target_os = "macos")'.dependencies]
-klearu-diffusion = { workspace = true, features = ["metal", "image-io"] }
+# `accelerate` routes the CPU matmul path (T5/CLIP text encoders, VAE attn)
+# through Apple's AMX-backed cblas_sgemm — without it those fall to the slow
+# pure-Rust matrixmultiply backend (e.g. T5-XXL encode was ~12 min). `metal`
+# handles the GPU-resident Flux/HiDream transformers + VAE.
+klearu-diffusion = { workspace = true, features = ["metal", "image-io", "accelerate"] }
 
 serde = { workspace = true }
 serde_json = { workspace = true }

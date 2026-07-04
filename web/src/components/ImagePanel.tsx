@@ -288,6 +288,8 @@ function Composer({ configured, generating, onGenerate, onGenerateVideo, onAbort
   const [mode, setMode] = useSessionState<'image' | 'video'>('img_mode', 'image');
   const [numFrames, setNumFrames] = useSessionState<number>('img_frames', 16);
   const [fps, setFps] = useSessionState<number>('img_fps', 8);
+  const [sampler, setSampler] = useSessionState<string>('img_sampler', 'ddim');
+  const [karras, setKarras] = useSessionState<boolean>('img_karras', false);
   // Reference images for HiDream-O1 reference editing. Held in memory only
   // (Uint8Array bytes + a preview object URL); never persisted — so this works
   // in incognito with no filesystem round-trip.
@@ -341,6 +343,8 @@ function Composer({ configured, generating, onGenerate, onGenerateVideo, onAbort
           cfg_scale: cfg,
           seed: baseSeed != null ? baseSeed + i : undefined,
           ref_image_bytes: refs,
+          sampler,
+          karras,
         });
         if (!ok) break; // user aborted — stop the whole batch
       }
@@ -433,6 +437,24 @@ function Composer({ configured, generating, onGenerate, onGenerateVideo, onAbort
             <input type="number" value={batch} onChange={(e) => setBatch(Number(e.target.value))} min={1} max={100}
               className="w-14 sm:w-16 bg-gray-800 border border-gray-700 rounded px-2 py-1 text-sm text-gray-100" />
           </Field>
+        )}
+        {mode === 'image' && (
+          <Field label="sampler (SD/SDXL)">
+            <select value={sampler} onChange={(e) => setSampler(e.target.value)}
+              className="bg-gray-800 border border-gray-700 rounded px-2 py-1 text-sm text-gray-100">
+              <option value="ddim">DDIM</option>
+              <option value="euler">Euler</option>
+              <option value="euler_a">Euler a</option>
+              <option value="dpmpp_2m">DPM++ 2M</option>
+              <option value="lcm">LCM (needs LCM model)</option>
+            </select>
+          </Field>
+        )}
+        {mode === 'image' && sampler !== 'ddim' && sampler !== 'lcm' && (
+          <label className="flex items-center gap-1 text-xs text-gray-300 pb-1" title="Karras sigma schedule">
+            <input type="checkbox" checked={karras} onChange={(e) => setKarras(e.target.checked)} />
+            Karras
+          </label>
         )}
         {mode === 'video' && (
           <>

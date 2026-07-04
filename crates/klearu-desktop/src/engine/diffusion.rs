@@ -99,6 +99,14 @@ pub struct GenerateRequest {
     #[serde(default)]
     pub strength: Option<f32>,
 
+    /// SD/SDXL sampler: "ddim" (default) / "euler" / "euler_a" / "dpmpp_2m" /
+    /// "unipc" / "lcm". Ignored by HiDream/Flux (their own schedulers).
+    #[serde(default)]
+    pub sampler: Option<String>,
+    /// Use a Karras sigma schedule (Euler/DPM++/UniPC).
+    #[serde(default)]
+    pub karras: Option<bool>,
+
     // ---- reference editing (HiDream-O1) ------------------------------------
     /// Reference images as raw PNG/JPEG bytes (one per image), supplied
     /// directly by the frontend. When non-empty, HiDream routes through the
@@ -567,6 +575,12 @@ impl DiffusionEngine {
                 controlnet_start: req.controlnet_start,
                 controlnet_end: if req.controlnet_end == 0.0 { 1.0 } else { req.controlnet_end },
                 cond_bias: req.cond_bias,
+                sampler: req
+                    .sampler
+                    .as_deref()
+                    .and_then(klearu_diffusion::scheduler::SamplerKind::parse)
+                    .unwrap_or_default(),
+                karras: req.karras,
             };
             let events_for_cb = events_tx.clone();
             let img = kpipe::generate(
@@ -937,6 +951,9 @@ pub struct InProcessRequest {
     /// Reference images (PNG/JPEG bytes) for HiDream native reference editing.
     /// Empty = no reference editing.
     pub ref_image_bytes: Vec<Vec<u8>>,
+    /// SD/SDXL sampler name (default "ddim") + Karras sigma toggle.
+    pub sampler: Option<String>,
+    pub karras: bool,
     /// Bytes of the ControlNet conditioning image.
     pub control_image_bytes: Option<Vec<u8>>,
     pub controlnet_weight: f32,

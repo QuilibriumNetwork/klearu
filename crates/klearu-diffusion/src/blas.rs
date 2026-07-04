@@ -301,3 +301,4 @@ mod tests {
             "fp16 sgemm diverges from fp32 reference: max_diff={max_diff}");
     }
 }
+

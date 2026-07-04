@@ -66,6 +66,11 @@ impl DDIMScheduler {
 }
 
 impl Scheduler for DDIMScheduler {
+    fn alpha_bar_at(&self, t: i64) -> f32 {
+        // Explicit inherent-method call (inherent takes priority, so no recursion).
+        DDIMScheduler::alpha_bar_at(self, t)
+    }
+
     fn set_timesteps(&mut self, num_inference_steps: usize) {
         if num_inference_steps == 0 || num_inference_steps > self.num_train_timesteps {
             self.timesteps.clear();
@@ -138,7 +143,7 @@ impl Scheduler for DDIMScheduler {
     }
 }
 
-fn compute_betas(schedule: &str, beta_start: f32, beta_end: f32, t: usize) -> Vec<f32> {
+pub(super) fn compute_betas(schedule: &str, beta_start: f32, beta_end: f32, t: usize) -> Vec<f32> {
     match schedule {
         "linear" => (0..t)
             .map(|i| beta_start + (beta_end - beta_start) * (i as f32) / (t.saturating_sub(1).max(1) as f32))
@@ -205,8 +210,9 @@ mod tests {
         for w in s.timesteps.windows(2) {
             assert!(w[0] > w[1], "timesteps should descend");
         }
-        assert_eq!(s.timesteps[0], 980);
-        assert_eq!(*s.timesteps.last().unwrap(), 0);
+        // "leading" spacing with steps_offset=1: [1, 21, ..., 981] reversed.
+        assert_eq!(s.timesteps[0], 981);
+        assert_eq!(*s.timesteps.last().unwrap(), 1);
     }
 
     #[test]
@@ -218,12 +224,15 @@ mod tests {
         let eps: Vec<f32> = (0..n).map(|i| (i as f32) * 0.1).collect();
         let last = s.timesteps.len() - 1;
         let prev = s.step(&eps, last, &sample);
-        // At the last step (t≈0), prev_t = -1 → ᾱ_prev = 1.0, so prev should be ≈ pred_x0.
+        // At the last step prev_t = -1 → ᾱ_prev = alpha_bars[0] (diffusers
+        // set_alpha_to_one=False), so prev = √ᾱ_prev·x0_pred + √(1−ᾱ_prev)·ε.
         let alpha_bar_t = s.alpha_bar_at(s.timesteps[last]);
+        let ab_prev = s.alpha_bar_at(-1);
         for i in 0..n {
-            let expected_x0 = (sample[i] - (1.0 - alpha_bar_t).sqrt() * eps[i]) / alpha_bar_t.sqrt();
-            assert!((prev[i] - expected_x0).abs() < 1e-3,
-                "i={i}: prev={} expected≈{}", prev[i], expected_x0);
+            let x0 = (sample[i] - (1.0 - alpha_bar_t).sqrt() * eps[i]) / alpha_bar_t.sqrt();
+            let expected = ab_prev.sqrt() * x0 + (1.0 - ab_prev).sqrt() * eps[i];
+            assert!((prev[i] - expected).abs() < 1e-3,
+                "i={i}: prev={} expected≈{}", prev[i], expected);
         }
     }
 }

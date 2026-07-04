@@ -11,8 +11,10 @@
 
 pub mod ddim;
 pub mod flow_match;
-pub use ddim::DDIMScheduler;
+pub mod samplers;
+pub use ddim::{DDIMScheduler, PredictionType};
 pub use flow_match::{FlowMatchConfig, FlowMatchScheduler};
+pub use samplers::{build_sd_scheduler, SamplerKind};
 
 /// Common interface for any scheduler used in the SD pipeline.
 pub trait Scheduler {
@@ -39,4 +41,27 @@ pub trait Scheduler {
     /// `init_noise_sigma`: the noise scale at the first inference step.
     /// For DDIM this is just 1.0; Euler/Heun would scale by sqrt(σ_max² + 1).
     fn init_noise_sigma(&self) -> f32 { 1.0 }
+
+    /// Cumulative product ᾱ at training timestep `t` (t<0 → the final-step
+    /// value). Shared by every SD scheduler (same noise schedule); used by the
+    /// img2img/inpaint q_sample. Default assumes a leading integer schedule and
+    /// is overridden with the real table.
+    fn alpha_bar_at(&self, _t: i64) -> f32 { 1.0 }
+
+    /// The (possibly fractional) timestep to feed the UNet at `step_index`.
+    /// Karras/sigma schedules produce fractional timesteps; the default just
+    /// casts `timesteps()[step_index]`.
+    fn timestep_f32(&self, step_index: usize) -> f32 {
+        self.timesteps().get(step_index).copied().unwrap_or(0) as f32
+    }
+
+    /// Some samplers (ancestral, LCM) inject fresh noise each step. When true,
+    /// the pipeline supplies per-step noise via [`Scheduler::step_with_noise`].
+    fn needs_noise(&self) -> bool { false }
+
+    /// Step variant that accepts per-step standard-normal noise (same shape as
+    /// `sample`). Non-stochastic schedulers ignore it. Default → `step`.
+    fn step_with_noise(&self, model_output: &[f32], step_index: usize, sample: &[f32], _noise: &[f32]) -> Vec<f32> {
+        self.step(model_output, step_index, sample)
+    }
 }

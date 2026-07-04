@@ -393,6 +393,10 @@ pub struct GenerateRequest {
     /// space user steering vector (Refactor 1's `image_clip_*` user
     /// vector) lands here.
     pub cond_bias: Option<Vec<f32>>,
+    /// Sampler/scheduler to use (default DDIM = current behavior).
+    pub sampler: crate::scheduler::SamplerKind,
+    /// Use a Karras sigma schedule (Euler/DPM++/UniPC only).
+    pub karras: bool,
 }
 
 /// Streaming progress event. Emitted at each denoise step.
@@ -564,9 +568,14 @@ pub fn generate(
         (None, None)
     };
 
-    // 3. Scheduler init.
-    residents.scheduler.set_timesteps(req.steps);
-    let total_steps = residents.scheduler.timesteps().len();
+    // 3. Scheduler init — build the requested sampler (default DDIM). A local
+    //    Box<dyn Scheduler> so the choice is per-request; the resident's config
+    //    (with the modelspec-corrected prediction_type) drives the noise schedule.
+    let mut scheduler = crate::scheduler::build_sd_scheduler(
+        req.sampler, req.karras, &residents.cfg.scheduler,
+    );
+    scheduler.set_timesteps(req.steps);
+    let total_steps = scheduler.timesteps().len();
     let vae_shift = residents.cfg.vae.shift_factor;
 
     // 3a. Img2img / inpaint setup — VAE-encode the source image (if any)
@@ -668,8 +677,8 @@ pub fn generate(
             // strength = 0: leave x0 unchanged, denoise loop runs 0 iters.
             x0.clone()
         } else {
-            let t_start_sched = residents.scheduler.timesteps()[start_step];
-            let alpha_bar = residents.scheduler.alpha_bar_at(t_start_sched);
+            let t_start_sched = scheduler.timesteps()[start_step];
+            let alpha_bar = scheduler.alpha_bar_at(t_start_sched);
             let sqrt_alpha = alpha_bar.sqrt();
             let sqrt_one_minus = (1.0_f32 - alpha_bar).sqrt();
             let noise = deterministic_noise(x0.len(), req.seed);
@@ -742,14 +751,15 @@ pub fn generate(
     // 7. Denoise loop. Three flavours live here: txt2img (no x0, no
     //    native), naive img2img / inpaint (x0 + per-step blend), and
     //    native-inpaint (9-channel UNet feed + no per-step blend).
-    let timesteps: Vec<i64> = residents.scheduler.timesteps().to_vec();
-    for (step_idx, &t) in timesteps.iter().enumerate() {
+    let timesteps: Vec<i64> = scheduler.timesteps().to_vec();
+    for (step_idx, &_t) in timesteps.iter().enumerate() {
         if step_idx < effective_start_step { continue; }
         if abort.load(Ordering::SeqCst) {
             return Err(DiffusionError::Unsupported("aborted".into()));
         }
         let step_start = std::time::Instant::now();
-        let t_f = t as f32;
+        // Fractional (Karras) or integer timestep for the UNet time embedding.
+        let t_f = scheduler.timestep_f32(step_idx);
 
         // Build the per-step UNet input.
         latent_input.clear();
@@ -908,7 +918,13 @@ pub fn generate(
             eps_batched
         };
 
-        latent = residents.scheduler.step(&eps, step_idx, &latent);
+        latent = if scheduler.needs_noise() {
+            // Ancestral / LCM inject fresh noise each step.
+            let noise = deterministic_noise(latent.len(), req.seed.wrapping_add(step_idx as u64 + 1));
+            scheduler.step_with_noise(&eps, step_idx, &latent, &noise)
+        } else {
+            scheduler.step(&eps, step_idx, &latent)
+        };
 
         // ===== Per-step blend (naive img2img / inpaint only) =====
         // Replace the unmasked region with q_sample(init_latent_x0, t_next)
@@ -918,11 +934,11 @@ pub fn generate(
         if !native_inpaint {
             if let Some(x0) = &init_latent_x0 {
                 let target_t: i64 = if step_idx + 1 < total_steps {
-                    residents.scheduler.timesteps()[step_idx + 1]
+                    scheduler.timesteps()[step_idx + 1]
                 } else {
                     -1 // post-final → α_bar ≈ 1, no noise
                 };
-                let alpha_bar = residents.scheduler.alpha_bar_at(target_t);
+                let alpha_bar = scheduler.alpha_bar_at(target_t);
                 let sqrt_alpha = alpha_bar.sqrt();
                 let sqrt_one_minus = (1.0_f32 - alpha_bar).sqrt();
                 // Per-step independent noise — RePaint convention. Seed
@@ -1114,9 +1130,12 @@ pub fn generate_video(
         (run, pooled.clone(), nf)
     };
 
-    // 2. Scheduler.
-    residents.scheduler.set_timesteps(req.steps);
-    let total_steps = residents.scheduler.timesteps().len();
+    // 2. Scheduler. Video keeps DDIM for now (AnimateDiff was tuned on it).
+    let mut scheduler = crate::scheduler::build_sd_scheduler(
+        crate::scheduler::SamplerKind::Ddim, false, &residents.cfg.scheduler,
+    );
+    scheduler.set_timesteps(req.steps);
+    let total_steps = scheduler.timesteps().len();
 
     // 3. Initial noise: [cfg_batch * nf, latent_c, latent_h, latent_w].
     // For CFG: first nf frames = uncond noise, second nf = cond noise.
@@ -1222,12 +1241,12 @@ pub fn generate_video(
         latent = latent[half..].to_vec(); // keep cond half only
     }
 
-    let timesteps: Vec<i64> = residents.scheduler.timesteps().to_vec();
-    for (step_idx, &t) in timesteps.iter().enumerate() {
+    let timesteps: Vec<i64> = scheduler.timesteps().to_vec();
+    for (step_idx, &_t) in timesteps.iter().enumerate() {
         if abort.load(Ordering::SeqCst) {
             return Err(DiffusionError::Unsupported("aborted".into()));
         }
-        let t_f = t as f32;
+        let t_f = scheduler.timestep_f32(step_idx);
 
         // Duplicate latent for CFG: [uncond=latent, cond=latent].
         let latent_input = if do_cfg {
@@ -1283,7 +1302,12 @@ pub fn generate_video(
             let off = f * single_frame_floats;
             let frame_eps = &eps[off..off + single_frame_floats];
             let frame_lat = &latent[off..off + single_frame_floats];
-            let stepped = residents.scheduler.step(frame_eps, step_idx, frame_lat);
+            let stepped = if scheduler.needs_noise() {
+                let noise = deterministic_noise(frame_lat.len(), req.seed.wrapping_add((step_idx * nf + f) as u64 + 1));
+                scheduler.step_with_noise(frame_eps, step_idx, frame_lat, &noise)
+            } else {
+                scheduler.step(frame_eps, step_idx, frame_lat)
+            };
             new_latent.extend_from_slice(&stepped);
         }
         latent = new_latent;

@@ -631,6 +631,8 @@ async fn dispatch_stream_command(
                 cfg_scale: cfg_for_record,
                 seed: seed_for_record,
                 ref_image_bytes,
+                sampler: req.sampler.clone(),
+                karras: req.karras.unwrap_or(false),
                 cond_bias: None,
                 ..Default::default()
             };

@@ -92,6 +92,8 @@ async fn image_generate_in_process(
             mask_bytes,
             strength,
             ref_image_bytes,
+            sampler: req.sampler.clone(),
+            karras: req.karras.unwrap_or(false),
             conversation_id: req.conversation_id,
         },
         on_event,
@@ -112,6 +114,8 @@ struct InProcInputs {
     mask_bytes: Option<Vec<u8>>,
     strength: f32,
     ref_image_bytes: Vec<Vec<u8>>,
+    sampler: Option<String>,
+    karras: bool,
     conversation_id: Option<i64>,
 }
 
@@ -147,6 +151,8 @@ async fn run_in_process(
         mask_bytes: inputs.mask_bytes,
         strength: inputs.strength,
         ref_image_bytes: inputs.ref_image_bytes,
+        sampler: inputs.sampler,
+        karras: inputs.karras,
         control_image_bytes: None,
         controlnet_weight: 1.0,
         controlnet_start: 0.0,
@@ -419,6 +425,10 @@ pub struct ImageInpaintArgs {
     #[serde(default)]
     pub strength: Option<f32>,
     #[serde(default)]
+    pub sampler: Option<String>,
+    #[serde(default)]
+    pub karras: Option<bool>,
+    #[serde(default)]
     pub conversation_id: Option<i64>,
     /// PNG bytes of the source image.
     pub input_bytes: Vec<u8>,
@@ -448,6 +458,8 @@ pub async fn image_inpaint(
             mask_bytes: args.mask_bytes,
             strength: args.strength.unwrap_or(0.85),
             ref_image_bytes: Vec::new(),
+            sampler: args.sampler.clone(),
+            karras: args.karras.unwrap_or(false),
             conversation_id: args.conversation_id,
         },
         on_event,

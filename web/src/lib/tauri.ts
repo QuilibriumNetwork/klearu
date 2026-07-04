@@ -235,6 +235,10 @@ export interface GenerateRequest {
    *  generation runs the vision-encoder + DeepStack path. Bytes (not paths) so
    *  it works incognito. */
   ref_image_bytes?: Uint8Array[];
+  /** SD/SDXL sampler: 'ddim' | 'euler' | 'euler_a' | 'dpmpp_2m' | 'unipc' | 'lcm'. */
+  sampler?: string;
+  /** Karras sigma schedule (Euler/DPM++/UniPC). */
+  karras?: boolean;
 }
 
 export interface InpaintRequest {
