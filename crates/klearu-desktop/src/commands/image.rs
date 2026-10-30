@@ -95,6 +95,8 @@ async fn image_generate_in_process(
             sampler: req.sampler.clone(),
             karras: req.karras.unwrap_or(false),
             conversation_id: req.conversation_id,
+            width: req.width,
+            height: req.height,
         },
         on_event,
     )
@@ -117,6 +119,8 @@ struct InProcInputs {
     sampler: Option<String>,
     karras: bool,
     conversation_id: Option<i64>,
+    width: Option<usize>,
+    height: Option<usize>,
 }
 
 async fn run_in_process(
@@ -158,6 +162,8 @@ async fn run_in_process(
         controlnet_start: 0.0,
         controlnet_end: 1.0,
         cond_bias,
+        width: inputs.width,
+        height: inputs.height,
     };
 
     let on_event_for_task = on_event.clone();
@@ -355,20 +361,9 @@ pub async fn video_generate(
     let result = engine.generate_video_in_process(video_req, tx).await?;
     let _ = forward.await;
 
-    // Save the MP4 to disk (or base64 in incognito).
-    let path = if workspace.is_incognito() {
-        use base64::Engine;
-        let b64 = base64::engine::general_purpose::STANDARD.encode(&result.mp4_bytes);
-        format!("data:video/mp4;base64,{b64}")
-    } else {
-        let data_dir = workspace.data_dir();
-        let videos_dir = data_dir.join("videos");
-        let _ = std::fs::create_dir_all(&videos_dir);
-        let p = videos_dir.join(format!("{}-{}.mp4", now_secs(), seed));
-        std::fs::write(&p, &result.mp4_bytes)
-            .map_err(|e| DesktopError::Io(format!("write mp4: {e}")))?;
-        p.to_string_lossy().into_owned()
-    };
+    let path = deliver_video(
+        workspace.is_incognito(), &workspace.data_dir(), &result.mp4_bytes, seed, "",
+    )?;
 
     let _ = on_event.send(crate::engine::diffusion::GenEvent::Done {
         job_id: result.job_id,
@@ -393,6 +388,175 @@ pub async fn video_generate(
     let _ = memory.image_record(&rec);
 
     Ok(result.job_id)
+}
+
+/// Arguments for Wan 2.2 video generation.
+///
+/// Defaults are the model's own reference settings, not generic ones: 704x1280
+/// at 24 fps and 49 frames is what it was trained for, and generating below
+/// that is the largest single quality loss available.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WanVideoGenerateArgs {
+    pub prompt: String,
+    #[serde(default)]
+    pub negative_prompt: Option<String>,
+    #[serde(default = "wan_default_steps")]
+    pub steps: usize,
+    #[serde(default = "wan_default_guidance")]
+    pub guidance_scale: f32,
+    #[serde(default)]
+    pub seed: Option<u64>,
+    #[serde(default = "wan_default_frames")]
+    pub num_frames: usize,
+    #[serde(default = "wan_default_width")]
+    pub width: usize,
+    #[serde(default = "wan_default_height")]
+    pub height: usize,
+    #[serde(default = "wan_default_fps")]
+    pub fps: usize,
+    /// Fraction of the schedule over which guidance runs, as `[start, end]`.
+    /// Defaults to the whole schedule — the reference behaviour. Narrowing it
+    /// removes the unconditional forward on the outer steps.
+    #[serde(default = "wan_default_cfg_interval")]
+    pub cfg_interval: [f32; 2],
+    /// Base64-encoded start frame. Bytes rather than a path so an incognito
+    /// session never has to put the user's image on disk.
+    #[serde(default)]
+    pub start_image_b64: Option<String>,
+    /// Base64-encoded end frame.
+    #[serde(default)]
+    pub end_image_b64: Option<String>,
+}
+fn wan_default_steps() -> usize { 30 }
+fn wan_default_guidance() -> f32 { 5.0 }
+fn wan_default_frames() -> usize { 49 }
+fn wan_default_width() -> usize { 1280 }
+fn wan_default_height() -> usize { 704 }
+fn wan_default_fps() -> usize { 24 }
+fn wan_default_cfg_interval() -> [f32; 2] { [0.0, 1.0] }
+
+/// Generate video with Wan 2.2, optionally conditioned on a start and/or end
+/// frame. Both are optional and independent.
+#[cfg(target_os = "macos")]
+#[tauri::command]
+pub async fn wan_video_generate(
+    workspace: State<'_, Arc<Workspace>>,
+    args: WanVideoGenerateArgs,
+    on_event: tauri::ipc::Channel<crate::engine::diffusion::GenEvent>,
+) -> Result<u64> {
+    use base64::Engine as _;
+
+    let decode = |b: &String| -> Result<Vec<u8>> {
+        base64::engine::general_purpose::STANDARD
+            .decode(strip_data_uri(b))
+            .map_err(|e| DesktopError::bad_input(format!("decode image: {e}")))
+    };
+    let start_image_bytes = args.start_image_b64.as_ref().map(decode).transpose()?;
+    let end_image_bytes = args.end_image_b64.as_ref().map(decode).transpose()?;
+
+    let seed = args.seed.unwrap_or_else(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| (d.as_nanos() as u64).wrapping_mul(0x9E3779B97F4A7C15))
+            .unwrap_or(42)
+    });
+
+    let (tx, mut rx) = mpsc::unbounded_channel::<crate::engine::diffusion::GenEvent>();
+    let engine = workspace.diffusion.clone();
+    let memory = workspace.memory.clone();
+
+    let req = crate::engine::diffusion::WanVideoRequest {
+        prompt: args.prompt.clone(),
+        negative_prompt: args.negative_prompt.clone(),
+        steps: args.steps,
+        guidance_scale: args.guidance_scale,
+        seed,
+        num_frames: args.num_frames,
+        width: args.width,
+        height: args.height,
+        fps: args.fps,
+        cfg_interval: (args.cfg_interval[0], args.cfg_interval[1]),
+        start_image_bytes,
+        end_image_bytes,
+    };
+
+    let on_event_copy = on_event.clone();
+    let forward = tokio::spawn(async move {
+        while let Some(ev) = rx.recv().await {
+            if !matches!(ev, crate::engine::diffusion::GenEvent::Done { .. }) {
+                let _ = on_event_copy.send(ev);
+            }
+        }
+    });
+
+    let result = engine.generate_wan_video_in_process(req, tx).await?;
+    let _ = forward.await;
+
+    // Incognito never reaches the filesystem: the MP4 goes back as a data URI
+    // and is not recorded in the gallery either, since that would persist the
+    // prompt.
+    let incognito = workspace.is_incognito();
+    let path = deliver_video(incognito, &workspace.data_dir(), &result.mp4_bytes, seed, "-wan")?;
+
+    let _ = on_event.send(crate::engine::diffusion::GenEvent::Done {
+        job_id: result.job_id,
+        path: path.clone(),
+    });
+
+    if !incognito {
+        let rec = crate::memory::ImageRecord {
+            path: &path,
+            prompt: &args.prompt,
+            negative_prompt: args.negative_prompt.as_deref(),
+            seed: Some(seed as i64),
+            steps: Some(args.steps as i64),
+            cfg_scale: Some(args.guidance_scale as f64),
+            width: Some(result.width as i64),
+            height: Some(result.height as i64),
+            checkpoint: None,
+            conversation_id: None,
+            created_at: now_secs(),
+        };
+        let _ = memory.image_record(&rec);
+    }
+
+    Ok(result.job_id)
+}
+
+/// Hand a finished MP4 back to the caller: a file path normally, a `data:` URI
+/// in incognito.
+///
+/// Shared by the Tauri command and the LAN route on purpose. The two surfaces
+/// previously each carried their own copy of this decision, which is exactly
+/// how one of them ends up writing to disk in incognito after somebody edits
+/// the other.
+pub fn deliver_video(
+    incognito: bool,
+    data_dir: &std::path::Path,
+    mp4_bytes: &[u8],
+    seed: u64,
+    suffix: &str,
+) -> Result<String> {
+    if incognito {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(mp4_bytes);
+        return Ok(format!("data:video/mp4;base64,{b64}"));
+    }
+    let videos_dir = data_dir.join("videos");
+    let _ = std::fs::create_dir_all(&videos_dir);
+    let p = videos_dir.join(format!("{}-{}{suffix}.mp4", now_secs(), seed));
+    std::fs::write(&p, mp4_bytes)
+        .map_err(|e| DesktopError::Io(format!("write mp4: {e}")))?;
+    Ok(p.to_string_lossy().into_owned())
+}
+
+/// Accept both a bare base64 payload and a full `data:` URI, since a browser
+/// `FileReader` produces the latter.
+pub fn strip_data_uri(s: &str) -> &str {
+    match s.find(";base64,") {
+        Some(i) => &s[i + ";base64,".len()..],
+        None => s,
+    }
 }
 
 #[tauri::command]
@@ -461,8 +625,87 @@ pub async fn image_inpaint(
             sampler: args.sampler.clone(),
             karras: args.karras.unwrap_or(false),
             conversation_id: args.conversation_id,
+            width: None,
+            height: None,
         },
         on_event,
     )
     .await
+}
+
+#[cfg(test)]
+mod video_delivery_tests {
+    use super::*;
+
+    fn tmpdir(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("klearu-vid-test-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// Incognito must not leave a video anywhere on disk.
+    ///
+    /// The whole point of the mode is that nothing survives the session, and a
+    /// video is the largest, most identifying artefact the app produces. The
+    /// assertion is on the directory, not just the return value: an
+    /// implementation that writes the file *and* returns a data URI would pass
+    /// a weaker check while leaking the video.
+    #[test]
+    fn incognito_video_never_touches_disk() {
+        let dir = tmpdir("incognito");
+        let mp4 = b"\x00\x00\x00\x18ftypmp42fake-payload".to_vec();
+
+        let path = deliver_video(true, &dir, &mp4, 99, "-wan").unwrap();
+        assert!(path.starts_with("data:video/mp4;base64,"), "expected a data URI, got {path}");
+
+        let videos = dir.join("videos");
+        assert!(!videos.exists(), "incognito must not even create the videos directory");
+        let stray: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().collect();
+        assert!(stray.is_empty(), "incognito wrote {} entries into the data dir", stray.len());
+
+        // The payload must actually be in the URI — an empty one would "pass"
+        // the no-disk check while losing the user's video.
+        use base64::Engine;
+        let b64 = path.trim_start_matches("data:video/mp4;base64,");
+        let decoded = base64::engine::general_purpose::STANDARD.decode(b64).unwrap();
+        assert_eq!(decoded, mp4, "data URI must carry the whole mp4");
+    }
+
+    /// Outside incognito the file is written and the path returned.
+    #[test]
+    fn normal_mode_writes_the_video() {
+        let dir = tmpdir("normal");
+        let mp4 = b"fake-mp4-bytes".to_vec();
+
+        let path = deliver_video(false, &dir, &mp4, 7, "-wan").unwrap();
+        assert!(!path.starts_with("data:"), "expected a filesystem path, got {path}");
+        let p = std::path::Path::new(&path);
+        assert!(p.exists(), "video should exist at {path}");
+        assert_eq!(std::fs::read(p).unwrap(), mp4);
+        assert!(path.ends_with("-wan.mp4"), "suffix should distinguish the backend: {path}");
+    }
+
+    /// The two backends must not collide on one filename.
+    #[test]
+    fn suffix_separates_the_two_video_backends() {
+        let dir = tmpdir("suffix");
+        let a = deliver_video(false, &dir, b"a", 1, "-wan").unwrap();
+        let b = deliver_video(false, &dir, b"b", 1, "").unwrap();
+        assert_ne!(a, b, "same seed and second must still produce distinct files");
+        assert_eq!(std::fs::read(&a).unwrap(), b"a");
+        assert_eq!(std::fs::read(&b).unwrap(), b"b");
+    }
+
+    /// A browser `FileReader` yields a full data URI; a hand-built request
+    /// yields bare base64. Both have to work, or conditioning silently fails
+    /// with a decode error on one of the two clients.
+    #[test]
+    fn strip_data_uri_accepts_both_forms() {
+        assert_eq!(strip_data_uri("data:image/png;base64,QUJD"), "QUJD");
+        assert_eq!(strip_data_uri("data:image/jpeg;base64,QUJD"), "QUJD");
+        assert_eq!(strip_data_uri("QUJD"), "QUJD");
+        // No base64 marker: pass through rather than truncate.
+        assert_eq!(strip_data_uri("data:image/png,raw"), "data:image/png,raw");
+    }
 }

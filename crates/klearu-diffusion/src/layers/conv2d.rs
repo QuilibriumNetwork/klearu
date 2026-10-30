@@ -207,7 +207,9 @@ impl Conv2d {
         // loop with a single fused conv. Cached graph per (weight, shape).
         if std::env::var_os("KLEARU_MPSGRAPH_CONV").is_some() {
             let (out_buf, h_out, w_out) = mpsgraph_conv2d(
-                &input.buffer, &self.weight,
+                // The layer owns its weights for its whole life, so the
+                // address is a stable id here. See `next_weight_id`.
+                &input.buffer, &self.weight, self.weight.as_ptr() as u64,
                 n, self.in_channels, h_in, w_in,
                 self.out_channels, self.kernel_h, self.kernel_w,
                 self.stride, self.padding,

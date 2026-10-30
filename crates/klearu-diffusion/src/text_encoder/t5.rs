@@ -29,6 +29,24 @@ use crate::error::{DiffusionError, Result};
 use crate::weight::ComponentTensors;
 
 /// T5-XXL encoder configuration.
+/// Which GELU the gated feed-forward uses.
+///
+/// HuggingFace's `T5Config` rewrites `feed_forward_proj: "gated-gelu"` into
+/// `dense_act_fn: "gelu_new"`, and `ACT2FN["gelu_new"]` is the **tanh**
+/// approximation, not erf.
+///
+/// NOTE: [`T5Config::t5_xxl`] still selects [`GeluKind::Erf`], which is very
+/// likely wrong for Flux's T5 as well — but changing it would perturb existing
+/// Flux output, so it is left alone pending a reference comparison. New models
+/// (umT5) use the correct `Tanh`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GeluKind {
+    /// Exact GELU via erf.
+    Erf,
+    /// `gelu_new` / `NewGELUActivation`: the tanh approximation.
+    Tanh,
+}
+
 #[derive(Debug, Clone)]
 pub struct T5Config {
     pub vocab_size: usize,
@@ -41,6 +59,10 @@ pub struct T5Config {
     pub relative_attention_max_distance: usize,
     pub layer_norm_eps: f32,
     pub max_seq_len: usize,
+    /// umT5 gives **every** block its own `relative_attention_bias`; plain T5
+    /// has one in block 0 that all later blocks share.
+    pub relative_bias_per_layer: bool,
+    pub dense_act: GeluKind,
 }
 
 impl T5Config {
@@ -56,6 +78,30 @@ impl T5Config {
             relative_attention_max_distance: 128,
             layer_norm_eps: 1e-6,
             max_seq_len: 512,
+            relative_bias_per_layer: false,
+            dense_act: GeluKind::Erf,
+        }
+    }
+
+    /// `google/umt5-xxl`, the Wan text encoder.
+    ///
+    /// Same block shape as T5-XXL but a much larger vocabulary, and — the
+    /// defining difference — a `relative_attention_bias` table in every one of
+    /// the 24 blocks rather than only the first.
+    pub fn umt5_xxl() -> Self {
+        Self {
+            vocab_size: 256_384,
+            d_model: 4096,
+            d_ff: 10240,
+            d_kv: 64,
+            num_heads: 64,
+            num_layers: 24,
+            relative_attention_num_buckets: 32,
+            relative_attention_max_distance: 128,
+            layer_norm_eps: 1e-6,
+            max_seq_len: 512,
+            relative_bias_per_layer: true,
+            dense_act: GeluKind::Tanh,
         }
     }
 }
@@ -119,6 +165,7 @@ pub struct T5FF {
     pub wi_0: LinearNoBias, // gate
     pub wi_1: LinearNoBias, // up
     pub wo: LinearNoBias,   // down
+    pub act: GeluKind,
 }
 
 impl T5FF {
@@ -128,6 +175,7 @@ impl T5FF {
             wi_0: LinearNoBias::new(cfg.d_model, cfg.d_ff),
             wi_1: LinearNoBias::new(cfg.d_model, cfg.d_ff),
             wo: LinearNoBias::new(cfg.d_ff, cfg.d_model),
+            act: cfg.dense_act,
         }
     }
 
@@ -142,7 +190,10 @@ impl T5FF {
         self.wi_1.forward(&x_norm, n_tokens, &mut u);
         // gelu(g) ⊙ u — T5 uses the exact (erf-based) GELU.
         for i in 0..g.len() {
-            g[i] = gelu_exact(g[i]) * u[i];
+            g[i] = match self.act {
+                GeluKind::Erf => gelu_exact(g[i]),
+                GeluKind::Tanh => gelu_tanh(g[i]),
+            } * u[i];
         }
         let mut down = vec![0.0_f32; n_tokens * d];
         self.wo.forward(&g, n_tokens, &mut down);
@@ -322,7 +373,7 @@ impl T5Encoder {
     pub fn from_config(cfg: T5Config) -> Self {
         let blocks: Vec<T5Block> = (0..cfg.num_layers)
             .map(|i| T5Block {
-                attn: T5SelfAttn::new(&cfg, i == 0),
+                attn: T5SelfAttn::new(&cfg, i == 0 || cfg.relative_bias_per_layer),
                 ff: T5FF::new(&cfg),
             })
             .collect();
@@ -331,13 +382,41 @@ impl T5Encoder {
         Self { config: cfg, embed, blocks, final_layer_norm }
     }
 
+    /// Every tensor name this encoder will ask for, in load order.
+    ///
+    /// Useful for validating a checkpoint up front, and as a structural
+    /// assertion: `google/umt5-xxl` ships exactly 242 tensors, which is 24
+    /// blocks x 10 plus `shared.weight` and `encoder.final_layer_norm.weight`.
+    /// Plain T5-XXL has 219 — the 23 fewer are the per-block
+    /// `relative_attention_bias` tables it does not have.
+    pub fn tensor_names(&self) -> Vec<String> {
+        let cfg = &self.config;
+        let mut out = vec!["shared.weight".to_string()];
+        for i in 0..cfg.num_layers {
+            let p = format!("encoder.block.{i}");
+            out.push(format!("{p}.layer.0.layer_norm.weight"));
+            for n in ["q", "k", "v", "o"] {
+                out.push(format!("{p}.layer.0.SelfAttention.{n}.weight"));
+            }
+            if i == 0 || cfg.relative_bias_per_layer {
+                out.push(format!("{p}.layer.0.SelfAttention.relative_attention_bias.weight"));
+            }
+            out.push(format!("{p}.layer.1.layer_norm.weight"));
+            for n in ["wi_0", "wi_1", "wo"] {
+                out.push(format!("{p}.layer.1.DenseReluDense.{n}.weight"));
+            }
+        }
+        out.push("encoder.final_layer_norm.weight".to_string());
+        out
+    }
+
     /// Load weights from an HF-format component. Uses the standard
     /// `T5EncoderModel` naming (`shared.weight`, `encoder.block.<i>.layer.{0,1}.*`,
     /// `encoder.final_layer_norm.weight`).
     pub fn load_from(&mut self, comp: &ComponentTensors) -> Result<()> {
         let t0 = std::time::Instant::now();
         let cfg = self.config.clone();
-        eprintln!("[flux]   t5 embedding…");
+        eprintln!("[t5] embedding…");
         // Embedding.
         self.embed = comp.get_f32("shared.weight")
             .or_else(|_| comp.get_f32("encoder.embed_tokens.weight"))?;
@@ -354,7 +433,7 @@ impl T5Encoder {
             let p = format!("encoder.block.{i}");
             // Pre-print so user sees progress *before* the slow tensor reads.
             if (i + 1) % 4 == 0 || i + 1 == n || i == 0 {
-                eprintln!("[flux]   t5 block {}/{n}  ({:.1}s elapsed)",
+                eprintln!("[t5] block {}/{n}  ({:.1}s elapsed)",
                     i + 1, t0.elapsed().as_secs_f32());
             }
             // layer.0 = SelfAttention
@@ -363,7 +442,7 @@ impl T5Encoder {
             blk.attn.k.weight = comp.get_f32(&format!("{p}.layer.0.SelfAttention.k.weight"))?;
             blk.attn.v.weight = comp.get_f32(&format!("{p}.layer.0.SelfAttention.v.weight"))?;
             blk.attn.o.weight = comp.get_f32(&format!("{p}.layer.0.SelfAttention.o.weight"))?;
-            if i == 0 {
+            if i == 0 || cfg.relative_bias_per_layer {
                 let bias = comp.get_f32(&format!(
                     "{p}.layer.0.SelfAttention.relative_attention_bias.weight"
                 ))?;
@@ -376,7 +455,7 @@ impl T5Encoder {
             blk.ff.wo.weight = comp.get_f32(&format!("{p}.layer.1.DenseReluDense.wo.weight"))?;
         }
         self.final_layer_norm.gamma = comp.get_f32("encoder.final_layer_norm.weight")?;
-        eprintln!("[flux]   t5 loaded in {:.1}s", t0.elapsed().as_secs_f32());
+        eprintln!("[t5] loaded in {:.1}s", t0.elapsed().as_secs_f32());
         Ok(())
     }
 
@@ -397,18 +476,31 @@ impl T5Encoder {
             x[t * d..(t + 1) * d].copy_from_slice(row);
         }
         if progress {
-            eprintln!("[flux]   t5.forward: seq_len={seq_len}, d={d}, {n} layers");
+            eprintln!("[t5] forward: seq_len={seq_len}, d={d}, {n} layers");
         }
 
-        // Compute relative position bias once (block 0 owns the table).
-        let bias = self.blocks[0].attn.compute_bias(seq_len);
+        // Plain T5 computes the bias once from block 0 and shares it; umT5
+        // has a table per block, so it must be recomputed each layer.
+        let shared_bias = if self.config.relative_bias_per_layer {
+            None
+        } else {
+            Some(self.blocks[0].attn.compute_bias(seq_len))
+        };
 
         // Run each block: self-attn (with bias) + FF.
         for (i, blk) in self.blocks.iter().enumerate() {
-            blk.attn.forward_residual(&mut x, seq_len, &bias, attn_mask);
+            let per_layer;
+            let bias = match &shared_bias {
+                Some(b) => b,
+                None => {
+                    per_layer = blk.attn.compute_bias(seq_len);
+                    &per_layer
+                }
+            };
+            blk.attn.forward_residual(&mut x, seq_len, bias, attn_mask);
             blk.ff.forward_residual(&mut x, seq_len);
             if progress {
-                eprintln!("[flux]   t5.forward: layer {}/{n}  ({:.1}s elapsed)",
+                eprintln!("[t5] forward: layer {}/{n}  ({:.1}s elapsed)",
                     i + 1, t0.elapsed().as_secs_f32());
             }
         }
@@ -416,13 +508,20 @@ impl T5Encoder {
         // Final layer norm.
         self.final_layer_norm.forward_inplace(&mut x, seq_len);
         if progress {
-            eprintln!("[flux]   t5.forward: done in {:.1}s", t0.elapsed().as_secs_f32());
+            eprintln!("[t5] forward: done in {:.1}s", t0.elapsed().as_secs_f32());
         }
         x
     }
 }
 
-/// Exact GELU using erf. T5 uses this (not the tanh approximation).
+/// `gelu_new` / `NewGELUActivation`: the tanh approximation. This is what
+/// HuggingFace actually uses for `feed_forward_proj: "gated-gelu"`.
+fn gelu_tanh(x: f32) -> f32 {
+    const C: f32 = 0.797_885; // sqrt(2/pi)
+    0.5 * x * (1.0 + (C * (x + 0.044_715 * x * x * x)).tanh())
+}
+
+/// Exact GELU using erf.
 fn gelu_exact(x: f32) -> f32 {
     // 0.5 · x · (1 + erf(x / sqrt(2)))
     0.5 * x * (1.0 + erf_approx(x / std::f32::consts::SQRT_2))
@@ -459,6 +558,8 @@ mod tests {
             relative_attention_max_distance: 16,
             layer_norm_eps: 1e-6,
             max_seq_len: 32,
+            relative_bias_per_layer: false,
+            dense_act: GeluKind::Erf,
         }
     }
 
@@ -492,5 +593,258 @@ mod tests {
         assert_eq!(out.len(), 4 * 8);
         // No NaNs.
         assert!(out.iter().all(|x| x.is_finite()));
+    }
+    // -- umT5 -------------------------------------------------------------
+
+    #[test]
+    fn umt5_config_differs_from_t5_where_it_should() {
+        let u = T5Config::umt5_xxl();
+        let t = T5Config::t5_xxl();
+        // Same block geometry...
+        assert_eq!((u.d_model, u.d_ff, u.d_kv, u.num_heads, u.num_layers), (4096, 10240, 64, 64, 24));
+        assert_eq!((u.d_model, u.d_ff, u.num_layers), (t.d_model, t.d_ff, t.num_layers));
+        // ...but a far larger vocabulary, a bias table per block, and the
+        // tanh GELU that `gated-gelu` actually maps to.
+        assert_eq!(u.vocab_size, 256_384);
+        assert!(u.relative_bias_per_layer);
+        assert!(!t.relative_bias_per_layer);
+        assert_eq!(u.dense_act, GeluKind::Tanh);
+    }
+
+    #[test]
+    fn umt5_tensor_inventory_matches_the_real_checkpoint() {
+        // google/umt5-xxl ships 242 tensors (from its safetensors index).
+        let enc = T5Encoder::from_config(T5Config::umt5_xxl());
+        let names = enc.tensor_names();
+        assert_eq!(names.len(), 242);
+        let unique: std::collections::HashSet<_> = names.iter().collect();
+        assert_eq!(unique.len(), names.len(), "duplicate tensor name");
+
+        // A bias table in every block is the umT5 signature.
+        for i in 0..24 {
+            let n = format!("encoder.block.{i}.layer.0.SelfAttention.relative_attention_bias.weight");
+            assert!(names.contains(&n), "missing per-block bias at {i}");
+        }
+
+        // Plain T5-XXL has one, in block 0 only — 23 tensors fewer.
+        let t5 = T5Encoder::from_config(T5Config::t5_xxl());
+        let t5_names = t5.tensor_names();
+        assert_eq!(t5_names.len(), 242 - 23);
+        assert!(t5_names
+            .iter()
+            .filter(|n| n.contains("relative_attention_bias"))
+            .count()
+            == 1);
+    }
+
+    #[test]
+    fn umt5_allocates_a_bias_table_per_block() {
+        let enc = T5Encoder::from_config(T5Config::umt5_xxl());
+        assert!(
+            enc.blocks.iter().all(|b| b.attn.relative_attention_bias.is_some()),
+            "every umT5 block needs its own relative_attention_bias"
+        );
+        let t5 = T5Encoder::from_config(T5Config::t5_xxl());
+        assert!(t5.blocks[0].attn.relative_attention_bias.is_some());
+        assert!(
+            t5.blocks[1..].iter().all(|b| b.attn.relative_attention_bias.is_none()),
+            "plain T5 shares block 0's table"
+        );
+    }
+
+    #[test]
+    fn umt5_uses_each_blocks_own_bias() {
+        // Give block 1 a distinctive bias table and check it changes the
+        // output. Under T5's shared-bias path block 1's table is never read,
+        // so this is what separates the two behaviours.
+        let mut cfg = tiny_cfg();
+        cfg.relative_bias_per_layer = true;
+        let mut enc = T5Encoder::from_config(cfg.clone());
+        for (i, b) in enc.blocks.iter_mut().enumerate() {
+            b.attn.q.weight.iter_mut().enumerate().for_each(|(k, w)| {
+                *w = ((k + i) as f32 * 0.3).sin() * 0.2
+            });
+            b.attn.v.weight.iter_mut().enumerate().for_each(|(k, w)| {
+                *w = ((k + i) as f32 * 0.7).cos() * 0.2
+            });
+            b.attn.o.weight.iter_mut().for_each(|w| *w = 0.05);
+        }
+        for (i, e) in enc.embed.iter_mut().enumerate() {
+            *e = (i as f32 * 0.11).sin();
+        }
+        let tokens = [1u32, 2, 3, 4];
+        let before = enc.forward(&tokens, None);
+
+        let table = enc.blocks[1].attn.relative_attention_bias.as_mut().unwrap();
+        for (k, v) in table.iter_mut().enumerate() {
+            *v = (k as f32) * 0.5;
+        }
+        let after = enc.forward(&tokens, None);
+
+        let worst = before.iter().zip(&after).map(|(a, b)| (a - b).abs()).fold(0.0_f32, f32::max);
+        assert!(worst > 1e-4, "block 1's own bias table was ignored: {worst}");
+    }
+
+    #[test]
+    fn the_two_gelus_are_close_but_not_equal() {
+        // `gated-gelu` maps to `gelu_new` (tanh) in HuggingFace, not erf.
+        // The gap is small, which is exactly why using the wrong one is easy
+        // to miss — see the note on `GeluKind`.
+        let mut worst = 0.0_f32;
+        for i in -400..400 {
+            let x = i as f32 * 0.01;
+            worst = worst.max((gelu_exact(x) - gelu_tanh(x)).abs());
+        }
+        assert!(worst > 1e-5, "the two should genuinely differ: {worst}");
+        assert!(worst < 2e-3, "but only slightly: {worst}");
+    }
+    /// Load the **real** 11 GB umT5-XXL encoder and run it.
+    ///
+    /// Validates against the shipped checkpoint what the config alone cannot:
+    /// that the 242-tensor inventory is right, that the per-block
+    /// `relative_attention_bias` really is present in all 24 blocks (the
+    /// difference from plain T5), and that a bf16 checkpoint decodes.
+    ///
+    ///   KLEARU_UMT5=/abs/path/to/text_encoder \
+    ///   cargo test -p klearu-diffusion --lib --release \
+    ///     -- --ignored --nocapture real_umt5
+    #[test]
+    #[ignore]
+    fn real_umt5_loads_and_encodes() {
+        use crate::weight::ComponentTensors;
+
+        let Ok(dir) = std::env::var("KLEARU_UMT5") else {
+            eprintln!("set KLEARU_UMT5 to the text_encoder/ directory; skipping");
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+
+        // The shipped config must agree with `umt5_xxl()`, which is hardcoded.
+        let raw = std::fs::read_to_string(dir.join("config.json")).expect("read config.json");
+        let j: serde_json::Value = serde_json::from_str(&raw).expect("parse config.json");
+        let cfg = T5Config::umt5_xxl();
+        let get = |k: &str| j[k].as_u64().unwrap_or_else(|| panic!("missing {k}")) as usize;
+        assert_eq!(get("d_model"), cfg.d_model);
+        assert_eq!(get("d_ff"), cfg.d_ff);
+        assert_eq!(get("d_kv"), cfg.d_kv);
+        assert_eq!(get("num_heads"), cfg.num_heads);
+        assert_eq!(get("num_layers"), cfg.num_layers);
+        assert_eq!(get("vocab_size"), cfg.vocab_size);
+        assert_eq!(get("relative_attention_num_buckets"), cfg.relative_attention_num_buckets);
+        assert_eq!(j["model_type"].as_str(), Some("umt5"));
+        assert_eq!(j["feed_forward_proj"].as_str(), Some("gated-gelu"));
+        println!(
+            "config: umt5 {} layers, d_model {}, d_ff {}, {} heads x {}, vocab {}",
+            cfg.num_layers, cfg.d_model, cfg.d_ff, cfg.num_heads, cfg.d_kv, cfg.vocab_size
+        );
+
+        let t0 = std::time::Instant::now();
+        let comp = ComponentTensors::open_dir(&dir).expect("open checkpoint");
+        println!("checkpoint holds {} tensors", comp.tensors.len());
+
+        let mut enc = T5Encoder::from_config(cfg.clone());
+        let names = enc.tensor_names();
+        println!("model requests {} tensors", names.len());
+        let missing: Vec<_> = names.iter().filter(|n| !comp.has(n)).cloned().collect();
+        assert!(
+            missing.is_empty(),
+            "missing {}: {:?}",
+            missing.len(),
+            &missing[..missing.len().min(8)]
+        );
+        // The umT5 signature: a bias table in every block, not just block 0.
+        for i in 0..cfg.num_layers {
+            let n = format!(
+                "encoder.block.{i}.layer.0.SelfAttention.relative_attention_bias.weight"
+            );
+            assert!(comp.has(&n), "checkpoint lacks per-block bias at {i}");
+        }
+        println!("inventory matches, per-block bias present in all {} blocks", cfg.num_layers);
+
+        enc.load_from(&comp).expect("load real weights");
+        println!("loaded in {:.1}s", t0.elapsed().as_secs_f32());
+
+        // Arbitrary in-vocabulary ids: real text needs the SentencePiece
+        // tokenizer, which is a separate piece.
+        let tokens: Vec<u32> = vec![259, 1001, 2048, 77, 3, 512, 9, 1];
+        let t1 = std::time::Instant::now();
+        let out = enc.forward(&tokens, None);
+        println!("encoded {} tokens in {:.1}s", tokens.len(), t1.elapsed().as_secs_f32());
+
+        assert_eq!(out.len(), tokens.len() * cfg.d_model);
+        assert!(out.iter().all(|v| v.is_finite()), "non-finite hidden states");
+        let mean = out.iter().sum::<f32>() / out.len() as f32;
+        let var = out.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / out.len() as f32;
+        println!("hidden states: mean={mean:.4} std={:.4}", var.sqrt());
+        assert!(var.sqrt() > 1e-3, "hidden states are nearly constant");
+
+        // Different tokens must give different states — otherwise the
+        // embedding table or the bias wiring is wrong.
+        let other: Vec<u32> = vec![7, 42, 900, 31337, 5, 6, 8, 1];
+        let out2 = enc.forward(&other, None);
+        let diff = out
+            .iter()
+            .zip(&out2)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        println!("max |delta| between two token sequences: {diff:.4}");
+        assert!(diff > 1e-2, "encoder output does not depend on the tokens");
+    }
+    /// Compare klearu's umT5 against transformers on the **real 11 GB
+    /// checkpoint** — the last Wan component never validated numerically.
+    ///
+    /// Bad text conditioning would hand the DiT garbage to cross-attend to,
+    /// which is exactly what an incoherent generation looks like, so this
+    /// closes the remaining gap.
+    ///
+    ///   <python> scripts/dump_umt5_reference.py \
+    ///       --model models/wan22-ti2v-5b/text_encoder --out <dir>/umt5_ref.safetensors
+    ///   KLEARU_UMT5=/abs/text_encoder KLEARU_UMT5_REF=<dir>/umt5_ref.safetensors \
+    ///   cargo test -p klearu-diffusion --lib --release \
+    ///     -- --ignored --nocapture umt5_matches_transformers
+    #[test]
+    #[ignore]
+    fn umt5_matches_transformers() {
+        use crate::weight::ComponentTensors;
+
+        let (Ok(dir), Ok(ref_path)) =
+            (std::env::var("KLEARU_UMT5"), std::env::var("KLEARU_UMT5_REF"))
+        else {
+            eprintln!("set KLEARU_UMT5 and KLEARU_UMT5_REF; skipping");
+            return;
+        };
+        let ref_dir = std::path::Path::new(&ref_path).parent().unwrap().to_path_buf();
+        let r = ComponentTensors::open_dir(&ref_dir).expect("open reference");
+
+        let mut enc = T5Encoder::from_config(T5Config::umt5_xxl());
+        enc.load_from(&ComponentTensors::open_dir(std::path::Path::new(&dir)).unwrap())
+            .expect("load real umT5");
+
+        let compare = |label: &str, ids_key: &str, out_key: &str, n_real: usize| -> f64 {
+            let ids: Vec<u32> =
+                r.get_f32(ids_key).unwrap().iter().map(|v| *v as u32).collect();
+            let want = r.get_f32(out_key).unwrap();
+            let mask: Vec<bool> = (0..ids.len()).map(|i| i < n_real).collect();
+            let got = enc.forward(&ids, Some(&mask));
+            assert_eq!(got.len(), want.len(), "{label}: length");
+
+            // Only the real positions are meaningful: what a masked-out
+            // position produces is unconstrained, and the pipeline zeroes it.
+            let d = enc.config.d_model;
+            let (g, w) = (&got[..n_real * d], &want[..n_real * d]);
+            let worst = g.iter().zip(w).map(|(a, b)| (a - b).abs()).fold(0.0_f32, f32::max);
+            let dot: f64 = g.iter().zip(w).map(|(a, b)| *a as f64 * *b as f64).sum();
+            let na: f64 = g.iter().map(|a| (*a as f64).powi(2)).sum::<f64>().sqrt();
+            let nb: f64 = w.iter().map(|b| (*b as f64).powi(2)).sum::<f64>().sqrt();
+            let cos = dot / (na * nb + 1e-12);
+            println!("{label:10} max_abs_diff={worst:.4e}  cos_sim={cos:.8}");
+            cos
+        };
+
+        let c1 = compare("nopad", "in.ids_nopad", "out.nopad", 8);
+        let c2 = compare("padded", "in.ids_padded", "out.padded", 8);
+
+        assert!(c1 > 0.9999, "umT5 diverged from transformers (nopad): {c1}");
+        assert!(c2 > 0.9999, "umT5 diverged from transformers (padded): {c2}");
     }
 }

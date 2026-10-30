@@ -239,6 +239,10 @@ export interface GenerateRequest {
   sampler?: string;
   /** Karras sigma schedule (Euler/DPM++/UniPC). */
   karras?: boolean;
+  /** Output size in pixels for models that take one (Krea 2, Flux, HiDream);
+   *  SD/SDXL ignore it and use their native size. */
+  width?: number;
+  height?: number;
 }
 
 export interface InpaintRequest {
@@ -353,6 +357,43 @@ export async function videoGenerate(req: VideoGenerateRequest, onEvent: (e: GenE
   }
   const channel = await newChannel<GenEvent>(onEvent);
   return invoke<number>('video_generate', { args: req, onEvent: channel });
+}
+
+/** Wan 2.2 video generation, with optional start/end frame conditioning.
+ *
+ *  Defaults mirror the model's reference settings (704x1280, 49 frames, 24fps,
+ *  30 steps) — Wan degrades sharply below its native resolution, so leaving
+ *  these unset is the right call unless you are deliberately trading quality
+ *  for time. Conditioning frames are base64 (a `data:` URI is accepted), never
+ *  paths, so incognito sessions never write the user's image to disk. */
+export interface WanVideoGenerateRequest {
+  prompt: string;
+  negative_prompt?: string;
+  steps?: number;
+  guidance_scale?: number;
+  seed?: number;
+  num_frames?: number;
+  width?: number;
+  height?: number;
+  fps?: number;
+  /** Fraction of the schedule over which guidance runs, as [start, end].
+   *  Defaults to the whole schedule. Narrowing it removes the unconditional
+   *  forward on the outer steps — roughly half the cost of each step it skips. */
+  cfg_interval?: [number, number];
+  start_image_b64?: string;
+  end_image_b64?: string;
+}
+
+export async function wanVideoGenerate(
+  req: WanVideoGenerateRequest,
+  onEvent: (e: GenEvent) => void,
+): Promise<number> {
+  if (isRemote()) {
+    await remoteStream<GenEvent>('wan_video_generate', { args: req }, onEvent);
+    return 0;
+  }
+  const channel = await newChannel<GenEvent>(onEvent);
+  return invoke<number>('wan_video_generate', { args: req, onEvent: channel });
 }
 
 export async function imageAbort(): Promise<number | null> {

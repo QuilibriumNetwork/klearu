@@ -59,10 +59,12 @@ impl AdamW {
     /// NOT decayed (standard convention).
     pub fn step(&mut self, model: &mut ImageTransformer, grad: &Gradients) {
         self.step += 1;
-        let cfg = self.config.clone();
+        let mut cfg = self.config.clone();
         let bc1 = 1.0 - cfg.beta1.powi(self.step as i32);
         let bc2 = 1.0 - cfg.beta2.powi(self.step as i32);
         let lr_t = cfg.lr * bc2.sqrt() / bc1;
+        // Match m_hat / (sqrt(v_hat) + eps) with uncorrected moments.
+        cfg.eps *= bc2.sqrt();
 
         update_buf(&mut model.embed, &grad.embed,
             &mut self.m.embed, &mut self.v.embed, &cfg, lr_t, true);
@@ -122,9 +124,9 @@ fn update_buf(
         let g = grad[i];
         m[i] = beta1 * m[i] + (1.0 - beta1) * g;
         v[i] = beta2 * v[i] + (1.0 - beta2) * g * g;
-        // m and v are already bias-corrected outside via lr_t.
-        let update = m[i] / (v[i].sqrt() + eps) + wd * param[i];
-        param[i] -= lr_t * update;
+        // Bias correction is folded into lr_t and eps; decay uses base lr.
+        param[i] *= 1.0 - cfg.lr * wd;
+        param[i] -= lr_t * m[i] / (v[i].sqrt() + eps);
     }
 }
 
@@ -142,6 +144,7 @@ mod tests {
             image_grid_h: 2, image_grid_w: 2,
             bos_token: 100, sep_image_token: 101, eos_token: 102,
             rms_norm_eps: 1e-5, rope_theta: 10_000.0,
+            stable_image_positions: false,
         }
     }
 

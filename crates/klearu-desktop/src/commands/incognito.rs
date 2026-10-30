@@ -9,11 +9,16 @@
 //! existed.
 //!
 //! **There is no scratch directory.** Features that fundamentally need a
-//! filesystem path — image generation (the `sd_generate` subprocess
-//! requires `--out FILE.png`), inpainting (same), distillation (writes a
-//! whole dataset) — are refused while incognito is active. They'll be
-//! unblocked once the diffusion library refactor (tasks 247/248) makes
-//! generation callable in-process with byte buffers instead of paths.
+//! filesystem path — distillation (writes a whole dataset), image training
+//! (writes checkpoints and logs) — are refused while incognito is active.
+//!
+//! Image and video generation are not among them any more: both run in-process
+//! and take their inputs as byte buffers, so a whole generation completes
+//! without a filesystem path existing. Results come back as `data:` URIs and no
+//! gallery row is written. See `commands::image::deliver_video`, which is the
+//! single place that decision is made for video — deliberately shared by the
+//! Tauri command and the LAN route, because two copies is how one of them ends
+//! up writing to disk after somebody edits the other.
 
 use std::sync::Arc;
 
@@ -40,6 +45,8 @@ const INCOGNITO_NON_PERSISTED: &[&str] = &[
     "settings writes (in-memory only)",
     "image generation — txt2img, img2img, inpaint, native-inpaint, reference editing (in-process)",
     "image gallery rows + PNGs (in-memory; PNGs delivered as data: URIs)",
+    "video generation — Wan 2.2 text-to-video and start/end frame conditioning \
+     (in-process; conditioning images are read as bytes, MP4s delivered as data: URIs)",
 ];
 
 const INCOGNITO_BLOCKED: &[&str] = &[

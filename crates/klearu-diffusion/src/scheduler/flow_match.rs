@@ -49,6 +49,28 @@ impl FlowMatchConfig {
             max_image_seq_len: 4096,
         }
     }
+    /// Krea 2 Raw: Flux's resolution-dependent shift with the upper anchor
+    /// moved out to 6400 image tokens (1280² pixels at 16 px per token).
+    pub fn krea2_raw() -> Self {
+        Self {
+            use_dynamic_shifting: true,
+            base_shift: 0.5,
+            max_shift: 1.15,
+            base_image_seq_len: 256,
+            max_image_seq_len: 6400,
+        }
+    }
+    /// Krea 2 Turbo: distilled at a fixed shift μ = 1.15 regardless of
+    /// resolution.
+    pub fn krea2_turbo() -> Self {
+        Self {
+            use_dynamic_shifting: false,
+            base_shift: 1.15,
+            max_shift: 1.15,
+            base_image_seq_len: 256,
+            max_image_seq_len: 6400,
+        }
+    }
     pub fn flux_schnell() -> Self {
         Self {
             use_dynamic_shifting: false,

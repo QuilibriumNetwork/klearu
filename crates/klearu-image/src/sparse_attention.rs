@@ -9,9 +9,11 @@
 //!
 //! Cost comparison at our baseline (n=320, h=8, dh=64):
 //!   Dense:  O(n²·d) ≈ 320·320·512 ≈ 50M ops per layer's attention.
-//!   Sparse: O(n·K·dh + n·num_tables) ≈ 320·64·64 + 320·8 ≈ 1.3M ops.
-//!   ~40× speedup on the scoring step. LSH index build adds O(n·num_tables)
-//!   per-layer overhead — small at this scale.
+//!   Sparse: O(h·n·K·dh), plus hashing/index construction: about 10.5M
+//!   scoring multiply-adds for h=8, n=320, K=64, dh=64.
+//!   This is a theoretical scoring reduction, not an end-to-end speedup.
+//!   Candidate counts vary; index overhead and unchanged projections/FFNs
+//!   must be included in benchmarks.
 //!
 //! Backward pass: we cache the candidate sets used during forward and
 //! reuse them during backward. The unselected positions contribute
@@ -338,6 +340,7 @@ pub fn forward_with_sparse_attention(
         });
     }
     let unified = cfg.unified_vocab_size();
+        let (positions, _) = cfg.position_indices(token_ids, 0, None)?;
 
     // Embed + position add.
     let mut x = vec![0.0_f32; n * d];
@@ -349,7 +352,7 @@ pub fn forward_with_sparse_attention(
             });
         }
         let eoff = (tid as usize) * d;
-        let poff = i * d;
+        let poff = positions[i] * d;
         let dst = &mut x[i * d..(i + 1) * d];
         for k in 0..d {
             dst[k] = model.embed[eoff + k] + model.pos_embed[poff + k];
@@ -382,6 +385,7 @@ mod tests {
             image_grid_h: 4, image_grid_w: 4,
             bos_token: 100, sep_image_token: 101, eos_token: 102,
             rms_norm_eps: 1e-5, rope_theta: 10_000.0,
+            stable_image_positions: false,
         }
     }
 

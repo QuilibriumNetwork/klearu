@@ -26,8 +26,8 @@
 //!   MoE    : N · 3 · hidden · expert_intermediate + hidden · N    params
 //!   With N=16, expert_intermediate = mlp_intermediate / K (K=4),
 //!   the MoE has ~4× the total FFN params (more capacity), but only
-//!   K/N = 1/4 of them activate per token. Effective FLOPs are ~1/K = 25%
-//!   of dense; capacity is up to 4× dense.
+//!   K/N = 1/4 of them activate per token. Selected expert widths sum to the dense width: FFN arithmetic is
+//!   approximately equal to dense, plus routing; total capacity is 4× dense.
 
 use crate::error::Result;
 use crate::model::{ImageTransformerConfig, LinearNoBias, RmsNorm};
@@ -51,7 +51,7 @@ pub struct MoeFfnConfig {
 impl MoeFfnConfig {
     /// Matched to the dense baseline (`mlp_intermediate = 1408`,
     /// `hidden = 512`). 16 experts × intermediate=352, top-4 routing.
-    /// Total expert params ≈ 4× dense FFN; per-token compute ≈ 1/4 dense.
+    /// Total expert params ≈ 4× dense FFN; per-token expert compute ≈ dense (plus routing).
     pub fn baseline_for(hidden_size: usize, dense_mlp_intermediate: usize) -> Self {
         Self {
             hidden_size,
@@ -731,6 +731,7 @@ impl MoeImageTransformer {
             });
         }
         let unified = cfg.unified_vocab_size();
+        let (positions, _) = cfg.position_indices(token_ids, 0, None)?;
 
         // Embed + positional.
         let mut x = vec![0.0_f32; n * d];
@@ -742,7 +743,7 @@ impl MoeImageTransformer {
                 });
             }
             let eoff = (tid as usize) * d;
-            let poff = i * d;
+            let poff = positions[i] * d;
             let dst = &mut x[i * d..(i + 1) * d];
             for k in 0..d {
                 dst[k] = self.embed[eoff + k] + self.pos_embed[poff + k];
@@ -902,6 +903,7 @@ mod tests {
             image_grid_h: 2, image_grid_w: 2,
             bos_token: 100, sep_image_token: 101, eos_token: 102,
             rms_norm_eps: 1e-5, rope_theta: 10_000.0,
+            stable_image_positions: false,
         };
         let moe_cfg = MoeFfnConfig {
             hidden_size: 32, num_experts: 4, top_k: 2,

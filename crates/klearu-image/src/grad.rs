@@ -60,6 +60,33 @@ pub struct Gradients {
 }
 
 impl Gradients {
+    pub fn for_each_buffer_mut(&mut self, mut f: impl FnMut(&mut [f32])) {
+        f(&mut self.embed); f(&mut self.pos_embed); f(&mut self.final_norm_gamma); f(&mut self.lm_head_w);
+        for b in &mut self.blocks {
+            for x in [&mut b.norm_attn_gamma, &mut b.q_proj_w, &mut b.k_proj_w,
+                &mut b.v_proj_w, &mut b.o_proj_w, &mut b.norm_mlp_gamma,
+                &mut b.mlp_gate_w, &mut b.mlp_up_w, &mut b.mlp_down_w] { f(x); }
+        }
+    }
+
+    /// Average accumulated examples, then clip their global gradient norm.
+    /// Returns the norm before clipping. Refuse non-finite gradients.
+    pub fn average_and_clip(&mut self, examples: usize, max_norm: f32) -> crate::Result<f32> {
+        if examples == 0 || !max_norm.is_finite() || max_norm <= 0.0 {
+            return Err(crate::ImageGenError::Config("invalid gradient averaging/clipping configuration".into()));
+        }
+        let scale = 1.0 / examples as f32;
+        let mut sum = 0.0_f64;
+        self.for_each_buffer_mut(|buf| {
+            for x in buf { *x *= scale; sum += (*x as f64).powi(2); }
+        });
+        let norm = sum.sqrt() as f32;
+        if !norm.is_finite() { return Err(crate::ImageGenError::Config("non-finite gradient norm".into())); }
+        if norm > max_norm {
+            self.for_each_buffer_mut(|buf| { for x in buf { *x *= max_norm / norm; } });
+        }
+        Ok(norm)
+    }
     pub fn zeros_for(model: &ImageTransformer) -> Self {
         Self {
             embed:            vec![0.0; model.embed.len()],

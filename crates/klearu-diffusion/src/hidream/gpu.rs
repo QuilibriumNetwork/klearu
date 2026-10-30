@@ -24,7 +24,8 @@ use crate::hidream::mrope;
 use crate::metal_backend::{
     bias_add_f16_gpu, eadd_f16_gpu, emul_f16_gpu, gqa_repeat_f16_gpu, mpsgraph_sdpa_bf16_gpu,
     permute_hl_to_lh_f16_gpu, permute_lh_to_hl_f16_gpu, rms_norm_f16_gpu, rope_apply_f16_gpu,
-    sgemm_f16_a_btrans_buf, silu_f16_gpu, upload_f32_as_f16_buffer, GpuTensor,
+    sgemm_f16_a_btrans_buf, silu_f16_gpu, upload_bf16_bytes, upload_f32_as_f16_buffer,
+    GpuTensor,
 };
 use crate::weight::loader::ComponentTensors;
 use crate::Result;
@@ -66,6 +67,28 @@ fn write_prefix(t: &GpuTensor, data: &[f32]) {
     }
 }
 
+/// Load one named tensor into a persistent bf16 GPU buffer, checking that its
+/// element count is what the caller expects.
+///
+/// A tensor whose source dtype is IEEE f16 loses three mantissa bits landing in
+/// bf16 storage (see `Bf16Fidelity::Lossy`); that is logged rather than
+/// rejected, because the GPU pipeline has no f16 storage path to fall back to.
+fn load_bf16_buffer(comp: &ComponentTensors, name: &str, expect_numel: usize) -> Result<Buffer> {
+    let numel = comp.numel(name)
+        .ok_or_else(|| crate::DiffusionError::MissingTensor(name.to_string()))?;
+    if numel != expect_numel {
+        return Err(crate::DiffusionError::ShapeMismatch {
+            expected: format!("{expect_numel} elements in {name}"),
+            got: format!("{numel}"),
+        });
+    }
+    if comp.bf16_fidelity_of(name).is_some_and(|f| f.loses_precision()) {
+        tracing::debug!(tensor = name, "f16 source stored as bf16: 3 mantissa bits dropped");
+    }
+    let bytes = comp.get_bf16(name)?;
+    Ok(upload_bf16_bytes(&bytes))
+}
+
 /// A linear layer whose weight is converted to a **persistent bf16 GPU buffer**
 /// once at construction (the f32 source is dropped). This keeps the resident
 /// footprint at bf16 (~16 GB for the 8B model) instead of holding 32 GB of f32
@@ -93,11 +116,22 @@ impl GpuLinear {
     }
 
     /// Load `{prefix}.weight` (+ optional `{prefix}.bias`) straight into bf16
-    /// GPU buffers; the transient f32 is freed before the next weight loads.
+    /// GPU buffers.
+    ///
+    /// Uses the direct bf16 path: for a bf16-native checkpoint (Qwen3-VL ships
+    /// bf16) the weight goes mmap → `MTLBuffer` as one `memcpy`, with no f32
+    /// temporary at any point. The older `get_f32` + `upload_f32_as_f16_buffer`
+    /// route produced identical bits — bf16 → f32 → bf16 is exact — but
+    /// materialised a 2x-sized f32 Vec per tensor on the way.
     pub fn load(comp: &ComponentTensors, prefix: &str, in_f: usize, out_f: usize, bias: bool) -> Result<Self> {
-        let w = comp.get_f32(&format!("{prefix}.weight"))?;
-        let b = if bias { Some(comp.get_f32(&format!("{prefix}.bias"))?) } else { None };
-        Ok(Self::from_f32(&w, b.as_deref(), in_f, out_f))
+        let wname = format!("{prefix}.weight");
+        let weight_buf = load_bf16_buffer(comp, &wname, in_f * out_f)?;
+        let bias_buf = if bias {
+            Some(load_bf16_buffer(comp, &format!("{prefix}.bias"), out_f)?)
+        } else {
+            None
+        };
+        Ok(Self { weight_buf, bias_buf, in_features: in_f, out_features: out_f })
     }
 
     /// `out[m, out_f] = x[m, in_f] · weightᵀ (+ bias)`, all GPU-resident.

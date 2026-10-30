@@ -4,6 +4,7 @@
 //! HuggingFace / PyTorch convention. The forward computes one output
 //! row at a time as a dot product across the input.
 
+#[derive(Clone)]
 pub struct Linear {
     pub weight: Vec<f32>, // [out, in]
     pub bias: Option<Vec<f32>>, // [out] or None

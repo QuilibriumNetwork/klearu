@@ -118,6 +118,50 @@ pub fn load_image_bytes_as_chw_f32(
     Ok(out)
 }
 
+/// Like [`load_image_bytes_as_chw_f32`], but scales the image to the requested
+/// size instead of rejecting a mismatch.
+///
+/// Conditioning images come from a user's disk or clipboard at whatever size
+/// they happen to be, and the generation size is chosen separately, so
+/// requiring an exact match would push resizing onto every caller. Aspect ratio
+/// is deliberately not preserved: the frame it is conditioning is a fixed
+/// shape, and letterboxing would put bars into the video.
+#[cfg(feature = "image-io")]
+pub fn load_image_bytes_resized_chw_f32(
+    bytes: &[u8],
+    target_h: usize,
+    target_w: usize,
+) -> Result<Vec<f32>> {
+    let img = image::load_from_memory(bytes)
+        .map_err(|e| DiffusionError::Unsupported(format!("decode image bytes: {e}")))?;
+    let rgb = image::imageops::resize(
+        &img.to_rgb8(),
+        target_w as u32,
+        target_h as u32,
+        image::imageops::FilterType::Lanczos3,
+    );
+    let mut out = vec![0.0_f32; 3 * target_h * target_w];
+    for hi in 0..target_h {
+        for wi in 0..target_w {
+            let p = rgb.get_pixel(wi as u32, hi as u32);
+            for c in 0..3 {
+                out[c * target_h * target_w + hi * target_w + wi] =
+                    (p[c] as f32) / 127.5 - 1.0;
+            }
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(not(feature = "image-io"))]
+pub fn load_image_bytes_resized_chw_f32(
+    _bytes: &[u8], _target_h: usize, _target_w: usize,
+) -> Result<Vec<f32>> {
+    Err(DiffusionError::Unsupported(
+        "image input requires the 'image-io' feature".into(),
+    ))
+}
+
 #[cfg(not(feature = "image-io"))]
 pub fn load_image_bytes_as_chw_f32(
     _bytes: &[u8], _expected_h: usize, _expected_w: usize,

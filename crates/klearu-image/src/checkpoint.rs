@@ -40,6 +40,8 @@ struct ConfigJson {
     eos_token: u32,
     rms_norm_eps: f32,
     rope_theta: f32,
+    #[serde(default)]
+    stable_image_positions: bool,
 }
 
 impl From<&ImageTransformerConfig> for ConfigJson {
@@ -59,6 +61,7 @@ impl From<&ImageTransformerConfig> for ConfigJson {
             eos_token: c.eos_token,
             rms_norm_eps: c.rms_norm_eps,
             rope_theta: c.rope_theta,
+            stable_image_positions: c.stable_image_positions,
         }
     }
 }
@@ -80,6 +83,7 @@ impl From<ConfigJson> for ImageTransformerConfig {
             eos_token: c.eos_token,
             rms_norm_eps: c.rms_norm_eps,
             rope_theta: c.rope_theta,
+            stable_image_positions: c.stable_image_positions,
         }
     }
 }
@@ -131,7 +135,7 @@ pub fn save_model(model: &ImageTransformer, path: &Path) -> Result<()> {
         storage.insert(format!("{p}mlp_up.weight"), f32_to_bytes(&b.mlp_up.weight));
         storage.insert(format!("{p}mlp_down.weight"), f32_to_bytes(&b.mlp_down.weight));
     }
-    write_safetensors(&model.config, storage, path)
+    write_safetensors(model, storage, path)
 }
 
 /// Save model + optimizer state to `path` and `path.with_extension("optim.safetensors")`.
@@ -191,6 +195,9 @@ pub fn load_model(path: &Path) -> Result<ImageTransformer> {
     let cfg: ConfigJson = serde_json::from_str(cfg_json)
         .map_err(|e| ImageGenError::Config(format!("config parse: {e}")))?;
     let mut model = ImageTransformer::from_config(cfg.into());
+    model.conditioning = metadata.get("conditioning").map(|s| serde_json::from_str(s))
+        .transpose().map_err(|e| ImageGenError::Config(format!("conditioning: {e}")))?
+        .unwrap_or_default();
     fill_model_from_st(&mut model, &st)?;
     Ok(model)
 }
@@ -273,14 +280,16 @@ fn fill_pair(st: &SafeTensors, base: &str, m: &mut Vec<f32>, v: &mut Vec<f32>) -
 }
 
 fn write_safetensors(
-    cfg: &ImageTransformerConfig,
+    model: &ImageTransformer,
     storage: HashMap<String, Vec<u8>>,
     path: &Path,
 ) -> Result<()> {
-    let cfg_json = serde_json::to_string(&ConfigJson::from(cfg))
+    let cfg_json = serde_json::to_string(&ConfigJson::from(&model.config))
         .map_err(|e| ImageGenError::Config(format!("config serialize: {e}")))?;
     let mut metadata: HashMap<String, String> = HashMap::new();
     metadata.insert("klearu_image_config".to_string(), cfg_json);
+    metadata.insert("conditioning".into(), serde_json::to_string(&model.conditioning)
+        .map_err(|e| ImageGenError::Config(e.to_string()))?);
     metadata.insert("klearu_image_version".to_string(), "0.1.0".to_string());
     write_safetensors_with_metadata(storage, path, Some(metadata))
 }
@@ -318,7 +327,16 @@ mod tests {
             image_grid_h: 2, image_grid_w: 2,
             bos_token: 100, sep_image_token: 101, eos_token: 102,
             rms_norm_eps: 1e-5, rope_theta: 10_000.0,
+            stable_image_positions: false,
         }
+    }
+
+    #[test]
+    fn legacy_config_defaults_to_absolute_positions() {
+        let mut json = serde_json::to_value(ConfigJson::from(&tiny_cfg())).unwrap();
+        json.as_object_mut().unwrap().remove("stable_image_positions");
+        let parsed: ConfigJson = serde_json::from_value(json).unwrap();
+        assert!(!parsed.stable_image_positions);
     }
 
     #[test]

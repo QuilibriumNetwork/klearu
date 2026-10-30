@@ -62,3 +62,8 @@ required-features = ["cli"]
 name = "hidream_generate"
 path = "src/bin/hidream_generate.rs"
 required-features = ["cli", "metal"]
+
+[[bin]]
+name = "krea2_generate"
+path = "src/bin/krea2_generate.rs"
+required-features = ["cli", "metal"]

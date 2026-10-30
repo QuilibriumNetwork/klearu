@@ -28,6 +28,7 @@ pub mod blas;
 pub mod config;
 pub mod controlnet;
 pub mod hidream;
+pub mod krea2;
 #[cfg(feature = "metal")]
 pub mod metal_backend;
 pub mod error;
@@ -41,6 +42,9 @@ pub mod text_encoder;
 pub mod tokenizer;
 pub mod unet;
 pub mod vae;
+pub mod wan;
+pub mod wan_runner;
+pub mod vae3d;
 pub mod video_io;
 pub mod weight;
 

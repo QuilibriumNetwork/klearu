@@ -64,6 +64,11 @@ pub struct DiffusionConfig {
     /// Path to an AnimateDiff motion adapter `.safetensors` for video
     /// generation. E.g. `mm_sdxl_v10_beta.safetensors`.
     pub motion_adapter: Option<PathBuf>,
+    /// Wan 2.2 checkpoint root — the directory holding `transformer/`, `vae/`,
+    /// `text_encoder/`, `tokenizer/` and `scheduler/`. Its own video path,
+    /// separate from the AnimateDiff one above: different model family,
+    /// different loader, and it supports start/end frame conditioning.
+    pub wan_root: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,6 +111,14 @@ pub struct GenerateRequest {
     /// Use a Karras sigma schedule (Euler/DPM++/UniPC).
     #[serde(default)]
     pub karras: Option<bool>,
+
+    /// Output size in pixels for models that take one (Krea 2, Flux,
+    /// HiDream). `None` keeps each model's default (1024²). SD/SDXL use
+    /// their checkpoint's native size regardless.
+    #[serde(default)]
+    pub width: Option<usize>,
+    #[serde(default)]
+    pub height: Option<usize>,
 
     // ---- reference editing (HiDream-O1) ------------------------------------
     /// Reference images as raw PNG/JPEG bytes (one per image), supplied
@@ -182,6 +195,28 @@ pub struct DiffusionEngine {
     /// Resident Flux runner (macOS/Metal only): GPU MMDiT + T5 + CLIP-L + VAE.
     #[cfg(target_os = "macos")]
     flux: Arc<Mutex<Option<LoadedFlux>>>,
+    /// Resident Wan 2.2 video runner (macOS/Metal only).
+    #[cfg(target_os = "macos")]
+    wan: Arc<Mutex<Option<LoadedWan>>>,
+    /// Resident Krea 2 runner (macOS/Metal only): ~33 GB of GPU weights
+    /// (12.9B transformer + Qwen3-VL-4B), so every other family frees it
+    /// before loading and it frees them.
+    #[cfg(target_os = "macos")]
+    krea2: Arc<Mutex<Option<LoadedKrea2>>>,
+}
+
+/// A loaded Krea 2 runner paired with its checkpoint signature.
+#[cfg(target_os = "macos")]
+struct LoadedKrea2 {
+    runner: klearu_diffusion::krea2::runner::Krea2Runner,
+    signature: String,
+}
+
+/// A loaded Wan runner paired with its checkpoint signature.
+#[cfg(target_os = "macos")]
+struct LoadedWan {
+    runner: klearu_diffusion::wan_runner::WanRunner,
+    signature: String,
 }
 
 /// A loaded HiDream-O1 runner paired with its checkpoint signature.
@@ -490,6 +525,16 @@ impl DiffusionEngine {
                 .await;
         }
 
+        // Krea 2 (diffusers directory or single-file transformer): carries its
+        // own tokenizer, text encoder and VAE, so no extra settings needed.
+        #[cfg(target_os = "macos")]
+        if klearu_diffusion::krea2::runner::is_krea2_checkpoint(&checkpoint) {
+            let signature = format!("krea2|{}", checkpoint.display());
+            return self
+                .generate_krea2_in_process(checkpoint, signature, req, job_id, events)
+                .await;
+        }
+
         // Flux (single-file bundle or directory): GPU MMDiT + T5 + CLIP-L + VAE.
         #[cfg(target_os = "macos")]
         if klearu_diffusion::flux_runner::is_flux_checkpoint(&checkpoint) {
@@ -539,6 +584,9 @@ impl DiffusionEngine {
         let abort = self.in_proc_abort.clone();
         let events_tx = events.clone();
 
+        #[cfg(target_os = "macos")]
+        let krea2_handle = self.krea2.clone();
+
         // spawn_blocking: pipeline::generate runs the denoise loop and is
         // CPU/GPU-heavy. Off the tauri event-loop thread it goes.
         let total_steps = req.steps;
@@ -555,6 +603,10 @@ impl DiffusionEngine {
             };
             if needs_load {
                 *guard = None; // drop old residents first (free big buffers)
+                #[cfg(target_os = "macos")]
+                {
+                    *krea2_handle.lock() = None;
+                }
                 let inner = SdResidents::load(&load_opts)
                     .map_err(|e| DesktopError::engine(format!("load residents: {e}")))?;
                 *guard = Some(LoadedResidents { inner, signature });
@@ -630,6 +682,7 @@ impl DiffusionEngine {
         use klearu_diffusion::hidream::runner::{HiDreamGenOpts, HiDreamRunner};
 
         let handle = self.hidream.clone();
+        let krea2_handle = self.krea2.clone();
         let residents_handle = self.residents.clone();
         let abort = self.in_proc_abort.clone();
         let events_tx = events.clone();
@@ -642,6 +695,7 @@ impl DiffusionEngine {
             if needs_load {
                 *guard = None; // free old HiDream weights first
                 *residents_handle.lock() = None; // free any SD residents to make room
+                *krea2_handle.lock() = None;
                 let runner = HiDreamRunner::load(&checkpoint)
                     .map_err(|e| DesktopError::engine(format!("load hidream: {e}")))?;
                 *guard = Some(LoadedHiDream { runner, signature });
@@ -651,10 +705,10 @@ impl DiffusionEngine {
             let opts = HiDreamGenOpts {
                 prompt: req.prompt,
                 negative_prompt: req.negative_prompt,
-                // The desktop request has no resolution field yet; 1024² is a
-                // good default (2048² is ~4× slower). cfg_scale>1 → full/UniPC.
-                height: 1024,
-                width: 1024,
+                // 1024² unless the request says otherwise (2048² is ~4× slower).
+                // cfg_scale>1 → full/UniPC.
+                height: req.height.unwrap_or(1024),
+                width: req.width.unwrap_or(1024),
                 steps: req.steps,
                 guidance: req.cfg_scale,
                 seed: req.seed,
@@ -691,6 +745,101 @@ impl DiffusionEngine {
         Ok(result)
     }
 
+    /// In-process generation for Krea 2. Loads (and caches) a `Krea2Runner`,
+    /// runs the denoise loop with progress + abort, returns planar `[3,H,W]`
+    /// in `[-1,1]`.
+    ///
+    /// Settings mapping: **Turbo** is distilled for 8 steps without CFG and
+    /// uses exactly that, ignoring the step and CFG fields (as HiDream's
+    /// distilled path does). **Raw** takes both; `cfg_scale` is read as
+    /// standard CFG like every other model here and converted to Krea's
+    /// `cond + g·(cond − uncond)` convention (`g = cfg − 1`), so the
+    /// reference's recommended 3.5–4.5 is cfg 4.5–5.5 in the UI.
+    #[cfg(target_os = "macos")]
+    async fn generate_krea2_in_process(
+        &self,
+        checkpoint: PathBuf,
+        signature: String,
+        req: InProcessRequest,
+        job_id: u64,
+        events: mpsc::UnboundedSender<GenEvent>,
+    ) -> Result<InProcessResult> {
+        use klearu_diffusion::krea2::runner::{Krea2GenOpts, Krea2LoadSpec, Krea2Runner, Krea2Variant};
+
+        let handle = self.krea2.clone();
+        let residents_handle = self.residents.clone();
+        let hidream_handle = self.hidream.clone();
+        let flux_handle = self.flux.clone();
+        let wan_handle = self.wan.clone();
+        let abort = self.in_proc_abort.clone();
+        let events_tx = events.clone();
+        let result = tokio::task::spawn_blocking(move || -> Result<InProcessResult> {
+            let log = |line: String| {
+                let _ = events_tx.send(GenEvent::Log { job_id, line });
+            };
+            let mut guard = handle.lock();
+            let needs_load = match guard.as_ref() {
+                Some(l) => l.signature != signature,
+                None => true,
+            };
+            if needs_load {
+                // ~33 GB resident on a machine class with no swap: free every
+                // other model family first.
+                *guard = None;
+                *residents_handle.lock() = None;
+                *hidream_handle.lock() = None;
+                *flux_handle.lock() = None;
+                *wan_handle.lock() = None;
+                let spec = Krea2LoadSpec { checkpoint, ..Default::default() };
+                let runner = Krea2Runner::load_with_progress(&spec, |m| log(m.to_string()))
+                    .map_err(|e| DesktopError::engine(format!("load krea2: {e}")))?;
+                *guard = Some(LoadedKrea2 { runner, signature });
+            }
+            let runner = &guard.as_ref().unwrap().runner;
+
+            let (steps, guidance) = match runner.variant {
+                Krea2Variant::Turbo => {
+                    log("Krea 2 Turbo: distilled 8-step schedule, no CFG (steps/cfg settings ignored)".into());
+                    (0, Some(0.0))
+                }
+                Krea2Variant::Raw => (req.steps, Some((req.cfg_scale - 1.0).max(0.0))),
+            };
+            let opts = Krea2GenOpts {
+                prompt: req.prompt,
+                negative_prompt: req.negative_prompt,
+                width: req.width.unwrap_or(1024),
+                height: req.height.unwrap_or(1024),
+                steps,
+                guidance,
+                seed: req.seed,
+                input_image_bytes: req.input_image_bytes,
+                mask_bytes: req.mask_bytes,
+                strength: req.strength,
+            };
+            let t0 = std::time::Instant::now();
+            let img = runner
+                .generate(
+                    &opts,
+                    |step, total| {
+                        let _ = events_tx.send(GenEvent::Step {
+                            job_id,
+                            step: step as u32,
+                            total: total as u32,
+                            elapsed_s: t0.elapsed().as_secs_f32(),
+                        });
+                    },
+                    &abort,
+                )
+                .map_err(|e| DesktopError::engine(format!("krea2 generate: {e}")))?;
+            Ok(InProcessResult { rgb_chw: img.chw, height: img.height, width: img.width, job_id })
+        })
+        .await
+        .map_err(|e| DesktopError::engine(format!("join: {e}")))??;
+
+        let _ = events.send(GenEvent::Done { job_id, path: String::new() });
+        Ok(result)
+    }
+
     /// In-process generation for a Flux checkpoint (single-file bundle or
     /// directory). Loads (and caches) a GPU `FluxRunner`, runs the denoise loop
     /// with progress + abort, returns planar `[3,H,W]` in `[-1,1]`.
@@ -712,6 +861,7 @@ impl DiffusionEngine {
         let handle = self.flux.clone();
         let residents_handle = self.residents.clone();
         let hidream_handle = self.hidream.clone();
+        let krea2_handle = self.krea2.clone();
         let abort = self.in_proc_abort.clone();
         let events_tx = events.clone();
         let result = tokio::task::spawn_blocking(move || -> Result<InProcessResult> {
@@ -724,6 +874,7 @@ impl DiffusionEngine {
                 *guard = None; // free old Flux weights first
                 *residents_handle.lock() = None; // free SD residents to make room
                 *hidream_handle.lock() = None; // free HiDream too (these are big)
+                *krea2_handle.lock() = None;
                 let spec = FluxLoadSpec {
                     checkpoint,
                     clip_tokenizer: clip_tok,
@@ -741,10 +892,8 @@ impl DiffusionEngine {
 
             let opts = FluxGenOpts {
                 prompt: req.prompt,
-                // The desktop request has no resolution field yet; 1024² is a
-                // sensible default for Flux.
-                width: 1024,
-                height: 1024,
+                width: req.width.unwrap_or(1024),
+                height: req.height.unwrap_or(1024),
                 steps: req.steps,
                 guidance: req.cfg_scale,
                 seed: req.seed,
@@ -816,6 +965,8 @@ impl DiffusionEngine {
         let events_tx = events.clone();
         let motion_path_opt: Option<std::path::PathBuf> = self.config.lock()
             .motion_adapter.clone();
+        #[cfg(target_os = "macos")]
+        let krea2_handle = self.krea2.clone();
 
         let result = tokio::task::spawn_blocking(move || -> Result<VideoResult> {
             let mut guard = residents_handle.lock();
@@ -825,6 +976,10 @@ impl DiffusionEngine {
             };
             if needs_load {
                 *guard = None;
+                #[cfg(target_os = "macos")]
+                {
+                    *krea2_handle.lock() = None;
+                }
                 let inner = SdResidents::load(&load_opts)
                     .map_err(|e| DesktopError::engine(format!("load: {e}")))?;
                 *guard = Some(LoadedResidents { inner, signature });
@@ -891,6 +1046,122 @@ impl DiffusionEngine {
         Ok(result)
     }
 
+    /// Generate a video with Wan 2.2, optionally conditioned on a start and/or
+    /// end frame. Returns MP4 bytes; nothing is written to disk, so the caller
+    /// decides between a file and a `data:` URI (incognito).
+    ///
+    /// Separate from `generate_video_in_process`, which is AnimateDiff: a
+    /// different model family with a different loader and no frame
+    /// conditioning. Sharing one entry point would mean a config that is half
+    /// invalid whichever backend you pick.
+    #[cfg(target_os = "macos")]
+    pub async fn generate_wan_video_in_process(
+        &self,
+        req: WanVideoRequest,
+        events: mpsc::UnboundedSender<GenEvent>,
+    ) -> Result<VideoResult> {
+        use klearu_diffusion::wan_runner::{WanGenOpts, WanLoadSpec, WanRunner};
+
+        if self.busy() {
+            return Err(DesktopError::engine("another generation is already running"));
+        }
+        let root = self
+            .config
+            .lock()
+            .wan_root
+            .clone()
+            .ok_or_else(|| DesktopError::bad_input("image.wan_root not configured"))?;
+        if !klearu_diffusion::wan_runner::is_wan_checkpoint(&root) {
+            return Err(DesktopError::bad_input(format!(
+                "{} is not a Wan checkpoint (expected transformer/, vae/ and text_encoder/)",
+                root.display()
+            )));
+        }
+        let signature = root.display().to_string();
+
+        let job_id = { let mut n = self.next_id.lock(); *n += 1; *n };
+        self.in_proc_abort.store(false, std::sync::atomic::Ordering::SeqCst);
+        let _ = events.send(GenEvent::Started {
+            job_id, out_path: String::new(), pid: None,
+        });
+
+        let handle = self.wan.clone();
+        let residents_handle = self.residents.clone();
+        let hidream_handle = self.hidream.clone();
+        let flux_handle = self.flux.clone();
+        let krea2_handle = self.krea2.clone();
+        let abort = self.in_proc_abort.clone();
+        let events_tx = events.clone();
+
+        let result = tokio::task::spawn_blocking(move || -> Result<VideoResult> {
+            let mut guard = handle.lock();
+            let needs_load = match guard.as_ref() {
+                Some(l) => l.signature != signature,
+                None => true,
+            };
+            if needs_load {
+                // Wan is ~10 GB resident and this machine class has no swap;
+                // free every other model family before loading it, exactly as
+                // the Flux path does.
+                *guard = None;
+                *residents_handle.lock() = None;
+                *hidream_handle.lock() = None;
+                *flux_handle.lock() = None;
+                *krea2_handle.lock() = None;
+                let runner = WanRunner::load(&WanLoadSpec { root })
+                    .map_err(|e| DesktopError::engine(format!("load wan: {e}")))?;
+                *guard = Some(LoadedWan { runner, signature });
+            }
+            let runner = &guard.as_ref().unwrap().runner;
+
+            let opts = WanGenOpts {
+                prompt: req.prompt,
+                negative_prompt: req.negative_prompt,
+                steps: req.steps,
+                guidance_scale: req.guidance_scale,
+                seed: req.seed,
+                num_frames: req.num_frames,
+                width: req.width,
+                height: req.height,
+                fps: req.fps,
+                cfg_interval: req.cfg_interval,
+                start_image: req.start_image_bytes,
+                end_image: req.end_image_bytes,
+            };
+            let video = runner
+                .generate(
+                    &opts,
+                    |p| {
+                        let _ = events_tx.send(GenEvent::Step {
+                            job_id,
+                            step: p.step as u32,
+                            total: p.total as u32,
+                            elapsed_s: p.elapsed_s,
+                        });
+                    },
+                    &abort,
+                )
+                .map_err(|e| DesktopError::engine(format!("wan generate: {e}")))?;
+
+            let mp4 = klearu_diffusion::video_io::encode_mp4(&video.frames, video.fps, None)
+                .map_err(|e| DesktopError::engine(format!("encode mp4: {e}")))?;
+
+            Ok(VideoResult {
+                mp4_bytes: mp4,
+                num_frames: video.frames.len(),
+                fps: video.fps,
+                width: video.width,
+                height: video.height,
+                job_id,
+            })
+        })
+        .await
+        .map_err(|e| DesktopError::engine(format!("join: {e}")))??;
+
+        let _ = events.send(GenEvent::Done { job_id, path: String::new() });
+        Ok(result)
+    }
+
     /// Whether the in-process residents are currently loaded.
     pub fn residents_loaded(&self) -> bool {
         self.residents.lock().is_some()
@@ -914,6 +1185,30 @@ pub struct VideoRequest {
     pub num_frames: usize,
     pub fps: usize,
     pub cond_bias: Option<Vec<f32>>,
+}
+
+/// Parameters for video generation via Wan 2.2.
+///
+/// Images are bytes, not paths: a conditioning frame may come from the
+/// clipboard or an incognito session that must not touch disk.
+#[derive(Debug, Clone)]
+pub struct WanVideoRequest {
+    pub prompt: String,
+    /// `None` uses Wan's own negative prompt, which is what it was tuned with.
+    pub negative_prompt: Option<String>,
+    pub steps: usize,
+    pub guidance_scale: f32,
+    pub seed: u64,
+    pub num_frames: usize,
+    pub width: usize,
+    pub height: usize,
+    pub fps: usize,
+    /// Fraction of the schedule over which classifier-free guidance runs.
+    /// `(0.0, 1.0)` is every step, which is the reference behaviour; narrowing
+    /// it drops the second forward on the outer steps.
+    pub cfg_interval: (f32, f32),
+    pub start_image_bytes: Option<Vec<u8>>,
+    pub end_image_bytes: Option<Vec<u8>>,
 }
 
 /// Result of a video generation.
@@ -960,6 +1255,9 @@ pub struct InProcessRequest {
     pub controlnet_start: f32,
     pub controlnet_end: f32,
     pub cond_bias: Option<Vec<f32>>,
+    /// Requested output size; see [`GenerateRequest::width`].
+    pub width: Option<usize>,
+    pub height: Option<usize>,
 }
 
 /// Returned by [`DiffusionEngine::generate_in_process`]. Bytes-in-memory —

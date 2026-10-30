@@ -23,6 +23,7 @@ use ferret::{BlockArray, FerretCOT, NetIO, ALICE, BOB};
 use klearu_mpc::beaver::{BeaverTriple, BeaverTriple128, TripleGenerator, TripleGenerator128};
 use klearu_mpc::transport::Transport;
 use std::io;
+use std::sync::Arc;
 
 use crate::tcp_transport::TcpTransport;
 
@@ -269,9 +270,9 @@ pub fn setup_ferret_server(
     // Spawn thread for NetIO (blocks on accept)
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let netio = NetIO::new(ALICE, None, ferret_port as i32);
+        // FerretCOT holds its own reference, which keeps the connection open.
+        let netio = Arc::new(NetIO::new(ALICE, None, ferret_port as i32));
         let cot = FerretCOT::new(ALICE, 1, &netio, false);
-        std::mem::forget(netio);
         tx.send(cot).ok();
     });
 
@@ -311,10 +312,8 @@ pub fn setup_ferret_client(
     let correction_transport = TcpTransport::new(correction_stream)?;
 
     // Connect Ferret OT channel
-    let netio = NetIO::new(BOB, Some(server_ip.to_string()), ferret_port as i32);
+    let netio = Arc::new(NetIO::new(BOB, Some(server_ip.to_string()), ferret_port as i32));
     let cot = FerretCOT::new(BOB, 1, &netio, false);
-
-    std::mem::forget(netio);
 
     Ok((cot, correction_transport))
 }

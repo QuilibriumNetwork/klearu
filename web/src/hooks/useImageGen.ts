@@ -7,10 +7,12 @@ import {
   imageGenerate,
   imageList,
   videoGenerate,
+  wanVideoGenerate,
   type GenEvent,
   type GenerateRequest,
   type StoredImage,
   type VideoGenerateRequest,
+  type WanVideoGenerateRequest,
 } from '../lib/tauri';
 
 export interface GenProgress {
@@ -31,6 +33,7 @@ export interface UseImageGen {
   /** Resolves to `false` when the job was aborted (so a batch loop can break). */
   generate: (req: GenerateRequest) => Promise<boolean>;
   generateVideo: (req: VideoGenerateRequest) => Promise<void>;
+  generateWanVideo: (req: WanVideoGenerateRequest) => Promise<void>;
   abort: () => Promise<void>;
   /** Clear the aborted flag — call once before starting a fresh batch. */
   resetAbort: () => void;
@@ -113,7 +116,12 @@ export function useImageGen(): UseImageGen {
     return !abortedRef.current;
   }, [generating, refreshGallery]);
 
-  const generateVideo = useCallback(async (req: VideoGenerateRequest) => {
+  // Both video backends emit the same GenEvent stream, so the handling lives
+  // in one place. Duplicating it per backend is how one of them ends up not
+  // clearing `generating` on an error path.
+  const runVideoJob = useCallback(async (
+    start: (onEvent: (e: GenEvent) => void) => Promise<unknown>,
+  ) => {
     if (generating) return;
     setLastError(null);
     setProgress(null);
@@ -122,7 +130,7 @@ export function useImageGen(): UseImageGen {
 
     let outPath: string | undefined;
     try {
-      await videoGenerate(req, (e: GenEvent) => {
+      await start((e: GenEvent) => {
         if (e.type === 'started') {
           outPath = e.out_path;
           setProgress({ jobId: e.job_id, step: 0, total: 0, elapsedS: 0, outPath });
@@ -161,6 +169,17 @@ export function useImageGen(): UseImageGen {
     }
   }, [generating, refreshGallery]);
 
+  const generateVideo = useCallback(
+    (req: VideoGenerateRequest) => runVideoJob((cb) => videoGenerate(req, cb)),
+    [runVideoJob],
+  );
+
+  /** Wan 2.2, with optional start/end frame conditioning. */
+  const generateWanVideo = useCallback(
+    (req: WanVideoGenerateRequest) => runVideoJob((cb) => wanVideoGenerate(req, cb)),
+    [runVideoJob],
+  );
+
   const abort = useCallback(async () => {
     abortedRef.current = true; // break any in-flight batch loop
     try { await imageAbort(); } catch (e) { console.warn('abort failed', e); }
@@ -168,5 +187,5 @@ export function useImageGen(): UseImageGen {
 
   const resetAbort = useCallback(() => { abortedRef.current = false; }, []);
 
-  return { generating, progress, lastError, recentLogs, gallery, refreshGallery, generate, generateVideo, abort, resetAbort };
+  return { generating, progress, lastError, recentLogs, gallery, refreshGallery, generate, generateVideo, generateWanVideo, abort, resetAbort };
 }

@@ -65,16 +65,7 @@ fn linear_forward(w: &LinearNoBias, x: &[f32], n: usize, y: &mut [f32]) {
     let out_f = w.out_features;
     debug_assert_eq!(x.len(), n * in_f);
     debug_assert_eq!(y.len(), n * out_f);
-    for t in 0..n {
-        let xr = &x[t * in_f..(t + 1) * in_f];
-        let yr = &mut y[t * out_f..(t + 1) * out_f];
-        for o in 0..out_f {
-            let wr = &w.weight[o * in_f..(o + 1) * in_f];
-            let mut s = 0.0_f32;
-            for i in 0..in_f { s += xr[i] * wr[i]; }
-            yr[o] = s;
-        }
-    }
+    klearu_diffusion::blas::sgemm_a_btrans(n, out_f, in_f, x, &w.weight, y);
 }
 
 /// RMSNorm forward (in place). Also returns per-row `inv` values
@@ -110,6 +101,7 @@ pub fn forward_train(
         });
     }
     let unified = cfg.unified_vocab_size();
+    let (positions, _) = cfg.position_indices(token_ids, 0, None)?;
 
     // 1. Embed + position add.
     let mut x = vec![0.0_f32; n * d];
@@ -121,7 +113,7 @@ pub fn forward_train(
             });
         }
         let eoff = (tid as usize) * d;
-        let poff = i * d;
+        let poff = positions[i] * d;
         let dst = &mut x[i * d..(i + 1) * d];
         for k in 0..d {
             dst[k] = model.embed[eoff + k] + model.pos_embed[poff + k];
@@ -167,9 +159,6 @@ fn layer_forward(
     cfg: &ImageTransformerConfig,
 ) -> LayerCache {
     let d = cfg.hidden_size;
-    let h = cfg.num_heads;
-    let dh = cfg.head_dim();
-
     // Pre-attention norm.
     let mut xn1 = x_in.to_vec();
     let _ = rms_norm_forward_collect_inv(&mut xn1, &blk.norm_attn, n);
@@ -182,42 +171,7 @@ fn layer_forward(
     linear_forward(&blk.k_proj, &xn1, n, &mut k);
     linear_forward(&blk.v_proj, &xn1, n, &mut v);
 
-    // Attention (causal). attn_weights[h, n, n] only valid for j ≤ i; the
-    // rest are 0. attn_out_pre_o[n, d].
-    let scale = 1.0_f32 / (dh as f32).sqrt();
-    let mut attn_weights = vec![0.0_f32; h * n * n];
-    let mut attn_out_pre_o = vec![0.0_f32; n * d];
-    for hi in 0..h {
-        for qi in 0..n {
-            let mut scores = vec![0.0_f32; qi + 1];
-            let q_off = qi * d + hi * dh;
-            for kj in 0..=qi {
-                let k_off = kj * d + hi * dh;
-                let mut s = 0.0_f32;
-                for di in 0..dh { s += q[q_off + di] * k[k_off + di]; }
-                scores[kj] = s * scale;
-            }
-            let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let mut sum = 0.0_f32;
-            for s in scores.iter_mut() { *s = (*s - max).exp(); sum += *s; }
-            if sum > 0.0 {
-                let inv = 1.0 / sum;
-                for s in scores.iter_mut() { *s *= inv; }
-            }
-            // Store in [h, n, n] layout: attn_weights[hi, qi, kj].
-            for (kj, &w) in scores.iter().enumerate() {
-                attn_weights[hi * n * n + qi * n + kj] = w;
-            }
-            // Output for this (head, qi): sum_kj weights[kj] * V[kj, head, :].
-            let out_off = qi * d + hi * dh;
-            for kj in 0..=qi {
-                let v_off = kj * d + hi * dh;
-                let w = scores[kj];
-                if w == 0.0 { continue; }
-                for di in 0..dh { attn_out_pre_o[out_off + di] += w * v[v_off + di]; }
-            }
-        }
-    }
+    let (attn_weights, attn_out_pre_o) = crate::attention::forward(cfg, &q, &k, &v, n);
 
     // Output projection and residual.
     let mut o_out = vec![0.0_f32; n * d];
@@ -459,7 +413,7 @@ pub fn backward(
             n, &mut bg.o_proj_w, &mut grad_attn_out_pre_o);
 
         // --- 4g. Attention SDPA backward (per head).
-        let (grad_q, grad_k, grad_v) = attention_backward(
+        let (grad_q, grad_k, grad_v) = crate::attention::backward(
             cfg, &lc.q, &lc.k, &lc.v, &lc.attn_weights, &grad_attn_out_pre_o, n);
 
         // --- 4h. Q/K/V projections backward (all consume xn1).
@@ -489,11 +443,12 @@ pub fn backward(
     }
 
     // --- 5. Embed + pos_embed backward.
+    let (positions, _) = model.config.position_indices(&cache.token_ids, 0, None)?;
     let _ = cache.x_after_embed; // (not directly used; the grad on x_in flows here)
     for i in 0..n {
         let tid = cache.token_ids[i] as usize;
         let eoff = tid * d;
-        let poff = i * d;
+        let poff = positions[i] * d;
         let src = &grad_x_layer_out[i * d..(i + 1) * d];
         for k in 0..d {
             grad.embed[eoff + k] += src[k];
@@ -505,7 +460,8 @@ pub fn backward(
 }
 
 /// SDPA backward (per-head, causal). Returns grads on Q, K, V of shape [n, d].
-fn attention_backward(
+#[cfg(test)]
+fn attention_backward_reference(
     cfg: &ImageTransformerConfig,
     q: &[f32], k: &[f32], v: &[f32],
     attn_weights: &[f32],
@@ -620,6 +576,7 @@ pub fn forward_train_checkpointed(
         });
     }
     let unified = cfg.unified_vocab_size();
+    let (positions, _) = cfg.position_indices(token_ids, 0, None)?;
 
     let mut x = vec![0.0_f32; n * d];
     for (i, &tid) in token_ids.iter().enumerate() {
@@ -630,7 +587,7 @@ pub fn forward_train_checkpointed(
             });
         }
         let eoff = (tid as usize) * d;
-        let poff = i * d;
+        let poff = positions[i] * d;
         let dst = &mut x[i * d..(i + 1) * d];
         for k in 0..d {
             dst[k] = model.embed[eoff + k] + model.pos_embed[poff + k];
@@ -739,6 +696,20 @@ mod tests {
     use crate::optim::{AdamW, AdamWConfig};
     use crate::train::{TrainExample, assemble_batch};
 
+    #[test]
+    fn blas_attention_gradients_match_scalar_reference() {
+        let cfg = tiny_cfg();
+        let n = 7;
+        let tensor = |phase: f32| (0..n*cfg.hidden_size).map(|i| (i as f32*0.17+phase).sin()).collect::<Vec<_>>();
+        let (q,k,v,g) = (tensor(0.1),tensor(0.7),tensor(1.3),tensor(2.1));
+        let (aw,_) = crate::attention::forward(&cfg,&q,&k,&v,n);
+        let a = crate::attention::backward(&cfg,&q,&k,&v,&aw,&g,n);
+        let b = attention_backward_reference(&cfg,&q,&k,&v,&aw,&g,n);
+        for (actual,expected) in [(&a.0,&b.0),(&a.1,&b.1),(&a.2,&b.2)] {
+            for (x,y) in actual.iter().zip(expected) { assert!((x-y).abs()<2e-5,"{x} vs {y}"); }
+        }
+    }
+
     fn tiny_cfg() -> ImageTransformerConfig {
         ImageTransformerConfig {
             vocab_text: 100, vocab_image: 16,
@@ -748,6 +719,7 @@ mod tests {
             image_grid_h: 2, image_grid_w: 2,
             bos_token: 100, sep_image_token: 101, eos_token: 102,
             rms_norm_eps: 1e-5, rope_theta: 10_000.0,
+            stable_image_positions: false,
         }
     }
 

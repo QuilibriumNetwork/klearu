@@ -13,8 +13,9 @@
 //!
 //! This is a "Linear-VQ" approximation: not as good as a trained VQ-VAE
 //! decoder reconstructing from indices, but:
-//!   - **Decode quality is bounded by VAE only** (the codebook noise is
-//!     ~1/K of the 4-d latent space — barely visible at K=4096+).
+//!   - Quantization adds reconstruction error beyond the continuous VAE.
+//!     Measure held-out reconstructions; codebook size alone does not
+//!     establish perceptual quality.
 //!   - **Zero new model training needed** — just k-means once.
 //!   - **Encoder and decoder are already implemented + GPU-accelerated**
 //!     via klearu-diffusion's `AutoencoderKL::{encode, decode}`.

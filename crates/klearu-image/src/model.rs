@@ -48,9 +48,18 @@ pub struct ImageTransformerConfig {
     pub rms_norm_eps: f32,
     /// RoPE base for text-position encoding.
     pub rope_theta: f32,
+    /// Anchor SEP/image raster positions independently of caption length.
+    /// False preserves legacy checkpoint behavior.
+    pub stable_image_positions: bool,
 }
 
 impl ImageTransformerConfig {
+    /// First training experiment on a single M1 Max. Keep the image format
+    /// identical to the baseline so the encoded corpus can be reused.
+    pub fn pilot() -> Self {
+        Self { hidden_size: 256, num_layers: 6, num_heads: 4,
+            mlp_intermediate: 704, ..Self::baseline_50m() }
+    }
     /// Default 50M-param baseline (12 layers × 512 hidden × 8 heads).
     /// Image tokens at [16, 16] = 256 per image. Text prefix max 64 tokens.
     pub fn baseline_50m() -> Self {
@@ -75,6 +84,7 @@ impl ImageTransformerConfig {
             eos_token: eos,
             rms_norm_eps: 1e-5,
             rope_theta: 10_000.0,
+            stable_image_positions: false,
         }
     }
 
@@ -98,6 +108,32 @@ impl ImageTransformerConfig {
 
     pub fn head_dim(&self) -> usize {
         self.hidden_size / self.num_heads
+    }
+
+    /// Shared position lookup for dense training, inference and cached chunks.
+    /// SEP uses max_text_len+1; subsequent image tokens use consecutive slots.
+    pub fn position_indices(&self, ids: &[u32], start: usize, mut image_next: Option<usize>)
+        -> Result<(Vec<usize>, Option<usize>)> {
+        let mut positions = Vec::with_capacity(ids.len());
+        for (i, &id) in ids.iter().enumerate() {
+            let position = if self.stable_image_positions {
+                if id == self.sep_image_token {
+                    if image_next.is_some() {
+                        return Err(ImageGenError::Config("Repeated image separator".into()));
+                    }
+                    image_next = Some(self.max_text_len + 1);
+                }
+                if let Some(next) = image_next {
+                    image_next = Some(next + 1);
+                    next
+                } else { start + i }
+            } else { start + i };
+            if position >= self.max_seq_len() {
+                return Err(ImageGenError::Config("Position exceeds embedding table".into()));
+            }
+            positions.push(position);
+        }
+        Ok((positions, image_next))
     }
 }
 
@@ -166,6 +202,7 @@ impl ImageBlock {
 
 /// The full image transformer model.
 pub struct ImageTransformer {
+    pub conditioning: crate::conditioning::Conditioning,
     pub config: ImageTransformerConfig,
     /// Unified token embedding table. Rows 0..vocab_text = text BPE,
     /// vocab_text..vocab_text+3 = BOS/SEP/EOS, then vocab_image rows for
@@ -178,13 +215,33 @@ pub struct ImageTransformer {
     pub blocks: Vec<ImageBlock>,
     pub final_norm: RmsNorm,
     /// Output projection. Produces logits over the image vocab only
-    /// (vocab_image entries) — we never predict text. Tied to the
-    /// image-portion of the embedding when `tie_lm_head = true`
-    /// (default at init; weights overwritten by `load_from`).
+    /// (vocab_image entries) — we never predict text. Untied weights.
     pub lm_head: LinearNoBias,
 }
 
 impl ImageTransformer {
+    /// Deterministic small-weight initialization for training and benchmarks.
+    pub fn init_random(&mut self, seed: u64) {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+        let mut fill = |v: &mut [f32]| {
+            for x in v { *x = rng.gen_range(-0.02..0.02); }
+        };
+        fill(&mut self.embed);
+        fill(&mut self.pos_embed);
+        for b in &mut self.blocks {
+            for w in [&mut b.q_proj, &mut b.k_proj, &mut b.v_proj, &mut b.o_proj,
+                &mut b.mlp_gate, &mut b.mlp_up, &mut b.mlp_down] { fill(&mut w.weight); }
+        }
+        fill(&mut self.lm_head.weight);
+    }
+
+    pub fn decode_session(&self) -> DecodeSession<'_> {
+        DecodeSession { model: self, len: 0, image_next: None,
+            layers: (0..self.blocks.len()).map(|_| {
+                (vec![Vec::new(); self.config.num_heads], vec![Vec::new(); self.config.num_heads])
+            }).collect() }
+    }
     pub fn from_config(config: ImageTransformerConfig) -> Self {
         let unified = config.unified_vocab_size();
         let d = config.hidden_size;
@@ -194,6 +251,7 @@ impl ImageTransformer {
         let max_seq = config.max_seq_len();
         let lm_head = LinearNoBias::new(d, config.vocab_image);
         Self {
+            conditioning: Default::default(),
             embed: vec![0.0; unified * d],
             pos_embed: vec![0.0; max_seq * d],
             blocks,
@@ -230,6 +288,87 @@ impl ImageTransformer {
         if id >= off && id < off + self.config.vocab_image as u32 {
             Some(id - off)
         } else { None }
+    }
+}
+
+/// Cache tied to an immutable model borrow: weights cannot change mid-decode.
+/// Head-major K/V buffers append only the new chunk. Supports batched prefill
+/// followed by single-token decode, or arbitrary consecutive chunks.
+pub struct DecodeSession<'a> {
+    model: &'a ImageTransformer,
+    len: usize,
+    image_next: Option<usize>,
+    layers: Vec<(Vec<Vec<f32>>, Vec<Vec<f32>>)>,
+}
+
+impl DecodeSession<'_> {
+    pub fn len(&self) -> usize { self.len }
+    pub fn is_empty(&self) -> bool { self.len == 0 }
+
+    /// Return only the final position's image-vocabulary logits.
+    pub fn forward(&mut self, ids: &[u32]) -> Result<Vec<f32>> {
+        let cfg = &self.model.config;
+        let n = ids.len();
+        let end = self.len.checked_add(n).ok_or_else(|| ImageGenError::Config("sequence overflow".into()))?;
+        if n == 0 || end > cfg.max_seq_len() || ids.iter().any(|&id| id as usize >= cfg.unified_vocab_size()) {
+            return Err(ImageGenError::Config("invalid decode chunk: empty, out-of-range ID, or context exceeded".into()));
+        }
+        let (positions, image_next) = cfg.position_indices(ids, self.len, self.image_next)?;
+        let d = cfg.hidden_size;
+        let dh = cfg.head_dim();
+        let mut x = vec![0.0; n * d];
+        for (t, &id) in ids.iter().enumerate() {
+            for c in 0..d {
+                x[t*d+c] = self.model.embed[id as usize*d+c] + self.model.pos_embed[positions[t]*d+c];
+            }
+        }
+        for (blk, (keys, values)) in self.model.blocks.iter().zip(&mut self.layers) {
+            let mut xn = x.clone();
+            rms_norm_apply(&mut xn, &blk.norm_attn, n);
+            let mut q = vec![0.0; n*d];
+            let mut k = vec![0.0; n*d];
+            let mut v = vec![0.0; n*d];
+            linear_no_bias_forward(&blk.q_proj, &xn, n, &mut q);
+            linear_no_bias_forward(&blk.k_proj, &xn, n, &mut k);
+            linear_no_bias_forward(&blk.v_proj, &xn, n, &mut v);
+            let mut out = vec![0.0; n*d];
+            let mut qh = vec![0.0; n*dh];
+            let mut scores = vec![0.0; n*end];
+            let mut oh = vec![0.0; n*dh];
+            for hi in 0..cfg.num_heads {
+                for t in 0..n {
+                    let off = t*d+hi*dh;
+                    qh[t*dh..(t+1)*dh].copy_from_slice(&q[off..off+dh]);
+                    keys[hi].extend_from_slice(&k[off..off+dh]);
+                    values[hi].extend_from_slice(&v[off..off+dh]);
+                }
+                sgemm_a_btrans(n, end, dh, &qh, &keys[hi], &mut scores);
+                for t in 0..n {
+                    let row = &mut scores[t*end..(t+1)*end];
+                    let allowed = self.len+t+1;
+                    for s in &mut row[..allowed] { *s /= (dh as f32).sqrt(); }
+                    let max = row[..allowed].iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                    let mut sum = 0.0;
+                    for s in &mut row[..allowed] { *s = (*s-max).exp(); sum += *s; }
+                    for s in &mut row[..allowed] { *s /= sum; }
+                    row[allowed..].fill(0.0);
+                }
+                sgemm_row_major(n, dh, end, 1.0, &scores, end, &values[hi], dh, 0.0, &mut oh, dh);
+                for t in 0..n { out[t*d+hi*dh..t*d+(hi+1)*dh].copy_from_slice(&oh[t*dh..(t+1)*dh]); }
+            }
+            let mut projected = vec![0.0; n*d];
+            linear_no_bias_forward(&blk.o_proj, &out, n, &mut projected);
+            for (xi, oi) in x.iter_mut().zip(projected) { *xi += oi; }
+            let mlp = swiglu_forward(blk, &x, n);
+            for (xi, mi) in x.iter_mut().zip(mlp) { *xi += mi; }
+        }
+        let last = &mut x[(n-1)*d..];
+        rms_norm_apply(last, &self.model.final_norm, 1);
+        let mut logits = vec![0.0; cfg.vocab_image];
+        linear_no_bias_forward(&self.model.lm_head, last, 1, &mut logits);
+        self.len = end;
+        self.image_next = image_next;
+        Ok(logits)
     }
 }
 
@@ -455,6 +594,7 @@ impl ImageTransformer {
             });
         }
         let unified = self.config.unified_vocab_size();
+        let (positions, _) = self.config.position_indices(token_ids, 0, None)?;
 
         // 1. Token-embedding lookup + position embedding add.
         let mut x = vec![0.0_f32; n * d];
@@ -466,7 +606,7 @@ impl ImageTransformer {
                 });
             }
             let emb_off = (tid as usize) * d;
-            let pos_off = i * d;
+            let pos_off = positions[i] * d;
             let dst = &mut x[i * d..(i + 1) * d];
             for k in 0..d {
                 dst[k] = self.embed[emb_off + k] + self.pos_embed[pos_off + k];
@@ -523,6 +663,7 @@ mod tests {
             eos_token: 102,
             rms_norm_eps: 1e-5,
             rope_theta: 10_000.0,
+            stable_image_positions: false,
         };
         let model = ImageTransformer::from_config(cfg.clone());
         // [BOS, text*3, SEP, img*4] = 9 tokens.

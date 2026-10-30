@@ -345,6 +345,7 @@ mod tests {
             image_grid_h: 2, image_grid_w: 2,
             bos_token: 100, sep_image_token: 101, eos_token: 102,
             rms_norm_eps: 1e-5, rope_theta: 10_000.0,
+            stable_image_positions: false,
         };
         let plan = vec![1_u32, 2, 3, 4];                  // 4 tokens
         let user = vec![10_u32, 11, 12, 13, 14, 15, 16, 17]; // 8 tokens
@@ -365,6 +366,7 @@ mod tests {
             image_grid_h: 2, image_grid_w: 2,
             bos_token: 100, sep_image_token: 101, eos_token: 102,
             rms_norm_eps: 1e-5, rope_theta: 10_000.0,
+            stable_image_positions: false,
         };
         let plan = vec![1_u32; 10]; // longer than max_text_len
         let user = vec![5_u32];
@@ -381,6 +383,7 @@ mod tests {
             image_grid_h: 2, image_grid_w: 2,
             bos_token: 100, sep_image_token: 101, eos_token: 102,
             rms_norm_eps: 1e-5, rope_theta: 10_000.0,
+            stable_image_positions: false,
         };
         let bad_plan = vec![cfg.vocab_text as u32 + 5];
         let ok_user = vec![5_u32];

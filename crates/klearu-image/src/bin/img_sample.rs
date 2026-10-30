@@ -34,6 +34,7 @@ struct Args {
     vae: Option<PathBuf>,
     codebook: Option<PathBuf>,
     bpe: Option<PathBuf>,
+    unconditional: bool,
     prompt: String,
     temperature: f32,
     top_k: usize,
@@ -50,6 +51,7 @@ fn parse_args() -> Result<Args, String> {
         vae: None,
         codebook: None,
         bpe: None,
+        unconditional: false,
         prompt: String::new(),
         temperature: 0.9,
         top_k: 64,
@@ -69,6 +71,7 @@ fn parse_args() -> Result<Args, String> {
             "--checkpoint" => args.checkpoint = PathBuf::from(next(&mut i)?),
             "--vae" => args.vae = Some(PathBuf::from(next(&mut i)?)),
             "--codebook" => args.codebook = Some(PathBuf::from(next(&mut i)?)),
+            "--unconditional" => args.unconditional = true,
             "--bpe" => args.bpe = Some(PathBuf::from(next(&mut i)?)),
             "--tokens-out" => args.tokens_out = Some(PathBuf::from(next(&mut i)?)),
             "--prompt" => args.prompt = next(&mut i)?,
@@ -88,7 +91,7 @@ fn parse_args() -> Result<Args, String> {
     if args.checkpoint.as_os_str().is_empty() {
         return Err("--checkpoint is required".into());
     }
-    if args.prompt.is_empty() {
+    if args.prompt.is_empty() && !args.unconditional {
         return Err("--prompt is required".into());
     }
     // Two modes: --tokens-out (skip Rust decode, dump JSON) or
@@ -114,7 +117,8 @@ fn print_help() {
     eprintln!("                       decode. Pair with scripts/vqvae_decode.py for");
     eprintln!("                       the trained-VQ-VAE pipeline.");
     eprintln!("  --bpe FILE           tokenizer.json for BPE encoding the prompt");
-    eprintln!("                       (omit to send the prompt with empty text tokens)");
+    eprintln!("                       (defaults to the checkpoint’s embedded tokenizer)");
+    eprintln!("  --unconditional      Explicit image-only sampling (no prompt/BPE)");
     eprintln!("  --prompt \"...\"       Text prompt (required)");
     eprintln!("  --temperature F      Softmax temperature (default 0.9)");
     eprintln!("  --top-k N            Restrict to top-K codewords per step (default 64)");
@@ -148,27 +152,15 @@ fn run(args: Args) -> ImgResult<()> {
     eprintln!("[img_sample]   ✓ {} params, {} layers, hidden={}",
         model.param_count(), model.config.num_layers, model.config.hidden_size);
 
-    // 2. Tokenize the prompt (or empty if no BPE provided).
-    let text_tokens: Vec<u32> = if let Some(bpe_path) = &args.bpe {
-        eprintln!("[img_sample] loading BPE tokenizer …");
-        let tok = Tokenizer::from_file(bpe_path)
-            .map_err(|e| klearu_image::error::ImageGenError::Unsupported(
-                format!("tokenizer: {e}")))?;
-        let enc = tok.encode(args.prompt.as_str(), false)
-            .map_err(|e| klearu_image::error::ImageGenError::Unsupported(
-                format!("bpe encode: {e}")))?;
-        let mut ids: Vec<u32> = enc.get_ids().iter().copied()
-            .filter(|&t| (t as usize) < model.config.vocab_text)
-            .collect();
-        if ids.len() > model.config.max_text_len {
-            ids.truncate(model.config.max_text_len);
-        }
-        eprintln!("[img_sample]   ✓ {} text tokens", ids.len());
-        ids
-    } else {
-        eprintln!("[img_sample] no --bpe: sampling with empty text prefix");
-        Vec::new()
-    };
+    if args.unconditional && !args.prompt.is_empty() {
+        return Err(klearu_image::ImageGenError::Config("--unconditional cannot consume --prompt".into()));
+    }
+    let supplied = args.bpe.as_ref().map(|p| Tokenizer::from_file(p)
+        .map_err(|e| klearu_image::ImageGenError::Config(e.to_string()))).transpose()?;
+    let tok = klearu_image::conditioning::resolve(&model.conditioning, supplied, args.unconditional)?;
+    let text_tokens = if let Some(tok) = tok {
+        klearu_image::conditioning::encode(&tok, &model.config, &args.prompt)?
+    } else { Vec::new() };
 
     // 3. Sample tokens (mode-independent).
     eprintln!("[img_sample] sampling {} image tokens …",

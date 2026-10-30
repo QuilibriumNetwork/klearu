@@ -83,6 +83,8 @@ pub fn run(context: tauri::Context) {
             commands::image::image_generate,
             commands::image::image_inpaint,
             commands::image::video_generate,
+            #[cfg(target_os = "macos")]
+            commands::image::wan_video_generate,
             commands::image::image_abort,
             commands::image::image_list,
             commands::image::image_delete,

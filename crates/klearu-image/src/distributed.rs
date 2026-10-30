@@ -202,6 +202,7 @@ fn clone_model_weights(src: &ImageTransformer) -> ImageTransformer {
 }
 
 fn copy_weights(src: &ImageTransformer, dst: &mut ImageTransformer) {
+    dst.conditioning = src.conditioning.clone();
     dst.embed.copy_from_slice(&src.embed);
     dst.pos_embed.copy_from_slice(&src.pos_embed);
     for (s, d) in src.blocks.iter().zip(dst.blocks.iter_mut()) {
@@ -576,6 +577,7 @@ mod tests {
             image_grid_h: 2, image_grid_w: 2,
             bos_token: 100, sep_image_token: 101, eos_token: 102,
             rms_norm_eps: 1e-5, rope_theta: 10_000.0,
+            stable_image_positions: false,
         }
     }
 

@@ -12,14 +12,7 @@
 //!     prediction targets, returning mean loss + per-token logits-vs-
 //!     target stats.
 //!
-//! ## Scope NOT covered (deferred follow-up — see TODO note in lib.rs):
-//!
-//! Backpropagation + optimizer (Adam) for the transformer. Implementing
-//! the backward pass for each op (matmul, RMSNorm, SwiGLU, attention,
-//! softmax-CE, embedding lookup) is ~1500 LOC and is its own milestone.
-//! The forward + loss code here is the **measurement infrastructure** —
-//! we can already log loss curves on toy data and verify the forward
-//! pipeline produces sensible CE values, which is the right first step.
+//! Backpropagation and optimizer updates are implemented in `backward` and `optim`.
 
 use crate::error::{ImageGenError, Result};
 use crate::model::{ImageTransformer, ImageTransformerConfig};
@@ -171,7 +164,10 @@ pub fn cross_entropy_loss(
 /// without re-running the VAE.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ManifestEntry {
+    #[serde(default)]
     pub caption: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_tokens: Option<Vec<u32>>,
     /// Codewords in `[0, vocab_image)`, length = `image_grid_h * image_grid_w`.
     pub image_tokens: Vec<u32>,
 }
@@ -223,6 +219,7 @@ mod tests {
             eos_token: 102,
             rms_norm_eps: 1e-5,
             rope_theta: 10_000.0,
+            stable_image_positions: false,
         }
     }
 
@@ -274,8 +271,8 @@ mod tests {
     #[test]
     fn manifest_round_trip() {
         let entries = vec![
-            ManifestEntry { caption: "a cat".into(), image_tokens: vec![0, 1, 2, 3] },
-            ManifestEntry { caption: "a dog".into(), image_tokens: vec![4, 5, 6, 7] },
+            ManifestEntry { text_tokens: None, caption: "a cat".into(), image_tokens: vec![0, 1, 2, 3] },
+            ManifestEntry { text_tokens: None, caption: "a dog".into(), image_tokens: vec![4, 5, 6, 7] },
         ];
         let tmp = std::env::temp_dir().join("klearu_image_test_manifest.jsonl");
         write_manifest(&tmp, &entries).expect("write");

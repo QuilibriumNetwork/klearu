@@ -232,6 +232,28 @@ impl UniPCScheduler {
         }
     }
 
+    /// Build from an explicit sigma schedule (`len = steps + 1`, terminal 0).
+    ///
+    /// The `new` constructor bakes in HiDream's *double*-shifted ramp. Wan uses
+    /// diffusers' `use_flow_sigmas` path, which shifts once — same solver, a
+    /// different schedule — so it supplies its own sigmas here.
+    pub fn from_sigmas(sigmas: Vec<f32>) -> Self {
+        assert!(sigmas.len() >= 2, "need at least one step");
+        let timesteps = sigmas[..sigmas.len() - 1]
+            .iter()
+            .map(|s| s * NUM_TRAIN_TIMESTEPS)
+            .collect();
+        Self {
+            timesteps,
+            sigmas,
+            solver_order: 2,
+            model_outputs: Vec::new(),
+            lower_order_nums: 0,
+            last_sample: None,
+            this_order: 1,
+        }
+    }
+
     fn lambda(sigma: f32) -> f32 {
         // λ = log(α) − log(σ), α = 1 − σ.
         (1.0 - sigma).ln() - sigma.ln()

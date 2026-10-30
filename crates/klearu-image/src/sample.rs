@@ -13,11 +13,7 @@
 //!         append to the sequence.
 //!   4. Decode the generated 256-token grid via the image tokenizer.
 //!
-//! This module is **inference-only** — no gradient flow. Optimizing
-//! the inner forward calls (KV cache across positions, batched
-//! per-step sampling) is Phase 2+ work; the baseline here recomputes
-//! the full sequence each step (O(n²·d) per step, O(n³·d) total — fine
-//! for 256-token sequences).
+//! Inference uses batched prompt prefill followed by KV-cached decoding.
 
 use crate::error::{ImageGenError, Result};
 use crate::model::{ImageTransformer, ImageTransformerConfig};
@@ -80,29 +76,40 @@ pub fn sample_image_tokens(
     text_tokens: &[u32],
     config: &SampleConfig,
 ) -> Result<Vec<u32>> {
+    sample_image_tokens_from_prefix(model, text_tokens, &[], config)
+}
+
+/// Complete a raster-order image-token prefix. Returns the supplied prefix
+/// followed by generated tokens; the RNG starts at `config.seed` for the suffix.
+pub fn sample_image_tokens_from_prefix(
+    model: &ImageTransformer,
+    text_tokens: &[u32],
+    image_prefix: &[u32],
+    config: &SampleConfig,
+) -> Result<Vec<u32>> {
     let mcfg = &model.config;
     let n_image = mcfg.image_grid_h * mcfg.image_grid_w;
     let mut seq = build_prefix(mcfg, text_tokens)?;
+    if image_prefix.len() > n_image || image_prefix.iter().any(|&id| id as usize >= mcfg.vocab_image) {
+        return Err(ImageGenError::Config("Invalid image-token prefix length or codeword".into()));
+    }
+    if image_prefix.len() == n_image {
+        return Ok(image_prefix.to_vec());
+    }
+    seq.extend(image_prefix.iter().map(|&id| model.image_token_to_id(id)));
+    let mut session = model.decode_session();
+    let mut row = session.forward(&seq)?;
 
     let mut rng = SplitMix64::new(config.seed);
-    let mut tokens = Vec::with_capacity(n_image);
+    let mut tokens = image_prefix.to_vec();
+    tokens.reserve(n_image - tokens.len());
 
-    for _step in 0..n_image {
-        // Forward through the full current sequence.
-        let logits = model.forward(&seq)?;
-        // Slice the last position's logits — that's the model's
-        // prediction for the NEXT image token.
-        let last = seq.len() - 1;
-        let v = mcfg.vocab_image;
-        let row = &logits[last * v..(last + 1) * v];
-
-        // Apply temperature + top-k + top-p, then sample.
-        let codeword = sample_from_logits(row, config, &mut rng);
+    for step in image_prefix.len()..n_image {
+        let codeword = sample_from_logits(&row, config, &mut rng);
         tokens.push(codeword);
-
-        // Append the sampled codeword to the sequence in unified-vocab space.
-        let unified_id = model.image_token_to_id(codeword);
-        seq.push(unified_id);
+        if step + 1 < n_image {
+            row = session.forward(&[model.image_token_to_id(codeword)])?;
+        }
     }
     Ok(tokens)
 }
@@ -221,6 +228,7 @@ mod tests {
             eos_token: 102,
             rms_norm_eps: 1e-5,
             rope_theta: 10_000.0,
+            stable_image_positions: false,
         }
     }
 

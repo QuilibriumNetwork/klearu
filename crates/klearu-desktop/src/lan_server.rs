@@ -391,6 +391,7 @@ async fn dispatch_command(
                     flux_t5: get("image.flux_t5").map(std::path::PathBuf::from),
                     output_dir: get("image.output_dir").map(std::path::PathBuf::from),
                     motion_adapter: get("image.motion_adapter").map(std::path::PathBuf::from),
+                    wan_root: get("image.wan_root").map(std::path::PathBuf::from),
                 };
                 workspace.diffusion.set_config(new_cfg);
             }
@@ -576,6 +577,90 @@ async fn dispatch_stream_command(
             }).await.map_err(|e| crate::error::DesktopError::engine(format!("join: {e}")))?;
             Ok(())
         }
+        #[cfg(target_os = "macos")]
+        "wan_video_generate" => {
+            // Same shape as the Tauri command: the frontend wraps the payload
+            // in "args", and conditioning frames arrive base64 so a remote
+            // incognito session never puts an image on disk at either end.
+            let inner = args.get("args").cloned().unwrap_or(args.clone());
+            let a: crate::commands::image::WanVideoGenerateArgs =
+                serde_json::from_value(inner)
+                    .map_err(|e| crate::error::DesktopError::bad_input(format!("parse: {e}")))?;
+
+            let decode = |b: &String| -> crate::error::Result<Vec<u8>> {
+                use base64::Engine;
+                base64::engine::general_purpose::STANDARD
+                    .decode(crate::commands::image::strip_data_uri(b))
+                    .map_err(|e| {
+                        crate::error::DesktopError::bad_input(format!("decode image: {e}"))
+                    })
+            };
+            let start_image_bytes = a.start_image_b64.as_ref().map(decode).transpose()?;
+            let end_image_bytes = a.end_image_b64.as_ref().map(decode).transpose()?;
+            let seed = a.seed.unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| (d.as_nanos() as u64).wrapping_mul(0x9E3779B97F4A7C15))
+                    .unwrap_or(42)
+            });
+
+            let engine = workspace.diffusion.clone();
+            let memory = workspace.memory.clone();
+            let (etx, mut erx) = mpsc::unbounded_channel::<crate::engine::diffusion::GenEvent>();
+            let tx2 = tx.clone();
+            tokio::spawn(async move {
+                while let Some(ev) = erx.recv().await {
+                    let json = serde_json::to_string(&ev).unwrap_or_default();
+                    let _ = tx2.send(Ok(Event::default().data(json))).await;
+                }
+            });
+
+            let prompt_for_record = a.prompt.clone();
+            let neg_for_record = a.negative_prompt.clone();
+            let req = crate::engine::diffusion::WanVideoRequest {
+                prompt: a.prompt,
+                negative_prompt: a.negative_prompt,
+                steps: a.steps,
+                guidance_scale: a.guidance_scale,
+                seed,
+                num_frames: a.num_frames,
+                width: a.width,
+                height: a.height,
+                fps: a.fps,
+                cfg_interval: (a.cfg_interval[0], a.cfg_interval[1]),
+                start_image_bytes,
+                end_image_bytes,
+            };
+            let result = engine.generate_wan_video_in_process(req, etx).await?;
+
+            let path_str = crate::commands::image::deliver_video(
+                workspace.is_incognito(), &workspace.data_dir(), &result.mp4_bytes, seed, "-wan",
+            )?;
+            if !workspace.is_incognito() {
+                let rec = crate::memory::ImageRecord {
+                    path: &path_str,
+                    prompt: &prompt_for_record,
+                    negative_prompt: neg_for_record.as_deref(),
+                    seed: Some(seed as i64),
+                    steps: Some(a.steps as i64),
+                    cfg_scale: Some(a.guidance_scale as f64),
+                    width: Some(result.width as i64),
+                    height: Some(result.height as i64),
+                    checkpoint: None,
+                    conversation_id: None,
+                    created_at: crate::commands::image::now_secs(),
+                };
+                let _ = memory.image_record(&rec);
+            }
+            let done = crate::engine::diffusion::GenEvent::Done {
+                job_id: result.job_id,
+                path: path_str,
+            };
+            let _ = tx.send(Ok(Event::default()
+                .data(serde_json::to_string(&done).unwrap_or_default())))
+                .await;
+            return Ok(());
+        }
         "image_generate" => {
             // Frontend sends { args: { prompt, ... } } — unwrap the inner
             // "args" field to get the actual GenerateRequest.
@@ -634,6 +719,8 @@ async fn dispatch_stream_command(
                 sampler: req.sampler.clone(),
                 karras: req.karras.unwrap_or(false),
                 cond_bias: None,
+                width: req.width,
+                height: req.height,
                 ..Default::default()
             };
             let result = engine.generate_in_process(in_proc, etx).await?;

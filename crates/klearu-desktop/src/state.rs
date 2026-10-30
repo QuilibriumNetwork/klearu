@@ -117,5 +117,6 @@ fn diffusion_config_from_settings(memory: &MemoryStore) -> crate::engine::diffus
         flux_t5: get("image.flux_t5").map(PathBuf::from),
         output_dir: get("image.output_dir").map(PathBuf::from),
         motion_adapter: get("image.motion_adapter").map(PathBuf::from),
+        wan_root: get("image.wan_root").map(PathBuf::from),
     }
 }

@@ -312,7 +312,7 @@ impl FluxRunner {
 
 /// Seeded standard-normal noise (splitmix64 + Box-Muller) — matches the
 /// `flux_generate` binary so seeds reproduce.
-fn sample_gaussian(shape: &[usize], seed: u64) -> Vec<f32> {
+pub(crate) fn sample_gaussian(shape: &[usize], seed: u64) -> Vec<f32> {
     let n: usize = shape.iter().product();
     let mut out = Vec::with_capacity(n);
     let mut state = seed.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(1);

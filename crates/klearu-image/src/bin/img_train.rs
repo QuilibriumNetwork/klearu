@@ -1,223 +1,304 @@
-//! img_train — train a klearu-image model from a JSONL manifest.
-//!
-//! Usage:
-//!     img_train \
-//!         --manifest data.jsonl \
-//!         --out checkpoint.safetensors \
-//!         --steps 10000 \
-//!         --lr 3e-4 \
-//!         --log-every 100 \
-//!         [--resume previous.safetensors]
-//!
-//! The manifest must be JSONL with one `{caption: string, image_tokens: [u32; 256]}`
-//! per line. Pre-tokenize images with `scripts/build_codebook.py` (for the
-//! codebook) + a separate offline encode-and-dump script.
-//!
-//! Text BPE tokenization is intentionally NOT baked in: callers pass
-//! pre-tokenized text via the `text_tokens` field of the manifest (or
-//! use the demo path that BPE-encodes captions on the fly via a
-//! tokenizer.json file passed via `--bpe`).
-
-use std::path::PathBuf;
-use std::process::ExitCode;
-
-use klearu_image::backward::train_step;
-use klearu_image::checkpoint::{save_with_optimizer, load_with_optimizer};
-use klearu_image::error::Result as ImgResult;
-use klearu_image::grad::Gradients;
-use klearu_image::model::{ImageTransformer, ImageTransformerConfig};
-use klearu_image::optim::{AdamW, AdamWConfig};
-use klearu_image::train::{assemble_batch, read_manifest, TrainExample};
+//! Single-machine training with explicit conditioning and bounded activation memory.
+use clap::Parser;
+use klearu_image::{
+    backward::{backward, forward_train},
+    checkpoint::{load_with_optimizer, save_with_optimizer},
+    conditioning::{self, Conditioning},
+    grad::Gradients,
+    model::{ImageTransformer, ImageTransformerConfig},
+    optim::{AdamW, AdamWConfig},
+    train::{assemble_batch, cross_entropy_loss, read_manifest, TrainExample},
+    ImageGenError, Result,
+};
+use rand::{seq::SliceRandom, SeedableRng};
+use std::{path::PathBuf, time::Instant};
 use tokenizers::Tokenizer;
 
+#[derive(Parser)]
+#[command(about = "Train klearu-image on one machine; --steps counts additional optimizer updates")]
 struct Args {
+    #[arg(long)]
     manifest: PathBuf,
+    #[arg(long, default_value = "klearu_image.safetensors")]
     out: PathBuf,
+    #[arg(long, default_value_t = 1000)]
     steps: usize,
-    lr: f32,
+    /// New runs default to 3e-4; resume keeps stored LR unless explicitly overridden.
+    #[arg(long)]
+    lr: Option<f32>,
+    #[arg(long, default_value_t = 100)]
     log_every: usize,
+    #[arg(long, default_value_t = 42)]
     seed: u64,
+    #[arg(long)]
     resume: Option<PathBuf>,
+    /// Tokenizer is embedded in new checkpoints. Required for new conditional runs,
+    /// including manifests that already contain text_tokens.
+    #[arg(long, conflicts_with = "unconditional")]
     bpe: Option<PathBuf>,
+    #[arg(long)]
+    unconditional: bool,
+    #[arg(long, default_value="pilot", value_parser=["pilot","baseline"])]
+    preset: String,
+    /// Image codebook size for a fresh run; resume uses its checkpoint configuration.
+    #[arg(long, conflicts_with = "resume", value_parser = clap::value_parser!(u32).range(2..))]
+    image_vocab: Option<u32>,
+    /// Give image positions fixed raster slots independent of caption length.
+    #[arg(long, conflicts_with = "resume")]
+    stable_image_positions: bool,
+    /// Sequential microbatches: one image's activations in memory at a time.
+    #[arg(long, default_value_t = 8)]
+    accumulate: usize,
+    #[arg(long, default_value_t = 1.0)]
+    clip_norm: f32,
+    #[arg(long)]
+    validation: Option<PathBuf>,
+    #[arg(long, default_value_t = 100)]
+    eval_every: usize,
+    #[arg(long, default_value_t = 128)]
+    eval_limit: usize,
+    #[arg(long, default_value_t = 500)]
+    save_every: usize,
 }
-
-fn parse_args() -> Result<Args, String> {
-    let raw: Vec<String> = std::env::args().collect();
-    let mut args = Args {
-        manifest: PathBuf::new(),
-        out: PathBuf::from("klearu_image.safetensors"),
-        steps: 10000,
-        lr: 3e-4,
-        log_every: 100,
-        seed: 42,
-        resume: None,
-        bpe: None,
-    };
-    let mut i = 1;
-    while i < raw.len() {
-        let arg = &raw[i];
-        let next = |i: &mut usize| -> Result<String, String> {
-            *i += 1;
-            raw.get(*i).cloned().ok_or_else(|| format!("flag {arg} expects a value"))
-        };
-        match arg.as_str() {
-            "--manifest" => args.manifest = PathBuf::from(next(&mut i)?),
-            "--out" => args.out = PathBuf::from(next(&mut i)?),
-            "--steps" => args.steps = next(&mut i)?.parse().map_err(|e| format!("{e}"))?,
-            "--lr" => args.lr = next(&mut i)?.parse().map_err(|e| format!("{e}"))?,
-            "--log-every" => args.log_every = next(&mut i)?.parse().map_err(|e| format!("{e}"))?,
-            "--seed" => args.seed = next(&mut i)?.parse().map_err(|e| format!("{e}"))?,
-            "--resume" => args.resume = Some(PathBuf::from(next(&mut i)?)),
-            "--bpe" => args.bpe = Some(PathBuf::from(next(&mut i)?)),
-            "--help" | "-h" => {
-                print_help();
-                std::process::exit(0);
-            }
-            other => return Err(format!("unknown flag: {other:?}")),
+fn error(e: impl std::fmt::Display) -> ImageGenError {
+    ImageGenError::Config(e.to_string())
+}
+fn main() -> std::process::ExitCode {
+    match run(Args::parse()) {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::ExitCode::FAILURE
         }
-        i += 1;
-    }
-    if args.manifest.as_os_str().is_empty() {
-        return Err("--manifest is required".into());
-    }
-    Ok(args)
-}
-
-fn print_help() {
-    eprintln!("img_train — train klearu-image model");
-    eprintln!();
-    eprintln!("  --manifest FILE     JSONL with image_tokens + caption (required)");
-    eprintln!("  --out FILE          Output checkpoint path (default klearu_image.safetensors)");
-    eprintln!("  --steps N           Number of optimizer steps (default 10000)");
-    eprintln!("  --lr F              Learning rate (default 3e-4)");
-    eprintln!("  --log-every N       Print loss every N steps (default 100)");
-    eprintln!("  --seed N            RNG seed for init / shuffle (default 42)");
-    eprintln!("  --resume FILE       Resume from existing checkpoint");
-    eprintln!("  --bpe FILE          Path to a tokenizer.json for BPE-encoding captions.");
-    eprintln!("                      Omit to expect manifest entries to carry pre-BPE'd text.");
-}
-
-fn main() -> ExitCode {
-    let args = match parse_args() {
-        Ok(a) => a,
-        Err(e) => { eprintln!("error: {e}"); return ExitCode::from(2); }
-    };
-    match run(args) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => { eprintln!("error: {e}"); ExitCode::FAILURE }
     }
 }
-
-fn run(args: Args) -> ImgResult<()> {
-    let cfg = ImageTransformerConfig::baseline_50m();
-    let (mut model, mut opt) = if let Some(path) = &args.resume {
-        eprintln!("[img_train] resuming from {}", path.display());
-        load_with_optimizer(path)?
-    } else {
-        let mut model = ImageTransformer::from_config(cfg.clone());
-        init_random(&mut model, args.seed);
-        let opt = AdamW::new(&model, AdamWConfig {
-            lr: args.lr, ..Default::default()
-        });
-        (model, opt)
-    };
-    eprintln!("[img_train] model: {} params, {} layers, hidden={}",
-        model.param_count(), model.config.num_layers, model.config.hidden_size);
-
-    let manifest = read_manifest(&args.manifest)?;
-    eprintln!("[img_train] manifest: {} entries", manifest.len());
-    if manifest.is_empty() {
-        return Err(klearu_image::error::ImageGenError::Config(
-            "empty manifest".into()));
-    }
-
-    let mut grad = Gradients::zeros_for(&model);
-
-    // BPE setup. If --bpe is provided, captions are encoded inline.
-    let bpe = if let Some(path) = &args.bpe {
-        eprintln!("[img_train] loading BPE tokenizer from {}", path.display());
-        let tok = Tokenizer::from_file(path)
-            .map_err(|e| klearu_image::error::ImageGenError::Unsupported(
-                format!("tokenizer: {e}")))?;
-        Some(tok)
-    } else {
-        eprintln!("[img_train] no --bpe: using empty text prefix (image-only training)");
-        None
-    };
-
-    let n_entries = manifest.len();
-    let start = std::time::Instant::now();
-    let mut loss_running = 0.0_f64;
-    let mut loss_count = 0_usize;
-    for step in 0..args.steps {
-        let idx = ((step as u64).wrapping_mul(2654435761) as usize) % n_entries;
-        let entry = &manifest[idx];
-        // Tokenize caption via BPE if available, else empty prefix.
-        let text_tokens: Vec<u32> = if let Some(tok) = &bpe {
-            match tok.encode(entry.caption.as_str(), false) {
-                Ok(enc) => {
-                    let mut ids: Vec<u32> = enc.get_ids().iter().copied()
-                        .filter(|&t| (t as usize) < model.config.vocab_text)
-                        .collect();
-                    if ids.len() > model.config.max_text_len {
-                        ids.truncate(model.config.max_text_len);
-                    }
-                    ids
+fn examples(
+    path: &PathBuf,
+    model: &ImageTransformer,
+    tok: Option<&Tokenizer>,
+) -> Result<Vec<TrainExample>> {
+    read_manifest(path)?
+        .into_iter()
+        .enumerate()
+        .map(|(i, e)| {
+            let text_tokens = if let Some(tok) = tok {
+                match e.text_tokens {
+                    Some(ids) => ids,
+                    None => conditioning::encode(tok, &model.config, &e.caption)?,
                 }
-                Err(_) => Vec::new(),
+            } else {
+                Vec::new()
+            };
+            if tok.is_some() && text_tokens.is_empty() {
+                return Err(error(format!(
+                    "{} row {} has empty conditional text",
+                    path.display(),
+                    i + 1
+                )));
             }
-        } else { Vec::new() };
-        let example = TrainExample {
-            text_tokens,
-            image_tokens: entry.image_tokens.clone(),
-        };
-        let batch = assemble_batch(&model.config, &example)?;
-        let loss = train_step(&mut model, &mut opt, &mut grad, &batch)?;
-        loss_running += loss as f64;
-        loss_count += 1;
-        if (step + 1) % args.log_every == 0 || step == 0 {
-            let avg = (loss_running / loss_count as f64) as f32;
-            let elapsed = start.elapsed().as_secs_f32();
-            eprintln!("[img_train] step {}/{}  loss={:.4}  ({:.1}s elapsed, {:.2}s/step)",
-                step + 1, args.steps, avg, elapsed, elapsed / (step + 1) as f32);
-            loss_running = 0.0;
-            loss_count = 0;
-        }
-        // Save checkpoint every 1000 steps.
-        if (step + 1) % 1000 == 0 {
-            save_with_optimizer(&model, &opt, &args.out)?;
-            eprintln!("[img_train] saved checkpoint → {}", args.out.display());
+            let ex = TrainExample {
+                text_tokens,
+                image_tokens: e.image_tokens,
+            };
+            assemble_batch(&model.config, &ex)?; // Validate ALL IDs and lengths before training.
+            Ok(ex)
+        })
+        .collect()
+}
+fn evaluate(model: &ImageTransformer, data: &[TrainExample], limit: usize) -> Result<()> {
+    let n = data.len().min(limit);
+    if n == 0 {
+        return Err(error("empty validation set"));
+    }
+    let mut sums = [0.0_f64; 3];
+    for (i, ex) in data.iter().take(n).enumerate() {
+        for mode in 0..3 {
+            let text = match mode {
+                0 => ex.text_tokens.clone(),
+                1 => data[(i + 1) % data.len()].text_tokens.clone(),
+                _ => Vec::new(),
+            };
+            let b = assemble_batch(
+                &model.config,
+                &TrainExample {
+                    text_tokens: text,
+                    image_tokens: ex.image_tokens.clone(),
+                },
+            )?;
+            let logits = model.forward(&b.token_ids)?;
+            sums[mode] += cross_entropy_loss(model, &logits, &b)?.0 as f64;
         }
     }
-    save_with_optimizer(&model, &opt, &args.out)?;
-    eprintln!("[img_train] final checkpoint → {} (+ .optim.safetensors)",
-        args.out.display());
+    eprintln!(
+        "[validation] examples={n} CE correct={:.4} shuffled={:.4} empty={:.4}",
+        sums[0] / n as f64,
+        sums[1] / n as f64,
+        sums[2] / n as f64
+    );
     Ok(())
 }
-
-/// Initialise model weights with small random values. Uses splitmix for
-/// determinism; replace with klearu-llm's xavier/kaiming when wiring
-/// the proper init pass.
-fn init_random(model: &mut ImageTransformer, seed: u64) {
-    let mut state = seed.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(1);
-    let mut rand = move || -> f32 {
-        state = state.wrapping_add(0x9E3779B97F4A7C15);
-        let mut z = state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
-        z ^= z >> 31;
-        ((z >> 11) as f32 / (1u64 << 53) as f32) * 0.04 - 0.02
-    };
-    for v in model.embed.iter_mut() { *v = rand(); }
-    for v in model.pos_embed.iter_mut() { *v = rand(); }
-    for blk in model.blocks.iter_mut() {
-        for v in blk.q_proj.weight.iter_mut() { *v = rand(); }
-        for v in blk.k_proj.weight.iter_mut() { *v = rand(); }
-        for v in blk.v_proj.weight.iter_mut() { *v = rand(); }
-        for v in blk.o_proj.weight.iter_mut() { *v = rand(); }
-        for v in blk.mlp_gate.weight.iter_mut() { *v = rand(); }
-        for v in blk.mlp_up.weight.iter_mut() { *v = rand(); }
-        for v in blk.mlp_down.weight.iter_mut() { *v = rand(); }
+fn run(args: Args) -> Result<()> {
+    if args.steps == 0
+        || args.accumulate == 0
+        || args.log_every == 0
+        || args.save_every == 0
+        || args.eval_every == 0
+        || args.eval_limit == 0
+        || args.lr.is_some_and(|lr| !lr.is_finite() || lr <= 0.0)
+        || !args.clip_norm.is_finite()
+        || args.clip_norm <= 0.0
+    {
+        return Err(error(
+            "steps, intervals, accumulation, learning rate and clip norm must be positive",
+        ));
     }
-    for v in model.lm_head.weight.iter_mut() { *v = rand(); }
+    let supplied = args
+        .bpe
+        .as_ref()
+        .map(|p| Tokenizer::from_file(p).map_err(error))
+        .transpose()?;
+    let (mut model, mut opt, tok) = if let Some(path) = &args.resume {
+        let (mut m, o) = load_with_optimizer(path)?;
+        let tok = conditioning::resolve(&m.conditioning, supplied, args.unconditional)?;
+        if let Some(t) = &tok {
+            conditioning::validate(t, &m.config)?;
+        }
+        m.conditioning = tok
+            .as_ref()
+            .map(conditioning::identity)
+            .transpose()?
+            .unwrap_or(Conditioning::Unconditional);
+        (m, o, tok)
+    } else {
+        let tok = conditioning::resolve(&Conditioning::Legacy, supplied, args.unconditional)?;
+        let mut cfg = if args.preset == "pilot" {
+            ImageTransformerConfig::pilot()
+        } else {
+            ImageTransformerConfig::baseline_50m()
+        };
+        cfg.vocab_text = tok.as_ref().map(conditioning::vocab_size).unwrap_or(1);
+        cfg.stable_image_positions = args.stable_image_positions;
+        if let Some(vocab) = args.image_vocab {
+            cfg.vocab_image = vocab as usize;
+        }
+        cfg.bos_token = cfg.vocab_text as u32;
+        cfg.sep_image_token = cfg.bos_token + 1;
+        cfg.eos_token = cfg.bos_token + 2;
+        let mut m = ImageTransformer::from_config(cfg);
+        m.init_random(args.seed);
+        m.conditioning = tok
+            .as_ref()
+            .map(conditioning::identity)
+            .transpose()?
+            .unwrap_or(Conditioning::Unconditional);
+        let o = AdamW::new(
+            &m,
+            AdamWConfig {
+                lr: args.lr.unwrap_or(3e-4),
+                ..Default::default()
+            },
+        );
+        (m, o, tok)
+    };
+    if let Some(lr) = args.lr {
+        opt.config.lr = lr;
+    }
+    // Explicit run settings let a resumed job preserve data order; changing these
+    // settings requires starting a new run rather than silently replaying samples.
+    use sha2::{Digest, Sha256};
+    let manifest_sha256 = format!("{:x}", Sha256::digest(std::fs::read(&args.manifest)?));
+    let settings = serde_json::json!({"seed":args.seed,"accumulate":args.accumulate,
+        "manifest":std::fs::canonicalize(&args.manifest)?,"manifest_sha256":manifest_sha256,"clip_norm":args.clip_norm});
+    if let Some(path) = &args.resume {
+        let run_path = path.with_extension("run.json");
+        if run_path.exists() {
+            let old: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(run_path)?).map_err(error)?;
+            if old != settings {
+                return Err(error(
+                    "resume settings differ (seed, accumulation, manifest or clipping)",
+                ));
+            }
+        } else {
+            eprintln!("[img_train] legacy checkpoint has no run settings; data order cannot be recovered exactly");
+        }
+        eprintln!(
+            "[img_train] resumed optimizer at step {}; lr={}",
+            opt.step, opt.config.lr
+        );
+    }
+    let data = examples(&args.manifest, &model, tok.as_ref())?;
+    if data.is_empty() {
+        return Err(error("empty manifest"));
+    }
+    let val = args
+        .validation
+        .as_ref()
+        .map(|p| examples(p, &model, tok.as_ref()))
+        .transpose()?;
+    eprintln!(
+        "[img_train] params={} examples={} accumulate={} parameter/gradient/Adam={:.2} GiB",
+        model.param_count(),
+        data.len(),
+        args.accumulate,
+        model.param_count() as f64 * 16.0 / 1073741824.0
+    );
+    if let Some(v) = &val {
+        evaluate(&model, v, args.eval_limit)?;
+    }
+    let mut grad = Gradients::zeros_for(&model);
+    let mut order: Vec<usize> = (0..data.len()).collect();
+    let mut epoch_cached = None;
+    let start = Instant::now();
+    for local in 0..args.steps {
+        grad.zero_inplace();
+        let mut loss = 0.0;
+        for micro in 0..args.accumulate {
+            let sample = opt
+                .step
+                .checked_mul(args.accumulate as u64)
+                .and_then(|x| x.checked_add(micro as u64))
+                .ok_or_else(|| error("sample counter overflow"))?;
+            let epoch = sample / data.len() as u64;
+            if epoch_cached != Some(epoch) {
+                order.iter_mut().enumerate().for_each(|(i, x)| *x = i);
+                order.shuffle(&mut rand::rngs::StdRng::seed_from_u64(
+                    args.seed.wrapping_add(epoch),
+                ));
+                epoch_cached = Some(epoch);
+            }
+            let ex = &data[order[(sample % data.len() as u64) as usize]];
+            let batch = assemble_batch(&model.config, ex)?;
+            let cache = forward_train(&model, &batch.token_ids)?;
+            loss += backward(&model, &cache, &batch.predict_at, &batch.targets, &mut grad)?;
+        }
+        let norm = grad.average_and_clip(args.accumulate, args.clip_norm)?;
+        if !loss.is_finite() {
+            return Err(error("non-finite loss"));
+        }
+        opt.step(&mut model, &grad);
+        if local == 0 || (local + 1) % args.log_every == 0 {
+            eprintln!(
+                "[img_train] step={} CE={:.4} grad_norm={:.3} elapsed={:.1}s seconds/example={:.4}",
+                opt.step,
+                loss / args.accumulate as f32,
+                norm,
+                start.elapsed().as_secs_f64(),
+                start.elapsed().as_secs_f64() / ((local + 1) * args.accumulate) as f64
+            );
+        }
+        if opt.step % args.eval_every as u64 == 0 {
+            if let Some(v) = &val {
+                evaluate(&model, v, args.eval_limit)?;
+            }
+        }
+        if (local + 1) % args.save_every == 0 || local + 1 == args.steps {
+            save_with_optimizer(&model, &opt, &args.out)?;
+            std::fs::write(
+                args.out.with_extension("run.json"),
+                serde_json::to_vec_pretty(&settings).map_err(error)?,
+            )?;
+        }
+    }
+    Ok(())
 }
