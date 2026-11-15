@@ -3,6 +3,7 @@ pub mod error;
 pub mod generate;
 pub mod model;
 pub mod tensor;
+pub mod similarity;
 
 #[cfg(feature = "native-io")]
 pub mod tokenizer;

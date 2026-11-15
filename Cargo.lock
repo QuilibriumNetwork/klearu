@@ -3061,6 +3061,7 @@ name = "klearu-llm"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "clap",
  "half",
  "klearu-accel",
  "klearu-core",

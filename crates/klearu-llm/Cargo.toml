@@ -8,7 +8,7 @@ repository.workspace = true
 
 [features]
 default = ["native-io", "parallel"]
-native-io = ["dep:klearu-core", "dep:safetensors", "dep:tokenizers", "dep:memmap2"]
+native-io = ["dep:klearu-core", "dep:safetensors", "dep:tokenizers", "dep:memmap2", "dep:clap"]
 sparse = ["dep:klearu-dejavu"]
 vision = ["dep:klearu-vision"]
 parallel = ["dep:rayon"]
@@ -31,6 +31,12 @@ rayon = { workspace = true, optional = true }
 safetensors = { version = "0.4", optional = true }
 tokenizers = { version = "0.20", optional = true }
 memmap2 = { version = "0.9", optional = true }
+clap = { workspace = true, optional = true }
+
+[[bin]]
+name = "token-similarity"
+path = "src/bin/token_similarity.rs"
+required-features = ["native-io"]
 
 [[bin]]
 name = "chat"
