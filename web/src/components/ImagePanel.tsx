@@ -26,6 +26,10 @@ const SETTING_KEYS = [
   'image.flux_vae',
   'image.flux_clip_l',
   'image.flux_t5',
+  'image.krea2_text_encoder',
+  'image.krea2_tokenizer',
+  'image.krea2_vae',
+  'image.krea2_variant',
   'image.output_dir',
   'image.motion_adapter',
   'image.wan_root',
@@ -42,6 +46,10 @@ interface ImageSettings {
   'image.flux_vae'?: string;
   'image.flux_clip_l'?: string;
   'image.flux_t5'?: string;
+  'image.krea2_text_encoder'?: string;
+  'image.krea2_tokenizer'?: string;
+  'image.krea2_vae'?: string;
+  'image.krea2_variant'?: string;
   'image.output_dir'?: string;
   'image.motion_adapter'?: string;
   'image.wan_root'?: string;
@@ -208,13 +216,26 @@ function SettingsBlock({ settings, onSet, onClose }: {
         <button onClick={onClose} className="ml-auto text-xs text-gray-400 hover:text-gray-200">close</button>
       </div>
       <SettingField label="sd_generate binary" placeholder="auto-detect — env or target/debug" k="image.sd_generate_path" value={settings['image.sd_generate_path']} onSet={onSet} pickFile />
-      <SettingField label="checkpoint / HiDream·Flux·Krea 2 dir" k="image.checkpoint" value={settings['image.checkpoint']}         onSet={onSet} pickFile pickDir />
+      <SettingField label="checkpoint file / model dir" k="image.checkpoint" value={settings['image.checkpoint']}         onSet={onSet} pickFile pickDir />
       <SettingField label="CLIP-L tokenizer.json"          k="image.tokenizer_l"        value={settings['image.tokenizer_l']}        onSet={onSet} pickFile />
       <SettingField label="CLIP-G tokenizer.json (SDXL)"   k="image.tokenizer_g"        value={settings['image.tokenizer_g']}        onSet={onSet} pickFile />
       <SettingField label="T5 tokenizer.json (Flux)"       k="image.flux_t5_tokenizer"  value={settings['image.flux_t5_tokenizer']}  onSet={onSet} pickFile />
       <SettingField label="Flux VAE (ae.safetensors)"      k="image.flux_vae"           value={settings['image.flux_vae']}           onSet={onSet} pickFile />
       <SettingField label="Flux CLIP-L (.safetensors)"     k="image.flux_clip_l"        value={settings['image.flux_clip_l']}        onSet={onSet} pickFile />
       <SettingField label="Flux T5-XXL (.safetensors)"     k="image.flux_t5"            value={settings['image.flux_t5']}            onSet={onSet} pickFile />
+      <SettingField label="Krea 2 text encoder dir"        k="image.krea2_text_encoder" value={settings['image.krea2_text_encoder']} onSet={onSet} pickDir placeholder="auto — beside checkpoint or HF cache" />
+      <SettingField label="Krea 2 tokenizer.json"          k="image.krea2_tokenizer"    value={settings['image.krea2_tokenizer']}    onSet={onSet} pickFile placeholder="auto — beside checkpoint or HF cache" />
+      <SettingField label="Krea 2 VAE dir"                 k="image.krea2_vae"          value={settings['image.krea2_vae']}          onSet={onSet} pickDir placeholder="auto — beside checkpoint or HF cache" />
+      <div className="flex items-center gap-2">
+        <label htmlFor="krea2-variant" className="text-xs text-gray-300 w-40 shrink-0">Krea 2 variant</label>
+        <select id="krea2-variant" value={settings['image.krea2_variant'] || 'auto'}
+          onChange={(e) => onSet('image.krea2_variant', e.target.value)}
+          className="flex-1 bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs text-gray-100">
+          <option value="auto">Auto-detect</option>
+          <option value="turbo">Turbo (8 steps)</option>
+          <option value="raw">Raw (CFG)</option>
+        </select>
+      </div>
       <SettingField label="output dir"                     k="image.output_dir"         value={settings['image.output_dir']}         onSet={onSet} pickDir />
       <SettingField label="motion adapter (AnimateDiff)"  k="image.motion_adapter"     value={settings['image.motion_adapter']}     onSet={onSet} pickFile />
       <SettingField label="Wan 2.2 checkpoint dir"         k="image.wan_root"           value={settings['image.wan_root']}           onSet={onSet} pickDir

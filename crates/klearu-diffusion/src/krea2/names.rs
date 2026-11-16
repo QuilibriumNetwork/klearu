@@ -9,16 +9,22 @@
 
 use crate::weight::loader::ComponentTensors;
 
-/// Present in every reference-named checkpoint, under one prefix or the other.
-const ORIGINAL_MARKERS: [&str; 2] =
-    ["txtfusion.projector.weight", "model.diffusion_model.txtfusion.projector.weight"];
-
 /// Present in every diffusers-named checkpoint.
 const DIFFUSERS_MARKER: &str = "text_fusion.projector.weight";
+const ORIGINAL_MARKER: &str = "txtfusion.projector.weight";
+const CHECKPOINT_PREFIXES: [&str; 5] =
+    ["", "model.diffusion_model.", "diffusion_model.", "transformer.", "model."];
+
+fn transformer_prefix(comp: &ComponentTensors) -> Option<&'static str> {
+    CHECKPOINT_PREFIXES.into_iter().find(|prefix| {
+        comp.has(&format!("{prefix}{DIFFUSERS_MARKER}"))
+            || comp.has(&format!("{prefix}{ORIGINAL_MARKER}"))
+    })
+}
 
 /// Whether `comp` holds a Krea 2 transformer under either naming scheme.
 pub fn is_krea2_transformer(comp: &ComponentTensors) -> bool {
-    comp.has(DIFFUSERS_MARKER) || ORIGINAL_MARKERS.iter().any(|m| comp.has(m))
+    transformer_prefix(comp).is_some()
 }
 
 /// Rename reference (`mmdit.py`) tensor names to diffusers names. A no-op on
@@ -30,13 +36,15 @@ pub fn is_krea2_transformer(comp: &ComponentTensors) -> bool {
 /// in the same order, and every loader here checks element counts rather
 /// than ranks.
 pub fn canonicalize(comp: &mut ComponentTensors) {
-    if !ORIGINAL_MARKERS.iter().any(|m| comp.has(m)) {
-        return;
-    }
+    let Some(prefix) = transformer_prefix(comp) else { return };
+    let original = comp.has(&format!("{prefix}{ORIGINAL_MARKER}"));
     let old = std::mem::take(&mut comp.tensors);
     comp.tensors = old
         .into_iter()
-        .map(|(name, r)| (original_to_diffusers(&name), r))
+        .filter_map(|(name, r)| {
+            let key = name.strip_prefix(prefix)?;
+            Some((if original { original_to_diffusers(key) } else { key.to_string() }, r))
+        })
         .collect();
 }
 
@@ -84,6 +92,44 @@ pub fn original_to_diffusers(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detects_and_normalizes_checkpoint_layouts_without_copying_weights() {
+        for prefix in CHECKPOINT_PREFIXES {
+            for original in [false, true] {
+                let mut comp = ComponentTensors {
+                    mmaps: Vec::new(), owned: Vec::new(), tensors: Default::default(),
+                };
+                let marker = if original { ORIGINAL_MARKER } else { DIFFUSERS_MARKER };
+                let weight = if original { "first.weight" } else { "img_in.weight" };
+                for name in [marker, weight] {
+                    comp.append_synth_tensor(&format!("{prefix}{name}"), safetensors::Dtype::F32,
+                        vec![1], &1.25_f32.to_le_bytes()).unwrap();
+                }
+                assert!(is_krea2_transformer(&comp), "prefix={prefix} original={original}");
+                let ptr = comp.owned.as_ptr();
+                canonicalize(&mut comp);
+                assert!(comp.has(DIFFUSERS_MARKER));
+                assert_eq!(comp.get_f32("img_in.weight").unwrap(), vec![1.25]);
+                assert_eq!(comp.owned.as_ptr(), ptr);
+                canonicalize(&mut comp);
+                assert_eq!(comp.tensors.len(), 2);
+                assert_eq!(comp.get_f32("img_in.weight").unwrap(), vec![1.25]);
+            }
+        }
+    }
+
+    #[test]
+    fn leaves_other_model_families_untouched() {
+        let mut comp = ComponentTensors {
+            mmaps: Vec::new(), owned: Vec::new(), tensors: Default::default(),
+        };
+        comp.append_synth_tensor("double_blocks.0.img_attn.qkv.weight", safetensors::Dtype::F32,
+            vec![1], &1.0_f32.to_le_bytes()).unwrap();
+        assert!(!is_krea2_transformer(&comp));
+        canonicalize(&mut comp);
+        assert!(comp.has("double_blocks.0.img_attn.qkv.weight"));
+    }
 
     #[test]
     fn renames_match_the_diffusers_converter() {

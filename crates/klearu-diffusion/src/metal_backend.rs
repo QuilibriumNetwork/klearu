@@ -2526,6 +2526,21 @@ kernel void slice_cols_f16(
     out[gid] = inp[t * stride + off + j];
 }
 
+// Bit-preserving rectangular copy for either bf16 or IEEE half storage.
+// Used to pack/scatter column tiles without converting their representation.
+kernel void copy_matrix_u16(
+    device const ushort* src [[buffer(0)]],
+    device ushort* dst [[buffer(1)]],
+    constant uint& src_stride [[buffer(2)]],
+    constant uint& dst_stride [[buffer(3)]],
+    constant uint& cols [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    ulong row = gid / cols;
+    uint col = gid % cols;
+    dst[row * dst_stride + col] = src[row * src_stride + col];
+}
+
 // Gate: x[t,di] *= gate[di], broadcasting gate [d] across n token rows.
 kernel void gate_mul_f16(
     device bfloat*       x    [[buffer(0)]],  // [n, d]
@@ -3505,6 +3520,7 @@ struct MetalBackend {
     modulate_f16_pipe: ComputePipelineState,
     gate_mul_f16_pipe: ComputePipelineState,
     slice_cols_f16_pipe: ComputePipelineState,
+    copy_matrix_u16_pipe: ComputePipelineState,
 }
 
 unsafe impl Send for MetalBackend {}
@@ -3639,6 +3655,7 @@ fn get_metal() -> &'static MetalBackend {
             modulate_f16_pipe: make_pipe("modulate_f16"),
             gate_mul_f16_pipe: make_pipe("gate_mul_f16"),
             slice_cols_f16_pipe: make_pipe("slice_cols_f16"),
+            copy_matrix_u16_pipe: make_pipe("copy_matrix_u16"),
             device,
             queue,
         }
@@ -4597,6 +4614,18 @@ unsafe fn dispatch_mps_matmul_bf16_via_f32(
     let b_elems = b_rows * b_cols;
     let c_elems = m * n;
 
+    // Convolution has few output channels (M), but potentially millions of
+    // spatial positions (N). Row chunking cannot bound its im2col operand.
+    if !transpose_left && !transpose_right
+        && n > mps_column_tile_width(m, n, k, if use_f32 { 4 } else { 2 }, MPS_SCRATCH_LIMIT)
+    {
+        dispatch_mps_matmul_bf16_via_f32_with_offsets(
+            backend, a_bf16, 0, b_bf16, 0, c_bf16, 0,
+            m, n, k, false, false, b_rows, b_cols,
+        );
+        return;
+    }
+
     // acquire_buffer zero-initializes recycled buffers, so c_f32/c_f16 are
     // safe inputs to MPS matmul's beta=0 path by construction.
     //
@@ -4679,6 +4708,95 @@ unsafe fn dispatch_mps_matmul_bf16_via_f32_with_offsets(
     transpose_left: bool, transpose_right: bool,
     b_rows: usize, b_cols: usize,
 ) {
+    dispatch_mps_matmul_bf16_tiled_with_offsets(
+        backend, a_bf16, a_off_bytes_bf16, b_bf16, b_off_bytes_bf16,
+        c_bf16, c_off_bytes_bf16, m, n, k, transpose_left, transpose_right,
+        b_rows, b_cols, MPS_SCRATCH_LIMIT,
+    );
+}
+
+// Keep wide convolution scratch well below 4 GiB, also limiting the cost of
+// acquire_mps_buffer's address-boundary retries. Includes K padding in B.
+const MPS_SCRATCH_LIMIT: usize = 256 << 20;
+
+fn mps_column_tile_width(m: usize, n: usize, k: usize, bytes: usize, limit: usize) -> usize {
+    let k_padded = k.div_ceil(32) * 32;
+    n.min((limit / bytes / k_padded.max(m).max(1)).max(1))
+}
+
+fn copy_matrix_u16(
+    src: &Buffer, src_off_bytes: usize, src_stride: usize,
+    dst: &Buffer, dst_off_bytes: usize, dst_stride: usize,
+    rows: usize, cols: usize,
+) {
+    let backend = get_metal();
+    with_cmd(|cmd| {
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&backend.copy_matrix_u16_pipe);
+        enc.set_buffer(0, Some(src), src_off_bytes as u64);
+        enc.set_buffer(1, Some(dst), dst_off_bytes as u64);
+        for (i, value) in [src_stride, dst_stride, cols].iter().enumerate() {
+            let value = *value as u32;
+            enc.set_bytes(2 + i as u64, 4, &value as *const _ as *const _);
+        }
+        enc.dispatch_threads(metal::MTLSize::new((rows * cols) as u64, 1, 1),
+                             metal::MTLSize::new(256, 1, 1));
+        enc.end_encoding();
+    });
+}
+
+unsafe fn dispatch_mps_matmul_bf16_tiled_with_offsets(
+    backend: &MetalBackend,
+    a_bf16: &Buffer, a_off_bytes_bf16: usize,
+    b_bf16: &Buffer, b_off_bytes_bf16: usize,
+    c_bf16: &Buffer, c_off_bytes_bf16: usize,
+    m: usize, n: usize, k: usize,
+    transpose_left: bool, transpose_right: bool,
+    b_rows: usize, b_cols: usize,
+    scratch_limit: usize,
+) {
+    let bytes = if USE_F32_SGEMM.with(|c| c.get()) { 4 } else { 2 };
+    let cols = mps_column_tile_width(m, n, k, bytes, scratch_limit);
+    if !transpose_left && !transpose_right && cols < n {
+        // B[k,n] and C[m,n] are strided along N. Pack one column tile,
+        // compute it with the existing precision/padding path, then scatter it
+        // into C. Byte offsets preserve per-batch views of the original buffers.
+        for start in (0..n).step_by(cols) {
+            let width = cols.min(n - start);
+            let b_tile = acquire_buffer(k * width * 2);
+            let c_tile = acquire_buffer(m * width * 2);
+            copy_matrix_u16(b_bf16, b_off_bytes_bf16 + start * 2, n,
+                            &b_tile, 0, width, k, width);
+            dispatch_mps_matmul_bf16_untiled_with_offsets(
+                backend, a_bf16, a_off_bytes_bf16, &b_tile, 0, &c_tile, 0,
+                m, width, k, false, false, k, width,
+            );
+            copy_matrix_u16(&c_tile, 0, width,
+                            c_bf16, c_off_bytes_bf16 + start * 2, n, m, width);
+            release_buffer(b_tile);
+            release_buffer(c_tile);
+            // Bound live scratch and allow the next tile to reuse it instead
+            // of queuing an entire multi-GiB convolution's worth of staging.
+            flush();
+        }
+        return;
+    }
+    dispatch_mps_matmul_bf16_untiled_with_offsets(
+        backend, a_bf16, a_off_bytes_bf16, b_bf16, b_off_bytes_bf16,
+        c_bf16, c_off_bytes_bf16, m, n, k, transpose_left, transpose_right,
+        b_rows, b_cols,
+    );
+}
+
+unsafe fn dispatch_mps_matmul_bf16_untiled_with_offsets(
+    backend: &MetalBackend,
+    a_bf16: &Buffer, a_off_bytes_bf16: usize,
+    b_bf16: &Buffer, b_off_bytes_bf16: usize,
+    c_bf16: &Buffer, c_off_bytes_bf16: usize,
+    m: usize, n: usize, k: usize,
+    transpose_left: bool, transpose_right: bool,
+    b_rows: usize, b_cols: usize,
+) {
     use metal::MTLSize;
     let use_f32 = USE_F32_SGEMM.with(|c| c.get());
     // Storage may be bfloat16 or IEEE f16. This variant previously assumed
@@ -4701,9 +4819,8 @@ unsafe fn dispatch_mps_matmul_bf16_via_f32_with_offsets(
     // Workaround: pad K to a multiple of K_ALIGN with zeros. Zero
     // contributes nothing to the dot product (`0 * a_ki = 0`), so the
     // mathematical result is unchanged. We allocate larger A and B
-    // buffers, copy the original data into the leading K positions,
-    // and rely on `acquire_buffer`'s pool zero-init to leave the
-    // trailing K positions as zero.
+    // buffers, zero them, then copy the original data into the leading K
+    // positions. Fresh allocations, unlike recycled buffers, are not zeroed.
     //
     // Only activates when transpose flags are false (the conv2d /
     // im2col path); the linear/attention paths use larger K (≥128)
@@ -4716,12 +4833,15 @@ unsafe fn dispatch_mps_matmul_bf16_via_f32_with_offsets(
     let a_alloc_elems = m * k_padded;
     let b_alloc_elems = if needs_pad { k_padded * b_cols } else { b_elems };
 
-    // acquire_buffer zero-initializes recycled buffers, so c_buf (matmul
-    // destination, beta=0 path) and the trailing K columns/rows of a_buf
-    // and b_buf are safe by construction.
+    // Recycled buffers are zeroed by acquire_buffer. Explicitly zero padded
+    // inputs as well so their unused K lanes are defined on fresh allocations.
     let a_buf = acquire_mps_buffer(a_alloc_elems * bytes);
     let b_buf = acquire_mps_buffer(b_alloc_elems * bytes);
     let c_buf = acquire_mps_buffer(c_elems * bytes);
+    if needs_pad {
+        zero_buffer(&a_buf, a_alloc_elems * bytes);
+        zero_buffer(&b_buf, b_alloc_elems * bytes);
+    }
     mps_addr_report(&[("A", &a_buf), ("B", &b_buf), ("C", &c_buf), ("a_src", a_bf16), ("b_src", b_bf16), ("c_dst", c_bf16)]);
 
     let dispatch_cast = |pipe: &ComputePipelineState, src: &Buffer, src_off: usize,
@@ -8806,6 +8926,111 @@ pub fn release_pool_buffer(buf: Buffer) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mps_column_tile_bounds_vae_scratch() {
+        // 1024-square VAE convolution: the previous full B staging buffer
+        // was exactly the reported 4,831,838,208 bytes (128 * 3 * 3 * HW * 4).
+        let (m, n, k) = (128, 1024 * 1024, 128 * 3 * 3);
+        assert_eq!(k * n * 4, 4_831_838_208);
+        for bytes in [2, 4] {
+            for (m, k) in [(m, k), (128, 27), (512, 9)] {
+                let cols = mps_column_tile_width(m, n, k, bytes, MPS_SCRATCH_LIMIT);
+                assert!(cols > 0 && cols <= n);
+                if k == 1152 { assert!(cols < n); }
+                assert!(k.div_ceil(32) * 32 * cols * bytes <= MPS_SCRATCH_LIMIT);
+                assert!(m * cols * bytes <= MPS_SCRATCH_LIMIT);
+            }
+        }
+        assert_eq!(mps_column_tile_width(128, 77, 320, 4, MPS_SCRATCH_LIMIT), 77);
+    }
+
+    #[test]
+    fn mps_column_tiles_match_reference_with_offsets() {
+        // A tiny scratch budget exercises the production tiling path without
+        // multi-GiB allocations. Odd-width tiles test packing/scattering and
+        // nonzero batch offsets, including a ragged final tile and padded K.
+        let (m, n, k) = (8, 41, 27);
+        let (a_off, b_off, c_off) = (5, 7, 9);
+        for half_io in [false, true] {
+            let quantize = |x: f32| if half_io {
+                half::f16::from_f32(x).to_f32()
+            } else {
+                half::bf16::from_f32(x).to_f32()
+            };
+            let a: Vec<f32> = (0..a_off + m * k + 3)
+                .map(|i| quantize((i % 13) as f32 / 16.0 - 0.375)).collect();
+            let b: Vec<f32> = (0..b_off + k * n + 3)
+                .map(|i| quantize((i % 17) as f32 / 32.0 - 0.25)).collect();
+            let initial = vec![-7.0; c_off + m * n + 3];
+            let upload = |v: &[f32]| if half_io {
+                GpuTensor::upload_f32_as_half(vec![v.len()], v)
+            } else {
+                GpuTensor::upload_f32_as_f16(vec![v.len()], v)
+            };
+            let ga = upload(&a);
+            let gb = upload(&b);
+            for f32_scratch in [false, true] {
+                let out = upload(&initial);
+                set_sgemm_half_io(half_io);
+                set_use_f32_sgemm(f32_scratch);
+                unsafe {
+                    dispatch_mps_matmul_bf16_tiled_with_offsets(
+                        get_metal(), &ga.buffer, a_off * 2, &gb.buffer, b_off * 2,
+                        &out.buffer, c_off * 2, m, n, k, false, false, k, n,
+                        32 * 4 * 13,
+                    );
+                }
+                let got = out.download_to_f32();
+                set_sgemm_half_io(false);
+                set_use_f32_sgemm(false);
+                assert_eq!(&got[..c_off], &initial[..c_off]);
+                assert_eq!(&got[c_off + m * n..], &initial[c_off + m * n..]);
+                for row in 0..m {
+                    for col in 0..n {
+                        let expected: f32 = (0..k).map(|i|
+                            a[a_off + row * k + i] * b[b_off + i * n + col]
+                        ).sum();
+                        let actual = got[c_off + row * n + col];
+                        assert!((actual - quantize(expected)).abs() < 0.005,
+                            "half={half_io} f32={f32_scratch} row={row} col={col}: {actual} vs {expected}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Exercises the reported 4.5 GiB fp32 operand through the public conv
+    /// entry point. Run alone: its bf16 source still requires 2.25 GiB.
+    #[test]
+    #[ignore]
+    fn mps_column_tiles_large_vae_operand() {
+        let (m, n, k) = (128, 1024 * 1024, 1152);
+        let mut weights = vec![0.0; m * k];
+        for row in 0..m { weights[row * k] = 1.0; }
+        let a = GpuTensor::upload_f32_as_f16(vec![m, k], &weights);
+        let b = acquire_buffer(k * n * 2);
+        // Every bf16 element is 0x3c3c, a finite exactly representable value.
+        with_cmd(|cmd| {
+            let blit = cmd.new_blit_command_encoder();
+            blit.fill_buffer(&b, metal::NSRange::new(0, (k * n * 2) as u64), 0x3c);
+            blit.end_encoding();
+        });
+        let out = GpuTensor::new_f16(vec![m, n]);
+        set_use_f32_sgemm(true);
+        sgemm_f16_buf_with_offsets(&out.buffer, 0, &a.buffer, 0, &b, 0, m, n, k);
+        flush();
+        set_use_f32_sgemm(false);
+        let cols = mps_column_tile_width(m, n, k, 4, MPS_SCRATCH_LIMIT);
+        for row in [0, m / 2, m - 1] {
+            for start in (0..n).step_by(cols) {
+                for col in [start, (start + cols - 1).min(n - 1)] {
+                    let bits = unsafe { *(out.buffer.contents() as *const u16).add(row * n + col) };
+                    assert_eq!(bits, 0x3c3c, "row={row} col={col}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn upload_download_roundtrip_f16() {

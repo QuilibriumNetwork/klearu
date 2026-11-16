@@ -59,6 +59,13 @@ pub struct DiffusionConfig {
     pub flux_vae: Option<PathBuf>,
     pub flux_clip_l: Option<PathBuf>,
     pub flux_t5: Option<PathBuf>,
+    /// Companion components for a standalone Krea 2 transformer checkpoint.
+    /// Unset paths are resolved beside the checkpoint, then from the HF cache.
+    pub krea2_text_encoder: Option<PathBuf>,
+    pub krea2_tokenizer: Option<PathBuf>,
+    pub krea2_vae: Option<PathBuf>,
+    /// `None`/"auto", "turbo", or "raw". Useful for renamed checkpoints.
+    pub krea2_variant: Option<String>,
     /// Output directory. Defaults to `~/.klearu/images/`.
     pub output_dir: Option<PathBuf>,
     /// Path to an AnimateDiff motion adapter `.safetensors` for video
@@ -525,13 +532,28 @@ impl DiffusionEngine {
                 .await;
         }
 
-        // Krea 2 (diffusers directory or single-file transformer): carries its
-        // own tokenizer, text encoder and VAE, so no extra settings needed.
+        // Krea 2: directory or standalone transformer plus companion components.
         #[cfg(target_os = "macos")]
         if klearu_diffusion::krea2::runner::is_krea2_checkpoint(&checkpoint) {
-            let signature = format!("krea2|{}", checkpoint.display());
+            use klearu_diffusion::krea2::runner::{Krea2LoadSpec, Krea2Variant};
+            let variant = match cfg.krea2_variant.as_deref() {
+                None | Some("" | "auto") => None,
+                Some("turbo") => Some(Krea2Variant::Turbo),
+                Some("raw") => Some(Krea2Variant::Raw),
+                Some(_) => return Err(DesktopError::bad_input("image.krea2_variant must be auto, turbo, or raw")),
+            };
+            let spec = Krea2LoadSpec {
+                checkpoint,
+                text_encoder: cfg.krea2_text_encoder,
+                tokenizer: cfg.krea2_tokenizer,
+                vae: cfg.krea2_vae,
+                variant,
+                ..Default::default()
+            };
+            // Component and variant changes invalidate the resident runner too.
+            let signature = format!("krea2|{spec:?}");
             return self
-                .generate_krea2_in_process(checkpoint, signature, req, job_id, events)
+                .generate_krea2_in_process(spec, signature, req, job_id, events)
                 .await;
         }
 
@@ -758,13 +780,13 @@ impl DiffusionEngine {
     #[cfg(target_os = "macos")]
     async fn generate_krea2_in_process(
         &self,
-        checkpoint: PathBuf,
+        spec: klearu_diffusion::krea2::runner::Krea2LoadSpec,
         signature: String,
         req: InProcessRequest,
         job_id: u64,
         events: mpsc::UnboundedSender<GenEvent>,
     ) -> Result<InProcessResult> {
-        use klearu_diffusion::krea2::runner::{Krea2GenOpts, Krea2LoadSpec, Krea2Runner, Krea2Variant};
+        use klearu_diffusion::krea2::runner::{Krea2GenOpts, Krea2Runner, Krea2Variant};
 
         let handle = self.krea2.clone();
         let residents_handle = self.residents.clone();
@@ -790,7 +812,6 @@ impl DiffusionEngine {
                 *hidream_handle.lock() = None;
                 *flux_handle.lock() = None;
                 *wan_handle.lock() = None;
-                let spec = Krea2LoadSpec { checkpoint, ..Default::default() };
                 let runner = Krea2Runner::load_with_progress(&spec, |m| log(m.to_string()))
                     .map_err(|e| DesktopError::engine(format!("load krea2: {e}")))?;
                 *guard = Some(LoadedKrea2 { runner, signature });

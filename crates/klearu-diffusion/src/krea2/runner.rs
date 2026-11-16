@@ -57,9 +57,8 @@ impl Krea2Variant {
 /// Where to find the model. `checkpoint` is a Krea 2 directory in diffusers
 /// layout (`model_index.json`, `transformer/`, `text_encoder/`, `tokenizer/`,
 /// `vae/`) or a single-file transformer (`turbo.safetensors`/`raw.safetensors`).
-/// Components the checkpoint lacks — all of them for a single file, and the
-/// shared ones for a Raw download that skipped them — come from the overrides,
-/// or failing that from any other Krea 2 snapshot in the Hugging Face cache.
+/// Companion components come from explicit overrides, then subfolders beside
+/// the checkpoint, then another Krea 2 snapshot in the Hugging Face cache.
 #[derive(Debug, Clone, Default)]
 pub struct Krea2LoadSpec {
     pub checkpoint: PathBuf,
@@ -173,6 +172,20 @@ impl Krea2Runner {
         let ck = &spec.checkpoint;
         let dir = ck.is_dir().then(|| ck.clone());
 
+        // Resolve companion components before allocating the ~25 GB transformer.
+        // A checkpoint file uses the same sibling layout as a model directory.
+        let root = checkpoint_root(ck);
+        let te_dir = resolve_component(spec.text_encoder.as_ref(), Some(&root), "text_encoder", |p| {
+            has_safetensors(p) && p.join("config.json").is_file()
+        })?;
+        let tok = resolve_component(spec.tokenizer.as_ref(), Some(&root), "tokenizer", |p| {
+            if p.is_dir() { p.join("tokenizer.json").is_file() } else { p.is_file() }
+        })?;
+        let tok = if tok.is_dir() { tok.join("tokenizer.json") } else { tok };
+        let vae_dir = resolve_component(spec.vae.as_ref(), Some(&root), "vae", |p| {
+            has_safetensors(p) && p.join("config.json").is_file()
+        })?;
+
         // ---- variant ----
         let variant = spec.variant.unwrap_or_else(|| detect_variant(ck));
 
@@ -194,13 +207,6 @@ impl Krea2Runner {
 
         // ---- text encoder + tokenizer ----
         on_progress("loading Qwen3-VL text encoder");
-        let te_dir = resolve_component(spec.text_encoder.as_ref(), dir.as_deref(), "text_encoder", has_safetensors)
-            .ok_or_else(|| layout("no Krea 2 text_encoder/ found; set the text encoder path".into()))?;
-        let tok = resolve_component(spec.tokenizer.as_ref(), dir.as_deref(), "tokenizer", |p| {
-            p.join("tokenizer.json").is_file()
-        })
-        .map(|p| if p.is_dir() { p.join("tokenizer.json") } else { p })
-        .ok_or_else(|| layout("no Krea 2 tokenizer/tokenizer.json found; set the tokenizer path".into()))?;
         let text = if spec.offload_text_encoder {
             TextEncoder::OnDemand { dir: te_dir, tokenizer: tok }
         } else {
@@ -209,8 +215,6 @@ impl Krea2Runner {
 
         // ---- VAE ----
         on_progress("loading Qwen-Image VAE");
-        let vae_dir = resolve_component(spec.vae.as_ref(), dir.as_deref(), "vae", has_safetensors)
-            .ok_or_else(|| layout("no Krea 2 vae/ found; set the VAE path".into()))?;
         let vae_cfg_text = std::fs::read_to_string(vae_dir.join("config.json"))
             .map_err(|e| layout(format!("{}: config.json: {e}", vae_dir.display())))?;
         let vae_cfg = WanVaeConfig::from_json(&vae_cfg_text)?;
@@ -446,20 +450,30 @@ fn finite_at(what: &str, step: usize, v: &[f32]) -> Result<()> {
 /// Turbo or Raw: `model_index.json`'s `is_distilled` when there is one,
 /// otherwise the file name, otherwise Raw (the reference's default).
 pub fn detect_variant(checkpoint: &Path) -> Krea2Variant {
-    let index = if checkpoint.is_dir() {
-        Some(checkpoint.join("model_index.json"))
-    } else {
-        checkpoint.parent().map(|p| p.join("model_index.json"))
-    };
-    if let Some(distilled) = index
-        .and_then(|p| std::fs::read_to_string(p).ok())
+    if let Some(distilled) = std::fs::read_to_string(checkpoint_root(checkpoint).join("model_index.json")).ok()
         .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
         .and_then(|v| v.get("is_distilled").and_then(|d| d.as_bool()))
     {
         return if distilled { Krea2Variant::Turbo } else { Krea2Variant::Raw };
     }
-    let name = checkpoint.to_string_lossy().to_lowercase();
+    let name = if checkpoint.is_dir() {
+        checkpoint.to_string_lossy()
+    } else {
+        checkpoint.file_name().unwrap_or_default().to_string_lossy()
+    }.to_lowercase();
     if name.contains("turbo") { Krea2Variant::Turbo } else { Krea2Variant::Raw }
+}
+
+/// The pipeline root for a folder, a standalone checkpoint, or a transformer
+/// file selected inside an existing diffusers pipeline's `transformer/` folder.
+fn checkpoint_root(checkpoint: &Path) -> PathBuf {
+    if checkpoint.is_dir() { return checkpoint.to_path_buf(); }
+    let parent = checkpoint.parent().unwrap_or_else(|| Path::new("."));
+    if parent.file_name().is_some_and(|n| n == "transformer") {
+        parent.parent().unwrap_or(parent).to_path_buf()
+    } else {
+        parent.to_path_buf()
+    }
 }
 
 fn has_safetensors(dir: &Path) -> bool {
@@ -477,14 +491,22 @@ fn resolve_component(
     dir: Option<&Path>,
     sub: &str,
     usable: impl Fn(&Path) -> bool,
-) -> Option<PathBuf> {
+) -> Result<PathBuf> {
     if let Some(p) = explicit {
-        return Some(p.clone());
+        return if usable(p) {
+            Ok(p.clone())
+        } else {
+            Err(DiffusionError::Layout(format!(
+                "invalid Krea 2 {sub} path: {} (expected {})",
+                p.display(), if sub == "tokenizer" { "tokenizer.json or its directory" }
+                    else { "a directory containing config.json and safetensors weights" }
+            )))
+        };
     }
     if let Some(d) = dir {
         let own = d.join(sub);
         if usable(&own) {
-            return Some(own);
+            return Ok(own);
         }
     }
     hf_cache_dirs()
@@ -492,6 +514,11 @@ fn resolve_component(
         .flat_map(|hub| krea2_snapshots(&hub))
         .map(|snap| snap.join(sub))
         .find(|p| usable(p))
+        .ok_or_else(|| DiffusionError::Layout(format!(
+            "no Krea 2 {sub} found beside the checkpoint or in the Hugging Face cache; \
+             set image.krea2_{sub} in image settings (CLI: --{})",
+            sub.replace('_', "-")
+        )))
 }
 
 fn hf_cache_dirs() -> Vec<PathBuf> {
@@ -520,5 +547,89 @@ fn krea2_snapshots(hub: &Path) -> Vec<PathBuf> {
             out.extend(snaps.flatten().map(|s| s.path()));
         }
     }
+    out.sort();
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Fixture(PathBuf);
+    impl Fixture {
+        fn new() -> Self {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let path = std::env::temp_dir().join(format!("klearu-krea2-{}-{}",
+                std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn checkpoint(&self, relative: &str, marker: &str) -> PathBuf {
+            let path = self.0.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let bytes = 1.0_f32.to_le_bytes();
+            let tensor = safetensors::tensor::TensorView::new(safetensors::Dtype::F32, vec![1], &bytes).unwrap();
+            safetensors::tensor::serialize_to_file([(marker, tensor)], &None, &path).unwrap();
+            path
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) { std::fs::remove_dir_all(&self.0).unwrap(); }
+    }
+
+    #[test]
+    fn standalone_and_nested_checkpoints_find_local_companions() {
+        let fixture = Fixture::new();
+        let standalone = fixture.checkpoint("turbo.safetensors", "txtfusion.projector.weight");
+        let nested = fixture.checkpoint("transformer/model.safetensors", "model.diffusion_model.text_fusion.projector.weight");
+        assert!(is_krea2_checkpoint(&standalone));
+        assert!(is_krea2_checkpoint(&nested));
+        for sub in ["text_encoder", "vae"] {
+            fixture.checkpoint(&format!("{sub}/model.safetensors"), "weight");
+            std::fs::write(fixture.0.join(sub).join("config.json"), "{}").unwrap();
+        }
+        std::fs::create_dir(fixture.0.join("tokenizer")).unwrap();
+        let tokenizer = fixture.0.join("tokenizer/tokenizer.json");
+        std::fs::write(&tokenizer, "{}").unwrap();
+        for checkpoint in [&standalone, &nested, &fixture.0] {
+            let root = checkpoint_root(checkpoint);
+            assert_eq!(root, fixture.0);
+            for sub in ["text_encoder", "vae"] {
+                assert_eq!(resolve_component(None, Some(&root), sub, has_safetensors).unwrap(), root.join(sub));
+            }
+            assert_eq!(resolve_component(None, Some(&root), "tokenizer", |p| p.join("tokenizer.json").is_file()).unwrap(), root.join("tokenizer"));
+        }
+        assert_eq!(resolve_component(Some(&tokenizer), Some(&fixture.0), "tokenizer", |p| p.is_file()).unwrap(), tokenizer);
+        let other = fixture.0.join("other-tokenizer.json");
+        std::fs::write(&other, "{}").unwrap();
+        assert_eq!(resolve_component(Some(&other), Some(&fixture.0), "tokenizer", |p| p.is_file()).unwrap(), other);
+    }
+
+    #[test]
+    fn variant_detection_and_explicit_path_errors() {
+        let fixture = Fixture::new();
+        let raw = fixture.checkpoint("turbo-downloads/custom-raw.safetensors", "txtfusion.projector.weight");
+        assert_eq!(detect_variant(&raw), Krea2Variant::Raw);
+        let turbo = fixture.checkpoint("turbo.safetensors", "txtfusion.projector.weight");
+        assert_eq!(detect_variant(&turbo), Krea2Variant::Turbo);
+        let nested = fixture.checkpoint("transformer/model.safetensors", "text_fusion.projector.weight");
+        std::fs::write(fixture.0.join("model_index.json"), r#"{"is_distilled":true}"#).unwrap();
+        assert_eq!(detect_variant(&nested), Krea2Variant::Turbo);
+        std::fs::write(fixture.0.join("model_index.json"), r#"{"is_distilled":false}"#).unwrap();
+        assert_eq!(detect_variant(&turbo), Krea2Variant::Raw);
+        let spec = Krea2LoadSpec {
+            checkpoint: turbo,
+            text_encoder: Some(fixture.0.join("missing")),
+            ..Default::default()
+        };
+        // Must fail before transformer upload; this test needs no GPU.
+        let error = match Krea2Runner::load(&spec) {
+            Ok(_) => panic!("invalid explicit component should fail"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("invalid Krea 2 text_encoder path"), "{error}");
+        assert!(error.contains("missing"));
+    }
 }
